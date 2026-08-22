@@ -49,6 +49,7 @@ from agent.h2 import (
 )
 from agent.plan import Plan, parse_requested_yaw
 from agent.planner import Level1Planner
+from agent.l3_controller import Level3BalancePolicy
 from agent.policy import FlowPolicy, encode_instr, load_state, resolve_device
 from agent.tracker import TrackerMixin
 from agent.trials import MultiTrialBuffer
@@ -82,9 +83,12 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
         self.kp = KP.copy()
         self.kd = KD.copy()
         self.policy = FlowPolicy().to(self.device)
+        self.l3 = Level3BalancePolicy().to(self.device)
+        self.l3.eval()
         self.planner = Level1Planner()
         self.optimizer = torch.optim.AdamW(self.policy.parameters(), lr=1e-3)
         self.ckpt = self.storage / "student.pt"
+        self.l3_ckpt = self.storage / "l3.pt"
         self.replay_path = self.storage / "replay.npz"
         self.baked = False
         self.h1_pass = False
@@ -94,6 +98,7 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
         self._was_tracking = False
         self.policy.eval()
         load_state(self.policy, self.ckpt, self.device)
+        load_state(self.l3, self.l3_ckpt, self.device)
         self.lock = threading.RLock()
         self.errors: collections.deque[np.ndarray] = collections.deque(maxlen=ERROR_LEN)
         self.user_cmd = ""

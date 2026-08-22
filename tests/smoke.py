@@ -37,6 +37,7 @@ from agent import (  # noqa: E402
 )
 from agent.config import STAND_Z  # noqa: E402
 from agent.h2 import L_HZ  # noqa: E402
+from agent.l3_controller import ACT_DIM, LEG_JOINTS, OBS_DIM, Level3BalancePolicy, build_obs  # noqa: E402
 from agent.tracker import TrackerMixin  # noqa: E402
 
 
@@ -150,6 +151,24 @@ def smoke() -> None:
     assert int(bot.model.nu) == N_ACT and int(bot.model.nq) == 7 + N_ACT
     assert bot.model.joint("left_hip_yaw_joint").id >= 0
     assert bot.model.joint("right_hip_yaw_joint").id >= 0
+    assert isinstance(bot.l3, Level3BalancePolicy)
+    import torch as _torch
+
+    _torch.manual_seed(0)
+    l3_out = bot.l3(_torch.zeros(1, OBS_DIM))
+    assert tuple(l3_out.shape) == (1, ACT_DIM)
+    assert float(l3_out.abs().max()) < 1e-6, "untrained L3 last layer must be zero"
+    stand_obs = build_obs(
+        bot.data,
+        bot.torso_id,
+        bot._hinges(),
+        bot.q_cmd,
+        1.0,
+        0.0,
+        0.0,
+    )
+    assert stand_obs.shape == (OBS_DIM,), stand_obs.shape
+    assert len(LEG_JOINTS) == ACT_DIM
     parsed = bot.planner._parse(
         '{"instruction":"подними правую руку","skill":"reach","params":{"hand":"right"},"done":false}',
         "подними правую руку",
