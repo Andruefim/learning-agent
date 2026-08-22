@@ -14,6 +14,7 @@ from agent.config import (
     PARAM_OK,
     PIVOT_HX_OPEN,
     PIVOT_HX_SHIFT,
+    STAND_Z,
     TRACK_OK,
 )
 from agent.h2 import HIP_YAW_LIM, L_AK, L_EL, L_HX, L_HY, L_HZ, L_KN, L_SH, L_SX, R_AK, R_EL, R_HX, R_HY, R_HZ, R_KN, R_SH, R_SX, ARM_RAISE, STAND_Q, SQUAT_Q, WAIST_P
@@ -38,7 +39,7 @@ class TrackerMixin:
         q[L_SX] = float(np.clip(1.20 * t.l_out, self.lo[L_SX], self.hi[L_SX]))
         if wave > 0.12:
             self._wave_phase += 0.10 * wave
-            osc = 0.70 * wave * float(np.sin(self._wave_phase))
+            osc = 0.70 * wave * float(np.sin(self._wave_phase)) * self._stability_scale()
             if r_arm > 0.2:
                 q[R_SH] = float(np.clip(q[R_SH] + osc, self.lo[R_SH], self.hi[R_SH]))
                 q[R_EL] = float(np.clip(q[R_EL] + 0.25 * osc, self.lo[R_EL], self.hi[R_EL]))
@@ -188,18 +189,57 @@ class TrackerMixin:
             return True, "brace"
         if pelvis_z < self._floor_z():
             return True, "failed"
-        if e_xy >= 6.0 * TRACK_OK:
+        if e_xy >= 6.0 * TRACK_OK and tilt < 0.80:
             return True, "brace"
         if len(self._tilt_hist) >= BRACE_TILT_WIN:
             tilt_drop = float(self._tilt_hist[0]) - tilt
-            if tilt_drop >= 0.25 * (1.0 - BRACE_TILT):
+            if tilt < 0.80 and tilt_drop >= 0.25 * (1.0 - BRACE_TILT):
                 return True, "brace"
         if len(self._err_xy_hist) >= 20:
             med = float(np.median(np.asarray(self._err_xy_hist, dtype=np.float32)))
             e_old = float(self._err_xy_hist[-20])
-            if e_xy > med + 2.0 * TRACK_OK and (e_xy - e_old) > TRACK_OK:
+            if tilt < 0.80 and e_xy > med + 2.0 * TRACK_OK and (e_xy - e_old) > TRACK_OK:
                 return True, "brace"
         return False, ""
+
+    def _sagittal_pd(self, err_x: float, d_x: float) -> tuple[float, float, float]:
+        """Ankle + hip strategy. H2 box feet: COM forward → +ankle_pitch, +hip_pitch.
+
+        Toy-humanoid sag_ak used −1.2·err (plantarflex by tilting the sole); on H2
+        that dumps the foot box off its heel. Empirically +P −D holds a 70 kg,
+        ~1 m COM inverted pendulum. Hip uses the same sign pattern with larger
+        gain (τ_hip max ~360 Nm vs ankle ~67 Nm). Brace uses higher gain and a
+        wider clip than track.
+        """
+        brace = self.outcome == "brace"
+        ak_lim = float(np.clip(0.14 + 0.8 * abs(err_x), 0.14, 0.28))
+        hy_lim = float(np.clip(0.20 + 1.5 * abs(err_x), 0.20, 0.50))
+        if brace:
+            ak_lim = min(ak_lim + 0.04, 0.32)
+            hy_lim = min(hy_lim + 0.10, 0.58)
+        if brace:
+            sag_ak = float(np.clip(3.2 * err_x - 6.5 * d_x, -ak_lim, ak_lim))
+            sag_hy = float(np.clip(5.5 * err_x - 10.0 * d_x, -hy_lim, hy_lim))
+            z_err = STAND_Z - float(self._pelvis()[2])
+            sag_hy = float(np.clip(sag_hy + 1.2 * max(z_err, 0.0), -hy_lim, hy_lim))
+        else:
+            sag_ak = float(np.clip(2.4 * err_x - 5.0 * d_x, -ak_lim, ak_lim))
+            sag_hy = float(np.clip(4.0 * err_x - 8.0 * d_x, -hy_lim, hy_lim))
+            h = float(self.waypoint.teacher().height)
+            scale = float(np.clip(h, 0.5, 1.0))
+            sag_ak *= scale
+            sag_hy *= scale
+        # Waist stays out of the sagittal loop: waist_pitch ROM is ±0.44 and
+        # collinear with hip_pitch, so it double-counts torso rotation.
+        sag_wp = 0.0
+        return sag_ak, sag_hy, sag_wp
+
+    def _maybe_unbrace(self, err: np.ndarray, tilt: float, pelvis_z: float, e: float) -> None:
+        if self.outcome != "brace" or self.status == "failed":
+            return
+        if tilt > 0.90 and pelvis_z >= STAND_Z - 0.03 and e < 5.5 * TRACK_OK:
+            self.outcome = "ok"
+            self.status = "ok"
 
     def _track(self, err: np.ndarray) -> tuple[np.ndarray, str]:
         tilt = self._tilt_up()
@@ -229,15 +269,24 @@ class TrackerMixin:
                 self.status = "done"
         d_off = err[:2] - self._off_prev
         self._off_prev = err[:2].copy()
-        # H2 planted foot: COM forward needs plantarflexion (more negative ankle pitch).
-        sag_ak = float(np.clip(-1.2 * err[0] + 2.0 * d_off[0], -0.15, 0.15))
-        sag_hy = 0.0
-        sag_wp = 0.0
+        yaw = float(self._heading())
+        c, s = float(np.cos(yaw)), float(np.sin(yaw))
+        err_f = c * float(err[0]) + s * float(err[1])
+        d_f = c * float(d_off[0]) + s * float(d_off[1])
+        sag_ak, sag_hy, sag_wp = self._sagittal_pd(err_f, d_f)
+        if self.outcome != "brace":
+            vx = abs(self._active_vx())
+            if vx > 0.08:
+                fade = float(np.clip(1.0 - (vx - 0.08) / 0.42, 0.2, 1.0))
+                sag_ak *= fade
+                sag_hy *= fade
+                sag_wp *= fade
         q[R_AK] += sag_ak
         q[L_AK] += sag_ak
         q[R_HY] += sag_hy
         q[L_HY] += sag_hy
         q[WAIST_P] += sag_wp
+        self._maybe_unbrace(err, tilt, pelvis_z, e)
         pd_hx = 1.2 * err[1] - 6.0 * d_off[1]
         q[R_HX] += float(np.clip(pd_hx, *self._hx_pd_room(q, R_HX)))
         q[L_HX] += float(np.clip(pd_hx, *self._hx_pd_room(q, L_HX)))

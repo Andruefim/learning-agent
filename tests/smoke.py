@@ -35,6 +35,7 @@ from agent import (  # noqa: E402
     evaluate_trial,
     parse_requested_yaw,
 )
+from agent.config import STAND_Z  # noqa: E402
 from agent.h2 import L_HZ  # noqa: E402
 from agent.tracker import TrackerMixin  # noqa: E402
 
@@ -96,6 +97,52 @@ def _drive(bot: RobotEngine, plan: Plan, steps: int) -> None:
         if i % 50 == 0:
             bot.apply_plan(plan, fresh=(i == 0), l1_ok=True)
         bot.step()
+
+
+def _assert_idle_stand(bot: RobotEngine, ticks: int = 800) -> None:
+    for i in range(ticks):
+        bot.step()
+        z = float(bot._pelvis()[2])
+        assert bot.outcome != "brace", {"tick": i, **bot.telemetry()}
+        assert abs(z - STAND_Z) < 0.03, {"tick": i, "z": z, "stand_z": STAND_Z, **bot.telemetry()}
+
+
+def _assert_torso_push(bot: RobotEngine) -> None:
+    """Horizontal torso impulse after ~100 ticks of stand; z must return to STAND_Z."""
+    bot.reset_sim()
+    _assert_idle_stand(bot, 100)
+    for _ in range(8):
+        bot.data.xfrc_applied[bot.torso_id, 0] = 180.0
+        bot.step()
+    bot.data.xfrc_applied[bot.torso_id] = 0
+    saw_brace = bot.outcome == "brace"
+    recovered_at = None
+    for i in range(800):
+        bot.step()
+        z = float(bot._pelvis()[2])
+        if bot.outcome == "brace":
+            saw_brace = True
+        if (
+            recovered_at is None
+            and saw_brace
+            and bot.outcome != "brace"
+            and abs(z - STAND_Z) < 0.03
+        ):
+            recovered_at = i
+        if i >= 400:
+            assert abs(z - STAND_Z) < 0.05, {
+                "post_tick": i,
+                "z": z,
+                "saw_brace": saw_brace,
+                **bot.telemetry(),
+            }
+    z = float(bot._pelvis()[2])
+    assert abs(z - STAND_Z) < 0.03, {"z": z, "saw_brace": saw_brace, **bot.telemetry()}
+    if saw_brace:
+        assert recovered_at is not None and recovered_at < 600, {
+            "recovered_at": recovered_at,
+            **bot.telemetry(),
+        }
 
 
 def smoke() -> None:
@@ -207,10 +254,12 @@ def smoke() -> None:
     blob = bot._load_replay()
     bot._replay_n = 0 if blob is None else int(len(blob["action"]))
 
-    for _ in range(800):
+    for i in range(800):
         bot.step()
+        z = float(bot._pelvis()[2])
+        assert bot.outcome != "brace", {"tick": i, **bot.telemetry()}
+        assert abs(z - STAND_Z) < 0.03, {"tick": i, "z": z, "stand_z": STAND_Z, **bot.telemetry()}
     tel = bot.telemetry()
-    assert float(bot._pelvis()[2]) > 0.75, tel
     assert bot._tilt_up() > 0.8, tel
     assert abs(float(bot._hinges()[R_SH])) < 0.45, "idle arms should hang"
 
@@ -224,8 +273,10 @@ def smoke() -> None:
     assert bot.outcome != "brace", bot.telemetry()
     assert float(bot._hinges()[R_SH]) < -0.45, bot.telemetry()
 
-    _drive(bot, Plan("встать", skill="stand"), 700)
+    bot.reset_sim()
+    _assert_idle_stand(bot, 200)
     _drive(bot, Plan("махни правой", skill="wave", params={"hand": "right"}), 700)
+    assert bot.outcome != "brace", bot.telemetry()
     assert float(bot._hinges()[R_SH]) < -0.45, bot.telemetry()
 
     _drive(bot, Plan("опусти руки", skill="hold", params={"hands": "down"}), 700)
@@ -242,6 +293,10 @@ def smoke() -> None:
     assert bot.outcome == "brace", bot.telemetry()
     bot.apply_plan(Plan("спасайся", skill="locomote", params={"direction": "forward", "speed": "fast"}), fresh=True, l1_ok=True)
     assert bot.status == "failed" and bot.user_cmd == ""
+
+    bot.reset_sim()
+    _assert_idle_stand(bot, 800)
+    _assert_torso_push(bot)
 
     bot.reset_sim()
     pelvis = bot._pelvis()
