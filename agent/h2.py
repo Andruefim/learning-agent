@@ -12,6 +12,7 @@ import numpy as np
 import mujoco
 
 from agent.config import PARAM_KEYS, ROOT
+from agent.joint_pd import kp_kd_vectors
 
 MODEL_XML = ROOT / "models" / "unitree_h2" / "scene_app.xml"
 N_ACT = 31
@@ -52,28 +53,8 @@ STAND_Q = _h2_leg_pose(hip=-0.20, knee=0.40, ankle=-0.25)
 STAND_Q[WAIST_P] = 0.05
 SQUAT_Q = _h2_leg_pose(hip=-0.55, knee=1.00, ankle=-0.40)
 SQUAT_Q[WAIST_P] = 0.12
-KP = np.array(
-    [
-        500, 500, 400, 500, 80, 400,
-        500, 500, 400, 500, 80, 400,
-        400, 400, 400,
-        80, 80, 40, 80, 10, 10, 10,
-        80, 80, 40, 80, 10, 10, 10,
-        10, 10,
-    ],
-    dtype=np.float32,
-)
-KD = np.array(
-    [
-        12.0, 12.0, 8.0, 12.0, 3.0, 5.0,
-        12.0, 12.0, 8.0, 12.0, 3.0, 5.0,
-        10.0, 10.0, 10.0,
-        4.0, 4.0, 2.0, 4.0, 0.5, 0.5, 0.5,
-        4.0, 4.0, 2.0, 4.0, 0.5, 0.5, 0.5,
-        0.5, 0.5,
-    ],
-    dtype=np.float32,
-)
+# Software Joint-PD gains (Nm/rad, Nm·s/rad). Motors stay torque in XML.
+KP, KD = kp_kd_vectors()
 
 
 def actuator_addrs(model: mujoco.MjModel) -> tuple[np.ndarray, np.ndarray]:

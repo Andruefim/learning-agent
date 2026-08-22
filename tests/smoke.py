@@ -162,9 +162,9 @@ def smoke() -> None:
         bot.data,
         bot.torso_id,
         bot._hinges(),
+        bot._qd(),
         bot.q_cmd,
-        1.0,
-        0.0,
+        STAND_Z,
         0.0,
     )
     assert stand_obs.shape == (OBS_DIM,), stand_obs.shape

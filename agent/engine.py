@@ -47,9 +47,10 @@ from agent.h2 import (
     disable_foot_spheres,
     joint_limits,
 )
+from agent.joint_pd import compute_torques
+from agent.l3_controller import Level3BalancePolicy, apply_leg_deltas, build_obs
 from agent.plan import Plan, parse_requested_yaw
 from agent.planner import Level1Planner
-from agent.l3_controller import Level3BalancePolicy
 from agent.policy import FlowPolicy, encode_instr, load_state, resolve_device
 from agent.tracker import TrackerMixin
 from agent.trials import MultiTrialBuffer
@@ -83,12 +84,12 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
         self.kp = KP.copy()
         self.kd = KD.copy()
         self.policy = FlowPolicy().to(self.device)
-        self.l3 = Level3BalancePolicy().to(self.device)
+        self.l3 = Level3BalancePolicy(zero_out=True).to(self.device)
         self.l3.eval()
         self.planner = Level1Planner()
         self.optimizer = torch.optim.AdamW(self.policy.parameters(), lr=1e-3)
         self.ckpt = self.storage / "student.pt"
-        self.l3_ckpt = self.storage / "l3.pt"
+        self.l3_ckpt = self.storage / "l3_balance.pt"
         self.replay_path = self.storage / "replay.npz"
         self.baked = False
         self.h1_pass = False
@@ -98,7 +99,9 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
         self._was_tracking = False
         self.policy.eval()
         load_state(self.policy, self.ckpt, self.device)
-        load_state(self.l3, self.l3_ckpt, self.device)
+        self.l3_drive = load_state(self.l3, self.l3_ckpt, self.device)
+        if not self.l3_drive:
+            self.l3_drive = load_state(self.l3, self.storage / "l3.pt", self.device)
         self.lock = threading.RLock()
         self.errors: collections.deque[np.ndarray] = collections.deque(maxlen=ERROR_LEN)
         self.user_cmd = ""
@@ -404,9 +407,7 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
         return np.clip(q + np.clip(desired.astype(np.float32) - q, -SLEW, SLEW), self.lo, self.hi)
 
     def _pd_torque(self, q_cmd: np.ndarray) -> np.ndarray:
-        tau = self.kp * (q_cmd.astype(np.float32) - self._hinges()) - self.kd * self._qd()
-        tau = tau + self.data.qfrc_bias[self.vadr].astype(np.float32)
-        return np.clip(tau.astype(np.float32), self.tau_lo, self.tau_hi)
+        return compute_torques(self.model, self.data, q_cmd, self.kp, self.kd, self.qadr, self.vadr)
 
     def step(self):
         err = self._balance_err()
@@ -449,7 +450,27 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
             chosen = self._mix(teacher, student)
             self.ctrl_source = "track" if self.alpha <= 1e-8 else f"residual-{self.stage}"
         self._last_teacher = teacher
-        self.q_cmd = self._slew(chosen)
+        target = chosen
+        if self.l3_drive and self.outcome != "brace":
+            t = self.waypoint.teacher()
+            walking = abs(self._active_vx()) > 0.08 or int(self._steps_goal) > 0
+            if not walking and abs(float(t.kick)) <= 0.2 and self.turn_mode == "none":
+                z_tgt = STAND_Z * float(t.height)
+                obs = build_obs(
+                    self.data,
+                    self.torso_id,
+                    self._hinges(),
+                    self._qd(),
+                    chosen,
+                    z_tgt,
+                    self._active_vx(),
+                )
+                x = torch.as_tensor(obs, device=self.device, dtype=torch.float32).unsqueeze(0)
+                with torch.no_grad():
+                    delta = self.l3.deltas(x)[0].detach().cpu().numpy().astype(np.float32)
+                target = apply_leg_deltas(chosen, delta, height_01=float(t.height))
+                self.ctrl_source = "l3"
+        self.q_cmd = self._slew(target)
         self.data.ctrl[:] = self._pd_torque(self.q_cmd)
         mujoco.mj_step(self.model, self.data)
         if self._measure is not None:

@@ -1,9 +1,7 @@
-"""Level 3 conditioned neural balance. Runs at the physics rate (S0 / 200 Hz).
+"""Level 3 conditioned neural balance at the physics rate (S0 / 200 Hz).
 
-Outputs residual target-angle deltas for the 10 balance legs (hip pitch/roll,
-knee, ankle pitch/roll). Last layer starts at zero so an untrained net is a
-no-op on top of the tracker PD. Official H2 MJCF is torque-driven; this module
-edits q_cmd, not XML actuators.
+12-DoF leg residual + 14-DoF arm conditioning from L2. Last layer can start
+at zero so an untrained net is a no-op on the nominal stance.
 """
 
 from __future__ import annotations
@@ -12,40 +10,41 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from agent.h2 import L_AK, L_AZ, L_EL, L_HX, L_HY, L_KN, L_SH, L_SX, R_AK, R_AZ, R_EL, R_HX, R_HY, R_KN, R_SH, R_SX
+from agent.h2 import STAND_Q, SQUAT_Q
 
-OBS_DIM = 26
-ACT_DIM = 10
-L3_DELTA_LIM = 0.35
-
-# Hip pitch/roll, knee, ankle pitch/roll. Hip yaw stays with the turn tracker.
-LEG_JOINTS = (R_HY, L_HY, R_HX, L_HX, R_KN, L_KN, R_AK, L_AK, R_AZ, L_AZ)
-UPPER_JOINTS = (R_SH, L_SH, R_EL, L_EL, R_SX, L_SX)
+LEG_DOF = 12
+UPPER_DOF = 14
+LEG_IDX = tuple(range(0, 12))
+UPPER_IDX = tuple(range(15, 29))
+OBS_DIM = 3 + 3 + LEG_DOF + LEG_DOF + (UPPER_DOF + 2)
+ACT_DIM = LEG_DOF
+L3_DELTA_LIM = 0.45
+# Back-compat aliases for tests.
+LEG_JOINTS = LEG_IDX
+UPPER_JOINTS = UPPER_IDX
 
 
 class Level3BalancePolicy(nn.Module):
-    def __init__(self):
+    def __init__(self, leg_dof: int = LEG_DOF, upper_dof: int = UPPER_DOF, *, zero_out: bool = True):
         super().__init__()
-        # Inputs (26 dim):
-        # - IMU Gravity Vector (3): [0, 0, -1] in torso coordinates
-        # - IMU Angular Velocity (3): torso gyro (wx, wy, wz)
-        # - Legs Proprioception (10): current angles of LEG_JOINTS
-        # - L2 Conditioning (10): [target_height, target_vx, target_upper_body_q(6), target_yaw(2)]
+        in_dim = 3 + 3 + leg_dof + leg_dof + (upper_dof + 2)
+        self.leg_dof = int(leg_dof)
         self.net = nn.Sequential(
-            nn.Linear(OBS_DIM, 64),
+            nn.Linear(in_dim, 128),
             nn.SiLU(),
-            nn.Linear(64, 64),
+            nn.Linear(128, 128),
             nn.SiLU(),
-            nn.Linear(64, ACT_DIM),
+            nn.Linear(128, leg_dof),
         )
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
+        if zero_out:
+            nn.init.zeros_(self.net[-1].weight)
+            nn.init.zeros_(self.net[-1].bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.net(obs)
 
-    def deltas(self, x: torch.Tensor) -> torch.Tensor:
-        return L3_DELTA_LIM * torch.tanh(self.forward(x))
+    def deltas(self, obs: torch.Tensor) -> torch.Tensor:
+        return L3_DELTA_LIM * torch.tanh(self.forward(obs))
 
 
 def torso_imu(data, torso_id: int) -> tuple[np.ndarray, np.ndarray]:
@@ -55,38 +54,42 @@ def torso_imu(data, torso_id: int) -> tuple[np.ndarray, np.ndarray]:
     return grav.astype(np.float32), gyro.astype(np.float32)
 
 
-def l2_conditioning(q_des: np.ndarray, height: float, vx: float, yaw: float) -> np.ndarray:
-    upper = np.asarray(q_des, dtype=np.float32)[list(UPPER_JOINTS)]
-    yaw = float(yaw)
-    return np.concatenate(
-        [
-            np.array([float(height), float(vx)], dtype=np.float32),
-            upper,
-            np.array([np.sin(np.pi * yaw), np.cos(np.pi * yaw)], dtype=np.float32),
-        ]
-    )
+def legs_nominal(height_01: float) -> np.ndarray:
+    h = float(np.clip(height_01, 0.0, 1.0))
+    return ((1.0 - h) * SQUAT_Q + h * STAND_Q).astype(np.float32)
 
 
 def build_obs(
     data,
     torso_id: int,
     q: np.ndarray,
-    q_des: np.ndarray,
-    height: float,
-    vx: float,
-    yaw: float,
+    qd: np.ndarray,
+    q_upper_target: np.ndarray,
+    target_height: float,
+    target_vx: float,
 ) -> np.ndarray:
+    """IMU + leg error/vel vs stand + L2 cond [z_pelvis_m, vx, 14 arm targets]."""
     grav, gyro = torso_imu(data, torso_id)
-    legs = np.asarray(q, dtype=np.float32)[list(LEG_JOINTS)]
-    cond = l2_conditioning(q_des, height, vx, yaw)
-    return np.concatenate([grav, gyro, legs, cond]).astype(np.float32)
+    q = np.asarray(q, dtype=np.float32)
+    qd = np.asarray(qd, dtype=np.float32)
+    qerr = q[list(LEG_IDX)] - STAND_Q[list(LEG_IDX)]
+    qvel = qd[list(LEG_IDX)]
+    upper = np.asarray(q_upper_target, dtype=np.float32).reshape(-1)[list(UPPER_IDX)]
+    cond = np.concatenate(
+        [
+            np.array([float(target_height), float(target_vx)], dtype=np.float32),
+            upper,
+        ]
+    )
+    return np.concatenate([grav, gyro, qerr, qvel, cond]).astype(np.float32)
 
 
-def apply_leg_deltas(q: np.ndarray, delta: np.ndarray) -> np.ndarray:
+def apply_leg_deltas(q: np.ndarray, delta: np.ndarray, height_01: float = 1.0) -> np.ndarray:
     out = np.asarray(q, dtype=np.float32).copy()
     d = np.clip(np.asarray(delta, dtype=np.float32).reshape(-1), -L3_DELTA_LIM, L3_DELTA_LIM)
-    if d.shape[0] != len(LEG_JOINTS):
-        raise ValueError(f"L3 delta dim {d.shape[0]} != {len(LEG_JOINTS)}")
-    for i, j in enumerate(LEG_JOINTS):
-        out[j] = out[j] + d[i]
+    if d.shape[0] != LEG_DOF:
+        raise ValueError(f"L3 delta dim {d.shape[0]} != {LEG_DOF}")
+    nom = legs_nominal(height_01)
+    for i, j in enumerate(LEG_IDX):
+        out[j] = nom[j] + d[i]
     return out

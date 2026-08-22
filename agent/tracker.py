@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-import torch
 import mujoco
 
 from agent.config import (
@@ -19,7 +18,6 @@ from agent.config import (
     TRACK_OK,
 )
 from agent.h2 import HIP_YAW_LIM, L_AK, L_EL, L_HX, L_HY, L_HZ, L_KN, L_SH, L_SX, R_AK, R_EL, R_HX, R_HY, R_HZ, R_KN, R_SH, R_SX, ARM_RAISE, STAND_Q, SQUAT_Q, WAIST_P
-from agent.l3_controller import apply_leg_deltas, build_obs
 from agent.plan import Plan, wrap_angle
 
 
@@ -292,29 +290,8 @@ class TrackerMixin:
         pd_hx = 1.2 * err[1] - 6.0 * d_off[1]
         q[R_HX] += float(np.clip(pd_hx, *self._hx_pd_room(q, R_HX)))
         q[L_HX] += float(np.clip(pd_hx, *self._hx_pd_room(q, L_HX)))
-        q = self._apply_l3(q)
         src = "brace" if self.outcome == "brace" else "track"
         return np.clip(q, self.lo, self.hi), src
-
-    def _apply_l3(self, q: np.ndarray) -> np.ndarray:
-        """Conditioned residual on the 10 stance joints. Untrained net is ~0."""
-        l3 = getattr(self, "l3", None)
-        if l3 is None:
-            return q
-        t = self.waypoint.teacher() if self.outcome != "brace" else Plan.stand().teacher()
-        obs = build_obs(
-            self.data,
-            self.torso_id,
-            self._hinges(),
-            q,
-            float(t.height),
-            self._active_vx(),
-            float(t.yaw) if self.outcome != "brace" else 0.0,
-        )
-        x = torch.as_tensor(obs, device=next(l3.parameters()).device, dtype=torch.float32).unsqueeze(0)
-        with torch.no_grad():
-            delta = l3.deltas(x)[0].detach().cpu().numpy().astype(np.float32)
-        return apply_leg_deltas(q, delta)
 
     def _hx_pd_room(self, q: np.ndarray, idx: int) -> tuple[float, float]:
         """PD hip-x clip = leftover ROM after the pose, never more than HX_PD_CLIP."""
