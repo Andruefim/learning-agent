@@ -1,0 +1,10 @@
+<mujoco model="Unitree H2 app">
+  <include file="scene.xml"/>
+  <option timestep="0.005" gravity="0 0 -9.81" integrator="implicitfast"/>
+  <visual>
+    <global offwidth="640" offheight="480"/>
+  </visual>
+  <worldbody>
+    <camera name="demo" pos="2.8 -3.2 1.55" mode="targetbody" target="pelvis" fovy="46"/>
+  </worldbody>
+</mujoco>

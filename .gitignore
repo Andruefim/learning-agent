@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+flywheel_data/
+*.pt
+*.engine
+.DS_Store

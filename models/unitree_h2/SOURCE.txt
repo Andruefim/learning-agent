@@ -1,0 +1,5 @@
+Official Unitree H2 MJCF from
+https://github.com/unitreerobotics/unitree_mujoco
+path: unitree_robots/h2/ (h2_mujoco.xml, scene.xml, meshes/)
+
+Do not edit h2_mujoco.xml / scene.xml. App loads scene_app.xml.

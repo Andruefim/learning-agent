@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Standing humanoid</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-zinc-950 text-zinc-100 h-screen overflow-hidden font-sans">
+  <div class="flex h-full">
+    <section class="flex-1 flex flex-col p-4 border-r border-zinc-800 min-w-0">
+      <header class="flex items-center justify-between mb-3 gap-3">
+        <h1 class="font-semibold text-emerald-400 tracking-tight">Standing humanoid · 3 levels</h1>
+        <div class="flex items-center gap-2 text-xs">
+          <span id="badge" class="bg-zinc-800 text-zinc-400 px-2 py-1 rounded">IDLE</span>
+          <span id="hold" class="bg-zinc-800 text-zinc-500 px-2 py-1 rounded">stand</span>
+        </div>
+      </header>
+      <div class="flex-1 bg-black rounded-xl overflow-hidden border border-zinc-800 flex items-center justify-center">
+        <img src="/video_feed" alt="MuJoCo" class="w-full h-full object-contain">
+      </div>
+      <dl id="stats" class="grid grid-cols-4 gap-2 mt-3 text-[11px] text-zinc-500 font-mono">
+        <div class="bg-zinc-900 rounded px-2 py-1">err <span id="s-err" class="text-zinc-200">—</span></div>
+        <div class="bg-zinc-900 rounded px-2 py-1">pelvis z <span id="s-z" class="text-zinc-200">—</span></div>
+        <div class="bg-zinc-900 rounded px-2 py-1">logs <span id="s-logs" class="text-zinc-200">—</span></div>
+        <div class="bg-zinc-900 rounded px-2 py-1">L2 <span id="s-dev" class="text-zinc-200">—</span></div>
+      </dl>
+    </section>
+
+    <aside class="w-[22rem] flex flex-col p-4 bg-zinc-900/80">
+      <p class="text-[10px] uppercase tracking-widest text-zinc-500 mb-2">Level 1 · command</p>
+      <div class="flex gap-2 mb-3">
+        <input id="cmd" type="text" placeholder="любая фраза: 5 шагов вперёд / опусти руки / присесть"
+               class="flex-1 bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+        <button onclick="send()" class="bg-emerald-600 hover:bg-emerald-500 px-3 rounded-lg text-sm font-semibold">Go</button>
+      </div>
+      <div class="flex gap-2 mb-4 text-xs">
+        <button onclick="wsSend({type:'reset'})" class="flex-1 bg-zinc-800 hover:bg-zinc-700 py-1.5 rounded-lg">Reset</button>
+        <button onclick="wsSend({type:'auto_trial'})" class="flex-1 bg-sky-800 hover:bg-sky-700 py-1.5 rounded-lg">Авто-испытание (Auto-Trial)</button>
+      </div>
+
+      <p class="text-[10px] uppercase tracking-widest text-zinc-500 mb-1">In-Context Memory</p>
+      <div id="memory" class="mb-4 bg-zinc-950 border border-zinc-800 rounded-lg p-2 text-[11px] text-zinc-400 font-mono min-h-[4.5rem] space-y-1">
+        <div class="text-zinc-600">нет попыток</div>
+      </div>
+
+      <button onclick="wsSend({type:'consolidate'})"
+              class="w-full bg-indigo-600 hover:bg-indigo-500 py-2 rounded-lg text-sm font-semibold mb-4">
+        Save / Consolidate
+      </button>
+
+      <p class="text-[10px] uppercase tracking-widest text-zinc-500 mb-1">Levels</p>
+      <ul class="text-xs text-zinc-400 space-y-1 mb-4 font-mono">
+        <li><span class="text-emerald-500">L1</span> VLM · language → motor JSON</li>
+        <li><span class="text-sky-400">L2</span> tracker on the body · student gated</li>
+        <li><span class="text-amber-400">L3</span> MuJoCo · contacts / gravity</li>
+      </ul>
+
+      <p class="text-[10px] uppercase tracking-widest text-zinc-500 mb-1">Log</p>
+      <div id="logs" class="flex-1 bg-zinc-950 border border-zinc-800 rounded-lg p-2 text-xs text-zinc-400 overflow-y-auto space-y-1 font-mono"></div>
+    </aside>
+  </div>
+
+  <script>
+    let ws;
+    const logs = document.getElementById("logs");
+
+    function line(t) {
+      const d = document.createElement("div");
+      d.textContent = t;
+      logs.appendChild(d);
+      logs.scrollTop = logs.scrollHeight;
+    }
+
+    function connect() {
+      ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+      ws.onopen = () => line("connected");
+      ws.onclose = () => { line("reconnect…"); setTimeout(connect, 800); };
+      ws.onmessage = (e) => {
+        const m = JSON.parse(e.data);
+        if (m.type === "log") line(m.text);
+        if (m.type === "telemetry") {
+          document.getElementById("badge").textContent = (m.instruction || m.subgoal || "stand").slice(0, 28);
+          const st = m.outcome === "brace" ? "brace" : (m.status || "stand");
+          document.getElementById("hold").textContent = st;
+          document.getElementById("hold").className = m.outcome === "brace"
+            ? "bg-amber-950 text-amber-400 px-2 py-1 rounded"
+            : "bg-zinc-800 text-zinc-500 px-2 py-1 rounded";
+          document.getElementById("s-err").textContent = m.error;
+          document.getElementById("s-z").textContent = m.pelvis_z;
+          document.getElementById("s-logs").textContent = m.logs;
+          document.getElementById("s-dev").textContent =
+            (m.ctrl || "track")
+            + (m.stage ? "·" + m.stage : "")
+            + (m.alpha ? "·α" + m.alpha : "")
+            + (m.h1 ? "·H1" : "")
+            + (m.outcome && m.outcome !== "ok" ? "·" + m.outcome : "");
+          const mem = document.getElementById("memory");
+          const trials = m.trials || [];
+          if (!trials.length) {
+            mem.innerHTML = '<div class="text-zinc-600">нет попыток</div>';
+          } else {
+            mem.innerHTML = trials.map((t) => {
+              const cls = t.fell ? "text-amber-400" : (t.success ? "text-emerald-400" : "text-zinc-300");
+              return `<div class="${cls}"></div>`;
+            }).join("");
+            [...mem.children].forEach((el, i) => { el.textContent = trials[i].line; });
+          }
+        }
+      };
+    }
+
+    function wsSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+    function send() {
+      const el = document.getElementById("cmd");
+      if (!el.value.trim()) return;
+      wsSend({ type: "command", text: el.value.trim() });
+      el.value = "";
+    }
+    document.getElementById("cmd").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+    connect();
+  </script>
+</body>
+</html>
