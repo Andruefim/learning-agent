@@ -33,6 +33,7 @@ from agent.config import (
     Z_DIM,
 )
 from agent.h2 import ACTION_DIM, ARM_RAISE, L_HY, L_KN, L_SH, N_ACT, R_HY, R_KN, R_SH, STAND_Q, SQUAT_Q, TRIAL_FEAT
+from agent.l3_cmd import clip_command
 from agent.plan import Plan, evaluate_trial, plan_to_params
 from agent.policy import FlowPolicy, encode_instr
 from agent.trials import Trial
@@ -60,7 +61,7 @@ class FlywheelMixin:
         with torch.no_grad():
             chunk = self.policy.sample(*self._obs_tensors(image, proprio, language, z, errors))
         act = chunk[0, 0].cpu().numpy().astype(np.float32)
-        return np.clip(act, self.lo, self.hi)
+        return clip_command(act)
 
     def _images_to_tensor(self, images: np.ndarray) -> torch.Tensor:
         x = torch.as_tensor(np.ascontiguousarray(images), device=self.device, dtype=torch.float32)
@@ -126,10 +127,10 @@ class FlywheelMixin:
                     self.stage = "C"
 
     def _mix(self, teacher: np.ndarray, student: np.ndarray) -> np.ndarray:
-        if self.alpha <= 1e-8 or self.outcome == "brace":
+        if self.alpha <= 1e-8 or self.outcome == "fall":
             return teacher
         delta = np.clip(student - teacher, -RESIDUAL_LIMIT, RESIDUAL_LIMIT)
-        return np.clip(teacher + float(self.alpha) * delta, self.lo, self.hi)
+        return clip_command(teacher + float(self.alpha) * delta)
 
     def _open_measure(self):
         p = self._pelvis()
@@ -192,14 +193,14 @@ class FlywheelMixin:
         """One student forward with a synthetic trial token. Used to prove skill_id is in the graph."""
         self.policy.eval()
         raw_s = state if state is not None else np.zeros(N_ACT, dtype=np.float32)
-        raw_a = action if action is not None else np.zeros(N_ACT, dtype=np.float32)
+        raw_a = action if action is not None else np.zeros(ACTION_DIM, dtype=np.float32)
         st = (list(map(float, raw_s)) + [0.0] * N_ACT)[:N_ACT]
-        act = (list(map(float, raw_a)) + [0.0] * N_ACT)[:N_ACT]
+        act = (list(map(float, raw_a)) + [0.0] * ACTION_DIM)[:ACTION_DIM]
         err = [float(error.get(k, 0.0)) for k in PARAM_KEYS]
         feat = torch.zeros(1, TRIAL_MAX, TRIAL_FEAT, device=self.device)
         ids = torch.full((1, TRIAL_MAX), len(SKILL_IDS), dtype=torch.long, device=self.device)
         ids[0, 0] = int(SKILL_TO_I.get(skill, 0))
-        feat[0, 0] = torch.tensor(st[:N_ACT] + act[:N_ACT] + err, device=self.device, dtype=torch.float32)
+        feat[0, 0] = torch.tensor(st[:N_ACT] + act[:ACTION_DIM] + err, device=self.device, dtype=torch.float32)
         image = np.zeros((VISION_H, VISION_W, 3), dtype=np.uint8)
         proprio = np.zeros(N_ACT, dtype=np.float32)
         language = encode_instr(json.dumps({"skill": skill, "params": {}}, sort_keys=True))
@@ -215,7 +216,7 @@ class FlywheelMixin:
         err = [float(error.get(k, 0.0)) for k in PARAM_KEYS]
         ids = torch.full((1, TRIAL_MAX), len(SKILL_IDS), dtype=torch.long, device=self.device)
         ids[0, 0] = int(SKILL_TO_I.get(skill, 0))
-        row = [0.0] * (2 * N_ACT) + err
+        row = [0.0] * (N_ACT + ACTION_DIM) + err
         feat = torch.zeros(1, TRIAL_MAX, TRIAL_FEAT, device=self.device, dtype=torch.float32)
         feat[0, 0] = torch.tensor(row, device=self.device, dtype=torch.float32)
         feat = feat.detach().requires_grad_(True)
@@ -315,7 +316,7 @@ class FlywheelMixin:
         if skill == "turn" and not TURN_IN_CONTEXT_OK:
             return {
                 "skill": skill,
-                "lines": ["Auto-Trial skipped: turn tracker not accepted yet"],
+                "lines": ["Auto-Trial skipped: turn not accepted for in-context yet"],
                 "trials": [],
                 "success": False,
                 "sgd": int(self._sgd_steps),

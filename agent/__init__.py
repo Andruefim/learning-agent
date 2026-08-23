@@ -1,9 +1,8 @@
-"""Standing Unitree H2: L1 planner, tracker, gated L2 student."""
+"""Standing Unitree H2: L1 planner, foundation L3, gated L2 command student."""
 
 from agent.config import (
     ALPHA_MAX,
     H1_SPEC,
-    PIVOT_HX_SHIFT,
     SHADOW_MSE_MAX,
 )
 from agent.engine import RobotEngine
@@ -29,7 +28,6 @@ __all__ = [
     "L_AZ",
     "L_SH",
     "N_ACT",
-    "PIVOT_HX_SHIFT",
     "Plan",
     "R_AZ",
     "R_HY",

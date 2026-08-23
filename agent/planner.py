@@ -1,4 +1,4 @@
-"""L1 VLM planner. Soft skill+params only; the tracker owns balance."""
+"""L1 VLM planner. Soft skill+params only; the foundation controller owns balance."""
 
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ class Level1Planner:
     async def plan(self, user_command: str, scene: dict, image: bytes = b"") -> tuple[Plan, bool]:
         prompt = (
             "You are the slow planner for a standing humanoid. The image is the camera.\n"
-            "The tracker balances at control rate. If tracker_outcome is brace or failed: "
+            "The foundation controller balances at control rate. If outcome is fall or failed: "
             'done=true, skill="hold", params={}. Do not invent a recovery gait.\n'
             "Reply JSON with keys instruction, skill, params, done.\n"
             "skill is one of: hold, stand, squat, locomote, turn, wave, kick, reach.\n"

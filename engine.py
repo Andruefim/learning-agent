@@ -8,7 +8,6 @@ from agent import (  # noqa: F401
     L_AZ,
     L_SH,
     N_ACT,
-    PIVOT_HX_SHIFT,
     Plan,
     R_AZ,
     R_HY,

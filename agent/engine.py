@@ -1,4 +1,4 @@
-"""Robot runtime: MuJoCo H2, PD torque, control loop, telemetry."""
+"""Robot runtime: MuJoCo H2, foundation policy, Joint-PD, telemetry."""
 
 from __future__ import annotations
 
@@ -16,14 +16,10 @@ from PIL import Image
 import mujoco
 
 from agent.config import (
-    BRACE_ERR_WIN,
-    BRACE_TILT,
-    BRACE_TILT_WIN,
     ERROR_LEN,
-    FALL_Z,
+    FALL_Z as CFG_FALL_Z,
     H1_SPEC,
     L1_PERIOD,
-    PIVOT_HX_SHIFT,
     ROOT,
     SLEW,
     STAND_Z,
@@ -34,6 +30,7 @@ from agent.config import (
 )
 from agent.flywheel import FlywheelMixin
 from agent.h2 import (
+    ACTION_DIM,
     KD,
     KP,
     MODEL_XML,
@@ -48,15 +45,28 @@ from agent.h2 import (
     joint_limits,
 )
 from agent.joint_pd import compute_torques
-from agent.l3_controller import Level3BalancePolicy, apply_leg_deltas, build_obs
-from agent.plan import Plan, parse_requested_yaw
+from agent.l3_cmd import CMD_H, CMD_VX, clip_command, command_from_plan, stand_command
+from agent.l3_foundation import (
+    DECIMATION,
+    FALL_Z,
+    TILT_LIM,
+    HumanoidFoundationPolicy,
+    balance_delta,
+    body_xy,
+    build_obs,
+    com_err_xy,
+    height_01,
+    q_from_action,
+)
+from agent.plan import Plan, parse_requested_yaw, wrap_angle
 from agent.planner import Level1Planner
 from agent.policy import FlowPolicy, encode_instr, load_state, resolve_device
-from agent.tracker import TrackerMixin
 from agent.trials import MultiTrialBuffer
 
+STEP_PERIOD = 0.55
 
-class RobotEngine(TrackerMixin, FlywheelMixin):
+
+class RobotEngine(FlywheelMixin):
     def __init__(self):
         self.storage = Path(os.getenv("STORAGE_DIR", ROOT / "flywheel_data"))
         self.storage.mkdir(parents=True, exist_ok=True)
@@ -84,24 +94,21 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
         self.kp = KP.copy()
         self.kd = KD.copy()
         self.policy = FlowPolicy().to(self.device)
-        self.l3 = Level3BalancePolicy(zero_out=True).to(self.device)
+        self.l3 = HumanoidFoundationPolicy(zero_out=True).to(self.device)
         self.l3.eval()
         self.planner = Level1Planner()
         self.optimizer = torch.optim.AdamW(self.policy.parameters(), lr=1e-3)
         self.ckpt = self.storage / "student.pt"
-        self.l3_ckpt = self.storage / "l3_balance.pt"
+        self.l3_ckpt = self.storage / "l3_foundation.pt"
         self.replay_path = self.storage / "replay.npz"
         self.baked = False
         self.h1_pass = False
         self.h1_report: dict = dict(H1_SPEC)
         self.student_drive = False
         self.outcome = "ok"
-        self._was_tracking = False
         self.policy.eval()
         load_state(self.policy, self.ckpt, self.device)
         self.l3_drive = load_state(self.l3, self.l3_ckpt, self.device)
-        if not self.l3_drive:
-            self.l3_drive = load_state(self.l3, self.storage / "l3.pt", self.device)
         self.lock = threading.RLock()
         self.errors: collections.deque[np.ndarray] = collections.deque(maxlen=ERROR_LEN)
         self.user_cmd = ""
@@ -124,37 +131,29 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
         self._ema_ok_tick0: int | None = None
         self._ema_ok_fall0 = 0.0
         self._replay_n = 0
-        self._pivot_hx_frac = float(PIVOT_HX_SHIFT)
         self._shadow_falls: collections.deque[int] = collections.deque(maxlen=64)
-        self._last_teacher = STAND_Q.copy()
-        self._last_student = STAND_Q.copy()
-        self._working_fall = 0.0
+        self._cmd = stand_command()
+        self._last_teacher = stand_command()
+        self._last_student = stand_command()
+        self._last_a = np.zeros(N_ACT, dtype=np.float32)
         self.q_cmd = STAND_Q.copy()
         self.last_l1 = 0.0
         self.l1_ok = True
         self.l1_busy = False
         self.logs: list[dict] = []
-        self.ctrl_source = "track"
+        self.ctrl_source = "l3"
         self._jpeg = b""
         self._eye_rgb = np.zeros((VISION_H, VISION_W, 3), dtype=np.uint8)
         self._tick = 0
-        self._phase = 0.0
-        self._pivot_period = 1.0
         self._step_count = 0
         self._steps_done = 0
         self._steps_goal = 0
-        self._prev_swing = 1.0
-        self._wave_phase = 0.0
-        self._kick_phase = 0.0
+        self._walk_ticks = 0
         self._yaw_applied = 0.0
-        self._tilt_prev = 1.0
-        self._err_xy_hist: collections.deque[float] = collections.deque(maxlen=BRACE_ERR_WIN)
-        self._tilt_hist: collections.deque[float] = collections.deque(maxlen=BRACE_TILT_WIN)
-        self.turn_mode = "none"
-        self.turn_mechanism = "unknown"
-        self._force_twist_only = False
         self._turn_heading0: float | None = None
         self._requested_yaw: float | None = None
+        self.turn_mode = "none"
+        self.turn_mechanism = "foundation"
         self.status = "ready"
         self._kick_render = True
         self._home()
@@ -168,7 +167,6 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
             self.errors.append(np.zeros(3, dtype=np.float32))
 
     def _teleport_spawn(self) -> None:
-        """Teleport to origin standing pose and zero velocities."""
         mujoco.mj_resetData(self.model, self.data)
         if int(self.model.nkey) > 0:
             mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
@@ -184,6 +182,8 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
         self.data.qfrc_applied[:] = 0
         self.data.xfrc_applied[:] = 0
         self.q_cmd = STAND_Q.copy()
+        self._cmd = stand_command()
+        self._last_a = np.zeros(N_ACT, dtype=np.float32)
         self.data.ctrl[:] = 0.0
         self.data.time = 0.0
         mujoco.mj_forward(self.model, self.data)
@@ -200,28 +200,22 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
         self.l1_ok = True
         self.l1_busy = False
         self._tick = 0
-        self._phase = 0.0
         self._step_count = 0
         self._steps_done = 0
         self._steps_goal = 0
-        self._prev_swing = 1.0
-        self._wave_phase = 0.0
-        self._kick_phase = 0.0
+        self._walk_ticks = 0
         self._yaw_applied = 0.0
-        self._tilt_prev = 1.0
-        self._err_xy_hist.clear()
-        self._tilt_hist.clear()
-        self._force_twist_only = False
         self._turn_heading0 = None
         self._requested_yaw = None
         self.turn_mode = "none"
         self.outcome = "ok"
-        self._was_tracking = False
         self._off_prev = np.zeros(2, dtype=np.float32)
         self._clear_errors()
         self.q_cmd = STAND_Q.copy()
-        self._last_teacher = STAND_Q.copy()
-        self._last_student = STAND_Q.copy()
+        self._cmd = stand_command()
+        self._last_teacher = stand_command()
+        self._last_student = stand_command()
+        self._last_a = np.zeros(N_ACT, dtype=np.float32)
         self._measure = None
         self._exec_bias = {}
         self.status = "stand"
@@ -259,21 +253,22 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
     def _feet_xy(self) -> np.ndarray:
         return 0.5 * (self.data.geom_xpos[self.r_fg, :2] + self.data.geom_xpos[self.l_fg, :2])
 
-    def _active_vx(self) -> float:
-        if self.outcome == "brace":
-            return 0.0
+    def _plan_command(self) -> np.ndarray:
+        cmd = command_from_plan(self.waypoint, exec_bias=self._exec_bias)
         if self._steps_goal > 0 and self._step_count >= self._steps_goal:
-            return 0.0
-        vx = float(self.waypoint.teacher().vx)
-        if self._steps_goal > 0 and abs(vx) < 0.08:
-            vx = 0.5
-        vx = vx + float(self._exec_bias.get("vx", 0.0))
-        return float(np.clip(vx, -1.0, 1.0))
+            cmd[CMD_VX] = 0.0
+        if self.outcome == "fall":
+            cmd[CMD_VX] = 0.0
+            cmd[CMD_H] = STAND_Z
+        return clip_command(cmd)
+
+    def _active_vx(self) -> float:
+        return float(self._cmd[CMD_VX])
 
     def _balance_err(self) -> np.ndarray:
         vx = self._active_vx()
         off = self._com_xy() - self._feet_xy() - np.array([STAND_COM_X + 0.035 * vx, 0.0], dtype=np.float32)
-        h = float(self._pelvis()[2]) - STAND_Z * float(self.waypoint.teacher().height)
+        h = float(self._pelvis()[2]) - float(self._cmd[CMD_H])
         return np.array([off[0], off[1], h], dtype=np.float32)
 
     def scene_brief(self) -> dict:
@@ -298,14 +293,7 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
             }
 
     def _needs_home(self) -> bool:
-        return (
-            self.outcome == "brace"
-            or self._tilt_up() < BRACE_TILT
-            or float(self._pelvis()[2]) < FALL_Z
-        )
-
-    def _floor_z(self) -> float:
-        return 0.52 + 0.10 * float(self.waypoint.teacher().height)
+        return self.outcome == "fall" or self._tilt_up() < TILT_LIM or float(self._pelvis()[2]) < FALL_Z
 
     def begin_command(self, text: str):
         with self.lock:
@@ -316,17 +304,13 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
             self.user_cmd = text
             self.l1_ok = True
             self.outcome = "ok"
-            self._was_tracking = False
             self._step_count = 0
             self._steps_done = 0
             self._steps_goal = 0
-            self._phase = 0.0
-            self._prev_swing = 1.0
+            self._walk_ticks = 0
             self._exec_bias = {}
             self._clear_errors()
             self._yaw_applied = 0.0
-            self._err_xy_hist.clear()
-            self._tilt_hist.clear()
             self._turn_heading0 = None
             self._requested_yaw = None
             self.status = self.user_cmd or "stand"
@@ -335,7 +319,7 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
         with self.lock:
             self.last_l1 = time.monotonic()
             self.l1_ok = bool(l1_ok)
-            if self.outcome == "brace":
+            if self.outcome == "fall":
                 self.user_cmd = ""
                 self.status = "failed"
                 return
@@ -353,11 +337,8 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
                 self._step_count = 0
                 self._steps_done = 0
                 self._steps_goal = int(plan.teacher().steps)
-                self._phase = 0.0
-                self._prev_swing = 1.0
+                self._walk_ticks = 0
             if fresh:
-                self._wave_phase = 0.0
-                self._kick_phase = 0.0
                 req = parse_requested_yaw(plan.skill, plan.params)
                 same_goal = (
                     req is not None
@@ -367,8 +348,6 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
                 )
                 if not same_goal:
                     self._yaw_applied = 0.0
-                    self._err_xy_hist.clear()
-                    self._tilt_hist.clear()
                     self._turn_heading0 = self._heading()
                     self._requested_yaw = req
                 self.goal = plan
@@ -396,18 +375,21 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
         with self.lock:
             self.l1_busy = False
 
-    def _set_root_yaw(self, yaw: float) -> None:
-        half = 0.5 * float(yaw)
-        self.data.qpos[3:7] = (np.cos(half), 0.0, 0.0, np.sin(half))
-        self.data.qvel[:] = 0
-        mujoco.mj_forward(self.model, self.data)
-
     def _slew(self, desired: np.ndarray) -> np.ndarray:
         q = self.q_cmd.astype(np.float32)
         return np.clip(q + np.clip(desired.astype(np.float32) - q, -SLEW, SLEW), self.lo, self.hi)
 
     def _pd_torque(self, q_cmd: np.ndarray) -> np.ndarray:
         return compute_torques(self.model, self.data, q_cmd, self.kp, self.kd, self.qadr, self.vadr)
+
+    def _update_steps(self) -> None:
+        if abs(self._active_vx()) > 0.08:
+            self._walk_ticks += 1
+            dt = float(self.model.opt.timestep)
+            self._step_count = int(self._walk_ticks * dt / STEP_PERIOD)
+            self._steps_done = self._step_count
+        if self._turn_heading0 is not None:
+            self._yaw_applied = self._achieved_yaw()
 
     def step(self):
         err = self._balance_err()
@@ -416,13 +398,13 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
         language = encode_instr(self.waypoint.param_text())
         z = self.waypoint.z()
         errors = np.stack(self.errors)
-        teacher, src = self._track(err)
+        teacher = self._plan_command()
         chosen = teacher
-        self.ctrl_source = src
+        self.ctrl_source = "l3"
         if self._tick % VISION_STRIDE == 0:
             self._eye_rgb = self._render_eye()
         student = self._last_student
-        if self.outcome != "brace" and self._tick % VISION_STRIDE == 0:
+        if self.outcome != "fall" and self._tick % VISION_STRIDE == 0:
             student = self._student(self._eye_rgb, proprio, language, z, errors)
             self._last_student = student
             mse = float(np.mean((student - teacher) ** 2))
@@ -446,35 +428,44 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
             )
             if len(self.logs) > 4_000:
                 self.logs = self.logs[-3_000:]
-        if self.outcome != "brace":
+        if self.outcome != "fall":
             chosen = self._mix(teacher, student)
-            self.ctrl_source = "track" if self.alpha <= 1e-8 else f"residual-{self.stage}"
+            if self.alpha > 1e-8:
+                self.ctrl_source = f"l3+l2-{self.stage}"
         self._last_teacher = teacher
-        target = chosen
-        if self.l3_drive and self.outcome != "brace":
-            t = self.waypoint.teacher()
-            walking = abs(self._active_vx()) > 0.08 or int(self._steps_goal) > 0
-            if not walking and abs(float(t.kick)) <= 0.2 and self.turn_mode == "none":
-                z_tgt = STAND_Z * float(t.height)
-                obs = build_obs(
-                    self.data,
-                    self.torso_id,
-                    self._hinges(),
-                    self._qd(),
-                    chosen,
-                    z_tgt,
-                    self._active_vx(),
-                )
-                x = torch.as_tensor(obs, device=self.device, dtype=torch.float32).unsqueeze(0)
-                with torch.no_grad():
-                    delta = self.l3.deltas(x)[0].detach().cpu().numpy().astype(np.float32)
-                target = apply_leg_deltas(chosen, delta, height_01=float(t.height))
-                self.ctrl_source = "l3"
-        self.q_cmd = self._slew(target)
+        self._cmd = chosen
+        if self.outcome != "fall" and self._tick % DECIMATION == 0:
+            obs = build_obs(self.data, self.torso_id, self._hinges(), self._qd(), self._last_a, self._cmd)
+            x = torch.as_tensor(obs, device=self.device, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                self._last_a = self.l3.act(x)[0].detach().cpu().numpy().astype(np.float32)
+        vx = float(self._cmd[CMD_VX])
+        off = com_err_xy(self.data, self.pelvis_id, self.r_fg, self.l_fg, vx)
+        d_off = off - self._off_prev
+        self._off_prev = off.copy()
+        yaw = self._heading()
+        q_des = q_from_action(self._cmd, self._last_a) + balance_delta(
+            body_xy(off, yaw),
+            body_xy(d_off, yaw),
+            height_01=height_01(float(self._cmd[CMD_H])),
+            vx=vx,
+        )
+        q_des = np.clip(q_des, self.lo, self.hi)
+        self.q_cmd = self._slew(q_des)
         self.data.ctrl[:] = self._pd_torque(self.q_cmd)
         mujoco.mj_step(self.model, self.data)
+        if self._fell():
+            self.outcome = "fall"
+        elif (
+            self.outcome == "fall"
+            and self.status != "failed"
+            and self._tilt_up() > 0.85
+            and float(self._pelvis()[2]) > STAND_Z - 0.08
+        ):
+            self.outcome = "ok"
         if self._measure is not None:
             self._poll_measure()
+        self._update_steps()
         self._tick += 1
 
     def _render(self):
@@ -499,12 +490,21 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
         w, x, y, z = self.data.qpos[3:7]
         return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
 
+    def _achieved_yaw(self) -> float:
+        if self._turn_heading0 is None:
+            return 0.0
+        return wrap_angle(self._heading() - float(self._turn_heading0))
+
+    def _turn_done(self) -> bool:
+        req = self._requested_yaw
+        if req is None:
+            return False
+        from agent.config import PARAM_OK
+
+        return abs(float(req) - self._achieved_yaw()) <= PARAM_OK["yaw"]
+
     def _fell(self) -> bool:
-        return (
-            self.outcome == "brace"
-            or self._tilt_up() < BRACE_TILT
-            or float(self._pelvis()[2]) < FALL_Z
-        )
+        return self._tilt_up() < TILT_LIM or float(self._pelvis()[2]) < min(FALL_Z, CFG_FALL_Z)
 
     def telemetry(self) -> dict:
         with self.lock:
@@ -583,4 +583,3 @@ class RobotEngine(TrackerMixin, FlywheelMixin):
             except Exception:
                 pass
             setattr(self, attr, None)
-

@@ -15,10 +15,12 @@ from agent.config import PARAM_KEYS, ROOT
 from agent.joint_pd import kp_kd_vectors
 
 MODEL_XML = ROOT / "models" / "unitree_h2" / "scene_app.xml"
+TRAIN_XML = ROOT / "models" / "unitree_h2" / "scene_train.xml"
 N_ACT = 31
 QPOS_FREE = 7
-ACTION_DIM = N_ACT
-TRIAL_FEAT = N_ACT + N_ACT + len(PARAM_KEYS)
+# L2 command: vx, vy, wz, h_m, 14 arm targets. Not 31 joint angles.
+ACTION_DIM = 18
+TRIAL_FEAT = N_ACT + ACTION_DIM + len(PARAM_KEYS)
 # Actuator order (see h2_mujoco.xml <actuator>).
 L_HP, L_HR, L_HYA, L_KN, L_AR, L_AP = 0, 1, 2, 3, 4, 5
 R_HP, R_HR, R_HYA, R_KN, R_AR, R_AP = 6, 7, 8, 9, 10, 11
@@ -97,6 +99,19 @@ def disable_foot_spheres(model: mujoco.MjModel, body_ids: tuple[int, ...]) -> in
         if int(model.geom_bodyid[g]) not in want:
             continue
         if int(model.geom_type[g]) != int(mujoco.mjtGeom.mjGEOM_SPHERE):
+            continue
+        model.geom_contype[g] = 0
+        model.geom_conaffinity[g] = 0
+        n += 1
+    return n
+
+
+def disable_mesh_contacts(model: mujoco.MjModel) -> int:
+    """MJX-JAX does not like mesh contacts; keep capsules/boxes for training."""
+    n = 0
+    mesh = int(mujoco.mjtGeom.mjGEOM_MESH)
+    for g in range(int(model.ngeom)):
+        if int(model.geom_type[g]) != mesh:
             continue
         model.geom_contype[g] = 0
         model.geom_conaffinity[g] = 0

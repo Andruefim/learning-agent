@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import torch
 
 from agent.config import PARAM_KEYS, PARAM_SCALE, SKILL_IDS, SKILL_TO_I, STAND_Z, TRIAL_MAX
-from agent.h2 import N_ACT, TRIAL_FEAT
+from agent.h2 import ACTION_DIM, N_ACT, TRIAL_FEAT
 from agent.plan import success_keys
 
 
@@ -74,8 +74,8 @@ class MultiTrialBuffer:
         for i, trial in enumerate(self._items):
             ids[0, i] = int(SKILL_TO_I.get(trial.skill, 0))
             state = list(trial.state or [])[:N_ACT] + [0.0] * N_ACT
-            action = list(trial.action or [])[:N_ACT] + [0.0] * N_ACT
+            action = list(trial.action or [])[:ACTION_DIM] + [0.0] * ACTION_DIM
             err = [float(trial.error_vector.get(k, 0.0)) for k in PARAM_KEYS]
-            row = state[:N_ACT] + action[:N_ACT] + err
+            row = state[:N_ACT] + action[:ACTION_DIM] + err
             feat[0, i] = torch.tensor(row[:TRIAL_FEAT], device=device, dtype=torch.float32)
         return ids, feat

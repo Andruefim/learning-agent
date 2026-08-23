@@ -52,8 +52,8 @@
       <p class="text-[10px] uppercase tracking-widest text-zinc-500 mb-1">Levels</p>
       <ul class="text-xs text-zinc-400 space-y-1 mb-4 font-mono">
         <li><span class="text-emerald-500">L1</span> VLM · language → motor JSON</li>
-        <li><span class="text-sky-400">L2</span> tracker on the body · student gated</li>
-        <li><span class="text-amber-400">L3</span> MuJoCo · contacts / gravity</li>
+        <li><span class="text-sky-400">L2</span> command student · gated residual</li>
+        <li><span class="text-amber-400">L3</span> foundation MLP + Joint-PD</li>
       </ul>
 
       <p class="text-[10px] uppercase tracking-widest text-zinc-500 mb-1">Log</p>
@@ -81,9 +81,9 @@
         if (m.type === "log") line(m.text);
         if (m.type === "telemetry") {
           document.getElementById("badge").textContent = (m.instruction || m.subgoal || "stand").slice(0, 28);
-          const st = m.outcome === "brace" ? "brace" : (m.status || "stand");
+          const st = m.outcome === "fall" ? "fall" : (m.status || "stand");
           document.getElementById("hold").textContent = st;
-          document.getElementById("hold").className = m.outcome === "brace"
+          document.getElementById("hold").className = m.outcome === "fall"
             ? "bg-amber-950 text-amber-400 px-2 py-1 rounded"
             : "bg-zinc-800 text-zinc-500 px-2 py-1 rounded";
           document.getElementById("s-err").textContent = m.error;

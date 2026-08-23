@@ -25,7 +25,7 @@ def wrap_angle(a: float) -> float:
 
 @dataclass
 class TeacherIntent:
-    """Numeric prior used only as tracker teacher / distillation label. Not the L1 contract."""
+    """Numeric prior mapped to an L3 command (vx, vy, wz, h, q_arms). Not joint angles."""
 
     height: float = 1.0
     vx: float = 0.0

@@ -79,17 +79,15 @@ SHADOW_EMA_TICKS = 200
 REPLAY_GATE = 1000
 ALPHA_START = 0.03
 ALPHA_STEP = 0.02
-# Bounded Residual (Variant A): student adds a clipped residual on the tracker.
+# Bounded Residual (Variant A): student adds a clipped residual on the L3 command.
 # ALPHA_MAX is the standing design, not a demo knob. Do not raise it without a
 # new stability argument. Stage D (Safety-Shield, alpha→1 with emergency
 # takeover) is a possible future direction — not implemented. If added, the
-# shield must trip on _should_brace trends (err/tilt rate), not late static
-# thresholds such as tilt<0.8 or e>4*TRACK_OK.
+# shield must trip on fall trends (tilt/z), not late static thresholds.
 ALPHA_MAX = 0.12
-RESIDUAL_LIMIT = 0.15
+RESIDUAL_LIMIT = 0.25
 ROLLBACK_FALL_DELTA = 0.08
-# Peak lean as a fraction of hip_x ROM, times sin(phase)*stability.
-# Known large remaining (e.g. 90°): 0.45 unloads swing F_N. Unknown remaining: 0.22.
+# Legacy CPG constants (unused by the foundation controller).
 PIVOT_HX_SHIFT = 0.45
 PIVOT_HX_OPEN = 0.22
 HX_PD_CLIP = 0.25
@@ -98,27 +96,27 @@ H1_SPEC = {
     "kind": "offline_heldout_plus_live_shadow",
     "requires_student_on_actuators": False,
     "offline": (
-        "Held-out teacher action chunks from replay. Student forward only; physics untouched. "
+        "Held-out teacher command chunks from replay. Student forward only; physics untouched. "
         "Pass if MSE(true error deque) < 0.05 and beats zero-deque and shuffled-error ablation by 1e-4."
     ),
     "shadow": (
-        "Every vision tick: u_student vs u_tracker, actuators stay on the teacher. "
+        "Every vision tick: u_student vs l3_cmd from L1, actuators stay on the foundation+PD. "
         f"Stage B after shadow_mse_ema < {SHADOW_MSE_MAX} for {SHADOW_EMA_TICKS} ticks, "
         f"replay>={REPLAY_GATE}, and fall rate not rising. "
-        "Bounded Residual ALPHA_MAX=0.12 (Variant A). Stage D (alpha→1 Safety-Shield) is not implemented."
+        "Bounded Residual ALPHA_MAX=0.12 (Variant A) on the 18-DoF command, not joint angles."
     ),
     "shadow_streak": SHADOW_EMA_TICKS,
     "shadow_mse_max": SHADOW_MSE_MAX,
     "replay_gate": REPLAY_GATE,
     "residual": (
-        "u = u_tracker + alpha * clip(u_student - u_tracker, ±limit). "
+        "cmd = l3_cmd + alpha * clip(u_student - l3_cmd, +/-limit). "
         "alpha starts at 0.03, grows only while ema stays in band; "
         "auto-rollback to last working alpha if fall rate rises. "
-        "ALPHA_MAX=0.12 is the cap; the tracker keeps base kinematics."
+        "ALPHA_MAX=0.12 is the cap; Joint-PD tracks the foundation q_target."
     ),
     "stage_d": (
-        "Future Safety-Shield only: alpha→1 with takeover on _should_brace "
-        "trend (err/tilt rate). Static tilt<0.8 / e>4*TRACK_OK are too late."
+        "Future Safety-Shield only: alpha->1 with takeover on fall trend (tilt/z). "
+        "Static tilt<0.8 / e>4*TRACK_OK are too late."
     ),
     "weights": "Updated only on Save/Consolidate (offline CFM). Runtime eval(), 0 backprop.",
 }
