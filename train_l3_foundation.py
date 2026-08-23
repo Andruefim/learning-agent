@@ -77,6 +77,23 @@ def curriculum_stage(it: int, iters: int) -> int:
     return STAGE_FULL
 
 
+RESUME_EVERY = 5  # unconditional checkpoint cadence, independent of the production gate
+
+
+def latest_path_for(out_path: Path) -> Path:
+    """Resume checkpoint next to the gated one. Different name so engine.py
+    (which only loads `l3_foundation.pt`) never picks this up by accident."""
+    return out_path.with_name(f"{out_path.stem}.latest.pt")
+
+
+def save_latest(policy: HumanoidFoundationPolicy, path: Path) -> None:
+    """Unconditional snapshot for resuming/inspecting training. Not gated,
+    not loaded by the live app - only `save_if_stand`'s output is."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(policy.state_dict(), path)
+    print(f"resume checkpoint saved {path}", flush=True)
+
+
 def save_if_stand(policy: HumanoidFoundationPolicy, path: Path, device: torch.device) -> bool:
     report = eval_inplace(policy, seconds=4.0, device=device)
     cases = report.get("cases", {})
@@ -194,6 +211,8 @@ def ppo_torch(
                 flush=True,
             )
         t0 = time.time()
+        if it % RESUME_EVERY == 0 or it == iters:
+            save_latest(net.actor, latest_path_for(out_path))
         if it == iters or it % 20 == 0:
             save_if_stand(net.actor, out_path, device)
     return net.actor
@@ -309,6 +328,9 @@ def ppo_jax(
         actor = jax.tree_util.tree_map(lambda p, g: p - lr * g, actor, grads[0])
         critic = jax.tree_util.tree_map(lambda p, g: p - lr * g, critic, grads[1])
         log_std = log_std - lr * grads[2]
+        if it % RESUME_EVERY == 0 or it == iters:
+            policy.load_state_dict(jax_params_to_state_dict(actor))
+            save_latest(policy, latest_path_for(out_path))
         if it == iters or it % 20 == 0:
             policy.load_state_dict(jax_params_to_state_dict(actor))
             save_if_stand(policy, out_path, torch_device)
