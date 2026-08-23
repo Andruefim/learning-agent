@@ -23,10 +23,21 @@ from agent.h2 import (
     colliding_geoms,
     disable_foot_spheres,
     disable_mesh_contacts,
+    cylinders_to_capsules,
     joint_limits,
 )
 from agent.joint_pd import compute_torques, kp_kd_vectors
-from agent.l3_cmd import CMD_ARMS, CMD_H, CMD_VX, CMD_VY, CMD_WZ, L2_CMD_DIM, stand_command
+from agent.l3_cmd import (
+    CMD_ARMS,
+    CMD_H,
+    CMD_VX,
+    CMD_VY,
+    CMD_WZ,
+    L2_CMD_DIM,
+    command_from_plan,
+    stand_command,
+)
+from agent.plan import Plan
 from agent.l3_foundation import (
     ACT_DIM,
     DECIMATION,
@@ -56,6 +67,7 @@ def load_train_model(xml: Path | None = None) -> mujoco.MjModel:
     l_foot = model.body("left_ankle_pitch_link").id
     disable_foot_spheres(model, (r_foot, l_foot))
     disable_mesh_contacts(model)
+    cylinders_to_capsules(model)
     _ = pelvis
     return model
 
@@ -284,50 +296,154 @@ class VecFoundationEnv:
         return np.stack(obs), np.asarray(rew, dtype=np.float32), np.asarray(done, dtype=np.float32)
 
 
-def eval_stand(policy, *, seconds: float = 4.0, device=None) -> dict:
-    """Hold idle stand. Pass if tilt/z stay up for the full window."""
-    env = FoundationEnv(stage=STAGE_STAND)
-    cmd = stand_command()
-    obs = env.reset(cmd)
+def _policy_act(policy, obs: np.ndarray, device) -> np.ndarray:
+    if hasattr(policy, "act_np"):
+        return policy.act_np(obs, device=device)
+    return np.zeros(ACT_DIM, dtype=np.float32)
+
+
+def _rollout_frozen(policy, cmd: np.ndarray, *, seconds: float, device, model) -> dict:
+    env = FoundationEnv(model, stage=STAGE_STAND)
+    obs = env.reset(np.asarray(cmd, dtype=np.float32))
     ticks = int(round(seconds / (env.dt * DECIMATION)))
-    z_hist, tilt_hist = [], []
+    z_hist, tilt_hist, q_hist = [], [], []
+    done = False
     for _ in range(max(1, ticks)):
-        if hasattr(policy, "act_np"):
-            a = policy.act_np(obs, device=device)
-        else:
-            a = np.zeros(ACT_DIM, dtype=np.float32)
-        obs, _, done = env.step(a)
+        obs, _, done = env.step(_policy_act(policy, obs, device))
         z_hist.append(env._z())
         tilt_hist.append(env._tilt())
+        q_hist.append(env._hinges().copy())
         if done:
             break
-    held = len(z_hist) >= ticks and min(z_hist) > STAND_Z - 0.08 and min(tilt_hist) > 0.85
+    z_min = float(min(z_hist) if z_hist else 0.0)
+    z_last = float(z_hist[-1] if z_hist else 0.0)
+    tilt_min = float(min(tilt_hist) if tilt_hist else 0.0)
+    q_last = q_hist[-1] if q_hist else np.zeros(ACT_DIM, dtype=np.float32)
     return {
-        "ok": bool(held),
         "seconds": float(len(z_hist) * env.dt * DECIMATION),
-        "z_min": float(min(z_hist) if z_hist else 0.0),
-        "tilt_min": float(min(tilt_hist) if tilt_hist else 0.0),
+        "z_min": z_min,
+        "z_last": z_last,
+        "tilt_min": tilt_min,
+        "q_last": q_last,
         "ticks": int(len(z_hist)),
         "need": int(ticks),
+        "fell": bool(done),
+        "full": len(z_hist) >= ticks,
     }
 
 
-def jax_available() -> bool:
+def eval_inplace(policy, *, seconds: float = 4.0, device=None) -> dict:
+    """In-place stand / squat / arms. Save gate: no fall, stay upright, track pose."""
+    from agent.h2 import L_SH, R_SH
+
+    model = load_train_model()
+    cases = (
+        (
+            "stand",
+            stand_command(),
+            lambda r: (not r["fell"] and r["full"] and r["z_min"] > STAND_Z - 0.08 and r["tilt_min"] > 0.85),
+        ),
+        (
+            "squat",
+            command_from_plan(Plan("присесть", skill="squat", params={"depth": "low"})),
+            lambda r: (
+                not r["fell"]
+                and r["full"]
+                and r["tilt_min"] > 0.75
+                and r["z_last"] < STAND_Z - 0.02
+                and r["z_min"] > 0.55
+            ),
+        ),
+        (
+            "reach",
+            command_from_plan(Plan("подними руки", skill="reach", params={"hand": "both"})),
+            lambda r: (
+                not r["fell"]
+                and r["full"]
+                and r["tilt_min"] > 0.80
+                and r["z_min"] > STAND_Z - 0.16
+                and float(r["q_last"][R_SH]) < -0.45
+                and float(r["q_last"][L_SH]) < -0.45
+            ),
+        ),
+        (
+            "wave",
+            command_from_plan(Plan("махни правой", skill="wave", params={"hand": "right"})),
+            lambda r: (
+                not r["fell"]
+                and r["full"]
+                and r["tilt_min"] > 0.80
+                and r["z_min"] > STAND_Z - 0.16
+                and float(r["q_last"][R_SH]) < -0.45
+            ),
+        ),
+        (
+            "hands_down",
+            command_from_plan(Plan("опусти руки", skill="hold", params={"hands": "down"})),
+            lambda r: (
+                not r["fell"]
+                and r["full"]
+                and r["tilt_min"] > 0.85
+                and r["z_min"] > STAND_Z - 0.10
+                and abs(float(r["q_last"][R_SH])) < 0.45
+                and abs(float(r["q_last"][L_SH])) < 0.45
+            ),
+        ),
+    )
+    reports: dict[str, dict] = {}
+    all_ok = True
+    for name, cmd, ok_fn in cases:
+        raw = _rollout_frozen(policy, cmd, seconds=seconds, device=device, model=model)
+        ok = bool(ok_fn(raw))
+        all_ok = all_ok and ok
+        reports[name] = {
+            "ok": ok,
+            "seconds": raw["seconds"],
+            "z_min": raw["z_min"],
+            "z_last": raw["z_last"],
+            "tilt_min": raw["tilt_min"],
+            "ticks": raw["ticks"],
+            "need": raw["need"],
+            "fell": raw["fell"],
+        }
+    stand = reports["stand"]
+    return {
+        "ok": bool(all_ok),
+        "seconds": stand["seconds"],
+        "z_min": stand["z_min"],
+        "tilt_min": stand["tilt_min"],
+        "ticks": stand["ticks"],
+        "need": stand["need"],
+        "cases": reports,
+    }
+
+
+def eval_stand(policy, *, seconds: float = 4.0, device=None) -> dict:
+    """Idle stand plus in-place squat/arms. Same save gate as training."""
+    return eval_inplace(policy, seconds=seconds, device=device)
+
+
+def jax_import_error() -> str | None:
     try:
         import jax  # noqa: F401
+    except Exception as exc:
+        return f"jax: {exc!r}"
+    try:
         from mujoco import mjx  # noqa: F401
-    except Exception:
-        return False
-    return True
+    except Exception as exc:
+        return f"mjx: {exc!r}"
+    return None
+
+
+def jax_available() -> bool:
+    return jax_import_error() is None
 
 
 def jax_device_kind() -> str:
-    if not jax_available():
-        return "none"
-    import jax
-
     try:
+        import jax
+
         dev = jax.devices()[0]
         return f"{dev.platform}:{dev.device_kind}"
     except Exception:
-        return "jax-unknown"
+        return "none"

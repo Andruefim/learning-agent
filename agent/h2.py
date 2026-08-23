@@ -119,6 +119,19 @@ def disable_mesh_contacts(model: mujoco.MjModel) -> int:
     return n
 
 
+def cylinders_to_capsules(model: mujoco.MjModel) -> int:
+    """Official H2 shins are cylinders; MJX-JAX has no cylinder-box contacts."""
+    n = 0
+    cyl = int(mujoco.mjtGeom.mjGEOM_CYLINDER)
+    cap = int(mujoco.mjtGeom.mjGEOM_CAPSULE)
+    for g in range(int(model.ngeom)):
+        if int(model.geom_type[g]) != cyl:
+            continue
+        model.geom_type[g] = cap
+        n += 1
+    return n
+
+
 def box_geom(model: mujoco.MjModel, geom_ids: list[int], fallback: int) -> int:
     for g in geom_ids:
         if int(model.geom_type[g]) == int(mujoco.mjtGeom.mjGEOM_BOX):

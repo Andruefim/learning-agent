@@ -1,7 +1,7 @@
 """Playground-style PPO for HumanoidFoundationPolicy.
 
 Prefers MJX-JAX on ROCm (512+ envs). Falls back to in-process MuJoCo vec envs.
-Writes flywheel_data/l3_foundation.pt only after idle stand holds ≥4 s.
+Writes flywheel_data/l3_foundation.pt only after in-place stand/squat/arms hold ≥4 s.
 
 Run:  python train_l3_foundation.py
       python train_l3_foundation.py --iters 200 --envs 512
@@ -33,9 +33,9 @@ from agent.l3_env import (
     STAGE_STAND,
     STAGE_VX,
     VecFoundationEnv,
-    eval_stand,
-    jax_available,
+    eval_inplace,
     jax_device_kind,
+    jax_import_error,
 )
 from agent.l3_foundation import (
     ACT_DIM,
@@ -77,8 +77,14 @@ def curriculum_stage(it: int, iters: int) -> int:
 
 
 def save_if_stand(policy: HumanoidFoundationPolicy, path: Path, device: torch.device) -> bool:
-    report = eval_stand(policy, seconds=4.0, device=device)
-    print(f"stand eval: {report}", flush=True)
+    report = eval_inplace(policy, seconds=4.0, device=device)
+    cases = report.get("cases", {})
+    bits = " ".join(
+        f"{name}={'ok' if c['ok'] else 'fail'}(z={c['z_min']:.2f}/{c.get('z_last', c['z_min']):.2f} "
+        f"tilt={c['tilt_min']:.3f}{' fell' if c.get('fell') else ''})"
+        for name, c in cases.items()
+    )
+    print(f"inplace eval: {'ok' if report['ok'] else 'fail'} {bits}", flush=True)
     if not report["ok"]:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -307,7 +313,9 @@ def ppo_jax(
 
 
 def try_mjx(n_envs: int) -> bool:
-    if not jax_available():
+    err = jax_import_error()
+    if err is not None:
+        print(f"MJX unavailable ({err}); using CPU MuJoCo vec env", flush=True)
         return False
     try:
         from agent.l3_mjx import MjxFoundationEnv
@@ -319,6 +327,7 @@ def try_mjx(n_envs: int) -> bool:
         act = jax.numpy.zeros((env.n, ACT_DIM))
         env.step(act)
         _ = obs
+        print(f"MJX ok n={env.n} put_model+step", flush=True)
         return True
     except Exception as exc:
         print(f"MJX unavailable ({exc!r}); using CPU MuJoCo vec env", flush=True)
@@ -337,7 +346,10 @@ def main() -> None:
     device = resolve_device(args.device)
     out_path = Path(args.out)
     kind = jax_device_kind()
-    gpu_jax = jax_available() and not kind.startswith("none") and "cpu" not in kind.lower()
+    mjx_err = jax_import_error()
+    gpu_jax = mjx_err is None and not kind.startswith("none") and "cpu" not in kind.lower()
+    if mjx_err is not None:
+        print(f"jax/mjx import: {mjx_err}", flush=True)
     iters = args.iters if args.iters is not None else (200 if gpu_jax else 0)
     print(
         f"foundation PPO obs={OBS_DIM} act={ACT_DIM} torch={device} jax={kind} "
