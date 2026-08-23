@@ -12,7 +12,6 @@ import numpy as np
 
 import mujoco
 
-from agent.config import STAND_Z
 from agent.h2 import (
     N_ACT,
     SPAWN_Z,
@@ -21,9 +20,9 @@ from agent.h2 import (
     actuator_addrs,
     box_geom,
     colliding_geoms,
+    cylinders_to_capsules,
     disable_foot_spheres,
     disable_mesh_contacts,
-    cylinders_to_capsules,
     joint_limits,
 )
 from agent.joint_pd import compute_torques, kp_kd_vectors
@@ -34,20 +33,28 @@ from agent.l3_cmd import (
     CMD_VY,
     CMD_WZ,
     L2_CMD_DIM,
-    command_from_plan,
+    arm_targets,
     stand_command,
 )
-from agent.plan import Plan
+from agent.plan import TeacherIntent
 from agent.l3_foundation import (
     ACT_DIM,
     DECIMATION,
-    FALL_Z,
+    EPISODE_SEC,
+    HEIGHT_RANGE,
     OBS_DIM,
-    TILT_LIM,
+    PUSH_DUR_SEC,
+    PUSH_EVERY_SEC,
+    PUSH_FORCE,
+    REACH_FRAC,
+    TERMINAL_PENALTY,
+    TRAIN_FALL_Z,
+    TRAIN_TILT,
     balance_delta,
     body_xy,
     build_obs,
     com_err_xy,
+    foot_pitch_from_xmat,
     heading_z,
     height_01,
     q_from_action,
@@ -74,14 +81,21 @@ def load_train_model(xml: Path | None = None) -> mujoco.MjModel:
 
 def _sample_command(rng: np.random.Generator, stage: int) -> np.ndarray:
     cmd = stand_command()
-    cmd[CMD_H] = float(rng.uniform(0.78, 1.02))
-    if stage >= STAGE_STAND:
-        if rng.random() < 0.35:
-            cmd[CMD_ARMS] = rng.uniform(-0.4, 0.2, size=14).astype(np.float32)
-            cmd[4] = float(rng.uniform(-1.55, 0.0))
-            cmd[11] = float(rng.uniform(-1.55, 0.0))
-        if rng.random() < 0.25:
-            cmd[CMD_H] = float(rng.uniform(0.70, 0.90))
+    cmd[CMD_H] = float(rng.uniform(*HEIGHT_RANGE))
+    if rng.random() < REACH_FRAC:
+        pitch = float(rng.uniform(0.33, 1.0))
+        asym = bool(rng.random() < 0.45)
+        t = TeacherIntent(
+            r_arm=pitch,
+            l_arm=float(rng.uniform(0.20, pitch)) if asym else pitch,
+            r_out=float(rng.uniform(-0.2, 0.6)),
+            l_out=float(rng.uniform(-0.2, 0.6)),
+        )
+        cmd[CMD_ARMS] = arm_targets(t)
+    elif rng.random() < 0.20:
+        cmd[CMD_ARMS] = rng.uniform(-0.4, 0.2, size=14).astype(np.float32)
+        cmd[4] = float(rng.uniform(-1.55, 0.0))
+        cmd[11] = float(rng.uniform(-1.55, 0.0))
     if stage >= STAGE_VX:
         cmd[CMD_VX] = float(rng.uniform(-0.15, 0.70))
     if stage >= STAGE_FULL:
@@ -115,9 +129,13 @@ class FoundationEnv:
         self.prev_a = np.zeros(ACT_DIM, dtype=np.float32)
         self._cmd_left = 0
         self._push_left = 0
+        self._push_wait = 0
+        self._time_left = 0
         self._air_l = 0.0
         self._air_r = 0.0
         self._cmd_frozen = False
+        self._pushes = True
+        self._horizon = True
         self._off_prev = np.zeros(2, dtype=np.float32)
         self.reset()
 
@@ -146,8 +164,20 @@ class FoundationEnv:
         wz = float(self.data.qvel[5])
         return v_b.astype(np.float32), wz
 
+    def _policy_dt(self) -> float:
+        return self.dt * DECIMATION
+
+    def _omega(self) -> np.ndarray:
+        return np.asarray(self.data.cvel[self.torso_id, :3], dtype=np.float64)
+
     def _terminated(self) -> bool:
-        return self._tilt() < TILT_LIM or self._z() < FALL_Z
+        return self._tilt() < TRAIN_TILT or self._z() < TRAIN_FALL_Z
+
+    def apply_impulse(self, fx: float, fy: float, *, duration_sec: float = PUSH_DUR_SEC) -> None:
+        self.data.xfrc_applied[self.torso_id] = 0
+        self.data.xfrc_applied[self.torso_id, 0] = float(fx)
+        self.data.xfrc_applied[self.torso_id, 1] = float(fy)
+        self._push_left = max(1, int(round(float(duration_sec) / self._policy_dt())))
 
     def _obs(self) -> np.ndarray:
         return build_obs(self.data, self.torso_id, self._hinges(), self._qd(), self.last_a, self.cmd)
@@ -162,43 +192,67 @@ class FoundationEnv:
         self.data.qvel[:] = 0
         self.data.qfrc_applied[:] = 0
         self.data.xfrc_applied[:] = 0
+        nq = 0.03 * self._rng.normal(size=N_ACT)
+        self.data.qpos[self.qadr] = np.clip(STAND_Q + nq, self.lo, self.hi)
+        self.data.qvel[self.vadr] = 0.04 * self._rng.normal(size=N_ACT)
+        if cmd is not None:
+            self.data.qpos[self.qadr] = STAND_Q
+            self.data.qvel[:] = 0
         self.last_a = np.zeros(ACT_DIM, dtype=np.float32)
         self.prev_a = np.zeros(ACT_DIM, dtype=np.float32)
         self.cmd = stand_command() if cmd is None else np.asarray(cmd, dtype=np.float32).reshape(L2_CMD_DIM)
         self._cmd_frozen = cmd is not None
+        self._pushes = cmd is None
+        self._horizon = cmd is None
         if cmd is None:
             self.cmd = _sample_command(self._rng, self.stage)
-        self._cmd_left = int(self._rng.integers(150, 250))
+        pdt = self._policy_dt()
+        self._cmd_left = int(self._rng.integers(100, 201))
+        sec = float(self._rng.uniform(*EPISODE_SEC))
+        self._time_left = int(round(sec / pdt))
         self._push_left = 0
+        self._push_wait = int(round(float(self._rng.uniform(*PUSH_EVERY_SEC)) / pdt))
         self._air_l = 0.0
         self._air_r = 0.0
         self._off_prev = np.zeros(2, dtype=np.float32)
+        self.data.xfrc_applied[:] = 0
         mujoco.mj_forward(self.model, self.data)
         return self._obs()
 
     def _maybe_push(self) -> None:
-        if self.stage < STAGE_FULL:
-            self.data.xfrc_applied[self.torso_id] = 0
+        if not self._pushes:
+            if self._push_left > 0:
+                self._push_left -= 1
+                if self._push_left <= 0:
+                    self.data.xfrc_applied[self.torso_id] = 0
             return
         if self._push_left > 0:
             self._push_left -= 1
             if self._push_left <= 0:
                 self.data.xfrc_applied[self.torso_id] = 0
             return
-        if self._rng.random() < 0.008:
-            f = self._rng.uniform(-60.0, 60.0, size=2)
-            self.data.xfrc_applied[self.torso_id, 0:2] = f
-            self._push_left = int(self._rng.integers(6, 16))
+        self._push_wait -= 1
+        if self._push_wait > 0:
+            self.data.xfrc_applied[self.torso_id] = 0
+            return
+        mag = float(self._rng.uniform(*PUSH_FORCE))
+        ang = float(self._rng.uniform(0.0, 2.0 * np.pi))
+        self.data.xfrc_applied[self.torso_id] = 0
+        self.data.xfrc_applied[self.torso_id, 0] = mag * np.cos(ang)
+        self.data.xfrc_applied[self.torso_id, 1] = mag * np.sin(ang)
+        pdt = self._policy_dt()
+        self._push_left = max(1, int(round(PUSH_DUR_SEC / pdt)))
+        self._push_wait = int(round(float(self._rng.uniform(*PUSH_EVERY_SEC)) / pdt))
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool]:
         a = np.clip(np.asarray(action, dtype=np.float32).reshape(ACT_DIM), -1.0, 1.0)
         base = q_from_action(self.cmd, a)
-        action_rate = float(np.mean((a - self.prev_a) ** 2))
-        tau_acc = 0.0
+        da = a - self.last_a
+        dda = a - 2.0 * self.last_a + self.prev_a
         h01 = height_01(float(self.cmd[CMD_H]))
         vx = float(self.cmd[CMD_VX])
+        self._maybe_push()
         for _ in range(DECIMATION):
-            self._maybe_push()
             off = com_err_xy(self.data, self.pelvis_id, self.r_fg, self.l_fg, vx)
             d_off = off - self._off_prev
             self._off_prev = off.copy()
@@ -209,56 +263,44 @@ class FoundationEnv:
                 self.hi,
             )
             tau = compute_torques(self.model, self.data, q_tgt, self.kp, self.kd, self.qadr, self.vadr)
-            tau_acc += float(np.mean(tau * tau))
             self.data.ctrl[:] = tau
             mujoco.mj_step(self.model, self.data)
-        self.prev_a = self.last_a
+        self.prev_a = self.last_a.copy()
         self.last_a = a
         self._cmd_left -= 1
         if self._cmd_left <= 0 and not self._cmd_frozen:
             self.cmd = _sample_command(self._rng, self.stage)
-            self._cmd_left = int(self._rng.integers(150, 250))
+            self._cmd_left = int(self._rng.integers(100, 201))
 
-        v_b, wz = self._body_vel()
+        v_b, _wz = self._body_vel()
         z = self._z()
-        tilt = self._tilt()
+        g_z = self._tilt()
+        gyro = self._omega()
+        v_xy = np.asarray(self.data.qvel[0:2], dtype=np.float64)
+        v_cmd = np.array([float(self.cmd[CMD_VX]), float(self.cmd[CMD_VY])], dtype=np.float64)
+        r_h = float(np.exp(-10.0 * abs(z - float(self.cmd[CMD_H]))))
+        r_up = float(np.exp(-5.0 * (1.0 - g_z * g_z)))
+        r_vel = float(np.exp(-2.0 * float(np.sum((v_b[:2] - v_cmd) ** 2))))
+        r_rate = -0.01 * float(np.sum(da**2))
+        r_acc = -0.005 * float(np.sum(dda**2))
+        r_ang = -0.05 * float(gyro[0] ** 2 + gyro[1] ** 2)
+        r_lin = 0.0
+        if float(np.linalg.norm(v_cmd)) < 0.05:
+            r_lin = -0.1 * float(np.sum(v_xy**2))
+        p_r = foot_pitch_from_xmat(self.data.xmat[self.r_foot_id])
+        p_l = foot_pitch_from_xmat(self.data.xmat[self.l_foot_id])
+        r_foot = -0.1 * (p_r * p_r + p_l * p_l)
         q = self._hinges()
-        r_vx = float(np.exp(-4.0 * (v_b[0] - float(self.cmd[CMD_VX])) ** 2))
-        r_vy = float(np.exp(-8.0 * (v_b[1] - float(self.cmd[CMD_VY])) ** 2))
-        r_wz = float(np.exp(-6.0 * (wz - float(self.cmd[CMD_WZ])) ** 2))
-        r_h = float(np.exp(-12.0 * (z - float(self.cmd[CMD_H])) ** 2))
-        r_arm = float(np.exp(-4.0 * np.mean((q[15:29] - self.cmd[CMD_ARMS]) ** 2)))
-        r_up = float(np.exp(-6.0 * (1.0 - tilt) ** 2))
-        alive = 1.0
-        air_l = self._foot_air(self.l_geoms)
-        air_r = self._foot_air(self.r_geoms)
-        if air_l:
-            self._air_l += self.dt * DECIMATION
-        else:
-            self._air_l = 0.0
-        if air_r:
-            self._air_r += self.dt * DECIMATION
-        else:
-            self._air_r = 0.0
-        r_air = 0.0
-        if self.stage >= STAGE_VX and abs(float(self.cmd[CMD_VX])) > 0.12:
-            r_air = float(np.clip(self._air_l + self._air_r, 0.0, 0.4))
-            if air_l == air_r:
-                r_air -= 0.05
-        r_tau = float(np.clip(-1e-6 * tau_acc, -1.5, 0.0))
-        r_rate = float(np.clip(-0.15 * action_rate, -1.0, 0.0))
-        reward = r_up + r_h + r_arm + alive + r_tau + r_rate
-        if self.stage >= STAGE_VX:
-            reward += r_vx
-        else:
-            reward += 0.4 * r_vx
-        if self.stage >= STAGE_FULL:
-            reward += 0.5 * r_vy + 0.5 * r_wz
-        if self.stage >= STAGE_VX:
-            reward += r_air
-        done = self._terminated()
-        if done:
-            reward -= 8.0
+        r_arm = 0.4 * float(np.exp(-4.0 * np.mean((q[15:29] - self.cmd[CMD_ARMS]) ** 2)))
+        reward = r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm
+        fall = self._terminated()
+        timeout = False
+        if self._horizon:
+            self._time_left -= 1
+            timeout = self._time_left <= 0
+        done = fall or timeout
+        if fall:
+            reward -= TERMINAL_PENALTY
         return self._obs(), float(reward), bool(done)
 
 
@@ -302,124 +344,14 @@ def _policy_act(policy, obs: np.ndarray, device) -> np.ndarray:
     return np.zeros(ACT_DIM, dtype=np.float32)
 
 
-def _rollout_frozen(policy, cmd: np.ndarray, *, seconds: float, device, model) -> dict:
-    env = FoundationEnv(model, stage=STAGE_STAND)
-    obs = env.reset(np.asarray(cmd, dtype=np.float32))
-    ticks = int(round(seconds / (env.dt * DECIMATION)))
-    z_hist, tilt_hist, q_hist = [], [], []
-    done = False
-    for _ in range(max(1, ticks)):
-        obs, _, done = env.step(_policy_act(policy, obs, device))
-        z_hist.append(env._z())
-        tilt_hist.append(env._tilt())
-        q_hist.append(env._hinges().copy())
-        if done:
-            break
-    z_min = float(min(z_hist) if z_hist else 0.0)
-    z_last = float(z_hist[-1] if z_hist else 0.0)
-    tilt_min = float(min(tilt_hist) if tilt_hist else 0.0)
-    q_last = q_hist[-1] if q_hist else np.zeros(ACT_DIM, dtype=np.float32)
-    return {
-        "seconds": float(len(z_hist) * env.dt * DECIMATION),
-        "z_min": z_min,
-        "z_last": z_last,
-        "tilt_min": tilt_min,
-        "q_last": q_last,
-        "ticks": int(len(z_hist)),
-        "need": int(ticks),
-        "fell": bool(done),
-        "full": len(z_hist) >= ticks,
-    }
-
-
 def eval_inplace(policy, *, seconds: float = 4.0, device=None) -> dict:
-    """In-place stand / squat / arms. Save gate: no fall, stay upright, track pose."""
-    from agent.h2 import L_SH, R_SH
+    from agent.l3_eval import eval_suite
 
-    model = load_train_model()
-    cases = (
-        (
-            "stand",
-            stand_command(),
-            lambda r: (not r["fell"] and r["full"] and r["z_min"] > STAND_Z - 0.08 and r["tilt_min"] > 0.85),
-        ),
-        (
-            "squat",
-            command_from_plan(Plan("присесть", skill="squat", params={"depth": "low"})),
-            lambda r: (
-                not r["fell"]
-                and r["full"]
-                and r["tilt_min"] > 0.75
-                and r["z_last"] < STAND_Z - 0.02
-                and r["z_min"] > 0.55
-            ),
-        ),
-        (
-            "reach",
-            command_from_plan(Plan("подними руки", skill="reach", params={"hand": "both"})),
-            lambda r: (
-                not r["fell"]
-                and r["full"]
-                and r["tilt_min"] > 0.80
-                and r["z_min"] > STAND_Z - 0.16
-                and float(r["q_last"][R_SH]) < -0.45
-                and float(r["q_last"][L_SH]) < -0.45
-            ),
-        ),
-        (
-            "wave",
-            command_from_plan(Plan("махни правой", skill="wave", params={"hand": "right"})),
-            lambda r: (
-                not r["fell"]
-                and r["full"]
-                and r["tilt_min"] > 0.80
-                and r["z_min"] > STAND_Z - 0.16
-                and float(r["q_last"][R_SH]) < -0.45
-            ),
-        ),
-        (
-            "hands_down",
-            command_from_plan(Plan("опусти руки", skill="hold", params={"hands": "down"})),
-            lambda r: (
-                not r["fell"]
-                and r["full"]
-                and r["tilt_min"] > 0.85
-                and r["z_min"] > STAND_Z - 0.10
-                and abs(float(r["q_last"][R_SH])) < 0.45
-                and abs(float(r["q_last"][L_SH])) < 0.45
-            ),
-        ),
-    )
-    reports: dict[str, dict] = {}
-    all_ok = True
-    for name, cmd, ok_fn in cases:
-        raw = _rollout_frozen(policy, cmd, seconds=seconds, device=device, model=model)
-        ok = bool(ok_fn(raw))
-        all_ok = all_ok and ok
-        reports[name] = {
-            "ok": ok,
-            "seconds": raw["seconds"],
-            "z_min": raw["z_min"],
-            "z_last": raw["z_last"],
-            "tilt_min": raw["tilt_min"],
-            "ticks": raw["ticks"],
-            "need": raw["need"],
-            "fell": raw["fell"],
-        }
-    stand = reports["stand"]
-    return {
-        "ok": bool(all_ok),
-        "seconds": stand["seconds"],
-        "z_min": stand["z_min"],
-        "tilt_min": stand["tilt_min"],
-        "ticks": stand["ticks"],
-        "need": stand["need"],
-        "cases": reports,
-    }
+    _ = seconds
+    return eval_suite(policy, device=device)
 
 
 def eval_stand(policy, *, seconds: float = 4.0, device=None) -> dict:
-    """Idle stand plus in-place squat/arms. Same save gate as training."""
     return eval_inplace(policy, seconds=seconds, device=device)
 
 
@@ -447,3 +379,13 @@ def jax_device_kind() -> str:
         return f"{dev.platform}:{dev.device_kind}"
     except Exception:
         return "none"
+
+
+# Trainer aliases (older import names).
+jax_import_error = jax_import_error
+jax_device_kind = jax_device_kind
+VecFoundationEnv = VecFoundationEnv
+eval_inplace = eval_inplace
+STAGE_STAND = STAGE_STAND
+STAGE_VX = STAGE_VX
+STAGE_FULL = STAGE_FULL

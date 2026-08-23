@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from agent.h2 import (
+    ARM_RAISE,
     L_AP,
     L_HP,
     L_HR,
@@ -30,7 +31,22 @@ from agent.h2 import (
 from agent.joint_pd import kp_kd_vectors
 from agent.l3_cmd import CMD_ARMS, CMD_H, CMD_VX, CMD_VY, CMD_WZ, L2_CMD_DIM
 from agent.l3_env import STAGE_FULL, STAGE_STAND, STAGE_VX, load_train_model
-from agent.l3_foundation import ACT_DIM, ACTION_SCALE, DECIMATION, FALL_Z, HIDDEN, OBS_DIM, TILT_LIM
+from agent.l3_foundation import (
+    ACT_DIM,
+    ACTION_SCALE,
+    DECIMATION,
+    EPISODE_SEC,
+    HEIGHT_RANGE,
+    HIDDEN,
+    OBS_DIM,
+    PUSH_DUR_SEC,
+    PUSH_EVERY_SEC,
+    PUSH_FORCE,
+    REACH_FRAC,
+    TERMINAL_PENALTY,
+    TRAIN_FALL_Z,
+    TRAIN_TILT,
+)
 
 
 def _require_jax():
@@ -64,7 +80,10 @@ def mlp_forward(jp, params, obs):
 
 
 def jax_silu(jp, x):
-    return x * jp.sigmoid(x)
+    # jax.numpy.sigmoid removed in JAX 0.10; nn.sigmoid is the op.
+    import jax
+
+    return x * jax.nn.sigmoid(x)
 
 
 @dataclass
@@ -162,16 +181,27 @@ class MjxFoundationEnv:
 
     def _sample_cmd(self, rng):
         jax, jp = self.jax, self.jp
-        rng, k1, k2, k3, k4, k5, k6 = jax.random.split(rng, 7)
-        h = jax.random.uniform(k1, (), minval=0.78, maxval=1.02)
+        rng, k1, k2, k3, k4, k5, k6, k7, k8 = jax.random.split(rng, 9)
+        h = jax.random.uniform(k1, (), minval=HEIGHT_RANGE[0], maxval=HEIGHT_RANGE[1])
         cmd = jp.zeros((L2_CMD_DIM,), dtype=jp.float32).at[CMD_H].set(h)
-        arms_on = jax.random.bernoulli(k2, 0.35)
-        arms = jax.random.uniform(k3, (14,), minval=-0.4, maxval=0.2)
-        sp = jax.random.uniform(k4, (2,), minval=-1.55, maxval=0.0)
-        arms = arms.at[0].set(sp[0]).at[7].set(sp[1])
-        cmd = jp.where(arms_on, cmd.at[4:18].set(arms), cmd)
-        squat = jax.random.bernoulli(k5, 0.25)
-        cmd = jp.where(squat, cmd.at[CMD_H].set(jax.random.uniform(k6, (), minval=0.70, maxval=0.90)), cmd)
+        pitch = jax.random.uniform(k3, (), minval=0.33, maxval=1.0)
+        asym = jax.random.bernoulli(k4, 0.45)
+        l_arm = jp.where(asym, jax.random.uniform(k5, (), minval=0.20, maxval=1.0) * pitch, pitch)
+        l_arm = jp.clip(l_arm, 0.20, pitch)
+        r_arm = pitch
+        l_out = jax.random.uniform(k6, (), minval=-0.2, maxval=0.6)
+        r_out = jax.random.uniform(k7, (), minval=-0.2, maxval=0.6)
+        raise_q = jp.float32(ARM_RAISE)
+        reach_arms = jp.zeros((14,), dtype=jp.float32)
+        reach_arms = reach_arms.at[0].set(raise_q * l_arm).at[7].set(raise_q * r_arm)
+        reach_arms = reach_arms.at[1].set(1.20 * l_out).at[8].set(-1.20 * r_out)
+        reach_arms = reach_arms.at[3].set(0.90 * l_arm).at[10].set(0.90 * r_arm)
+        mild = jax.random.uniform(k8, (14,), minval=-0.4, maxval=0.2)
+        sp = jax.random.uniform(k2, (2,), minval=-1.55, maxval=0.0)
+        mild = mild.at[0].set(sp[0]).at[7].set(sp[1])
+        u = jax.random.uniform(k1, ())
+        arms = jp.where(u < REACH_FRAC, reach_arms, jp.where(u < REACH_FRAC + 0.12, mild, jp.zeros((14,), dtype=jp.float32)))
+        cmd = cmd.at[4:18].set(arms)
         if self.stage >= STAGE_VX:
             rng, k = jax.random.split(rng)
             cmd = cmd.at[CMD_VX].set(jax.random.uniform(k, (), minval=-0.15, maxval=0.70))
@@ -235,87 +265,119 @@ class MjxFoundationEnv:
     def _reset_one(self, rng):
         jax, jp, mjx = self.jax, self.jp, self.mjx
         dx = mjx.make_data(self.mx)
+        rng, kn, kv, kc, kt, kw = jax.random.split(rng, 6)
+        qn = 0.03 * jax.random.normal(kn, (ACT_DIM,), dtype=jp.float32)
         qpos = dx.qpos.at[0:3].set(jp.array([0.0, 0.0, SPAWN_Z])).at[3:7].set(jp.array([1.0, 0.0, 0.0, 0.0]))
-        qpos = qpos.at[self.qadr].set(self.stand_q)
-        dx = dx.replace(qpos=qpos, qvel=jp.zeros_like(dx.qvel))
+        qpos = qpos.at[self.qadr].set(jp.clip(self.stand_q + qn, self.lo, self.hi))
+        qvel = jp.zeros_like(dx.qvel)
+        qvel = qvel.at[self.vadr].set(0.04 * jax.random.normal(kv, (ACT_DIM,), dtype=jp.float32))
+        dx = dx.replace(qpos=qpos, qvel=qvel)
         dx = mjx.forward(self.mx, dx)
         rng, cmd = self._sample_cmd(rng)
         last_a = jp.zeros((ACT_DIM,), dtype=jp.float32)
         off_prev = jp.zeros((2,), dtype=jp.float32)
-        return rng, dx, last_a, cmd, last_a, jp.array(200, dtype=jp.int32), off_prev
+        cmd_left = jax.random.randint(kc, (), 100, 201)
+        time_left = jax.random.randint(kt, (), 750, 1001)
+        push_wait = jax.random.randint(kw, (), 100, 151)
+        push_left = jp.array(0, dtype=jp.int32)
+        push_xy = jp.zeros((2,), dtype=jp.float32)
+        return rng, dx, last_a, cmd, last_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy
 
-    def _step_one(self, rng, dx, last_a, cmd, prev_a, cmd_left, off_prev, action):
+    def _step_one(self, rng, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, action):
         jax, jp, mjx = self.jax, self.jp, self.mjx
         a = jp.clip(action, -1.0, 1.0)
         base = self._default_q(cmd) + ACTION_SCALE * a
-        tau_acc = 0.0
+        force = jp.where(push_left > 0, push_xy, jp.zeros((2,), dtype=jp.float32))
+        tid = self.spec.torso_id
 
         def body(i, carry):
-            dx_i, acc, off_i = carry
+            dx_i, off_i = carry
             dlt, off_i = self._balance(dx_i, cmd, off_i)
             q_tgt = jp.clip(base + dlt, self.lo, self.hi)
             tau = self._pd(dx_i, q_tgt)
-            dx_i = dx_i.replace(ctrl=tau)
+            xfrc = dx_i.xfrc_applied.at[tid, 0].set(force[0]).at[tid, 1].set(force[1])
+            dx_i = dx_i.replace(ctrl=tau, xfrc_applied=xfrc)
             dx_i = mjx.step(self.mx, dx_i)
-            return dx_i, acc + jp.mean(tau * tau), off_i
+            return dx_i, off_i
 
-        dx, tau_acc, off_prev = jax.lax.fori_loop(0, DECIMATION, body, (dx, jp.float32(0.0), off_prev))
+        dx, off_prev = jax.lax.fori_loop(0, DECIMATION, body, (dx, off_prev))
         rot = self._xmat3(dx, self.spec.torso_id)
         v_b = rot.T @ dx.qvel[0:3]
-        wz = dx.qvel[5]
         z = dx.xpos[self.spec.pelvis_id, 2]
         tilt = rot[2, 2]
         q = dx.qpos[self.qadr]
-        r_vx = jp.exp(-4.0 * (v_b[0] - cmd[CMD_VX]) ** 2)
-        r_vy = jp.exp(-8.0 * (v_b[1] - cmd[CMD_VY]) ** 2)
-        r_wz = jp.exp(-6.0 * (wz - cmd[CMD_WZ]) ** 2)
-        r_h = jp.exp(-12.0 * (z - cmd[CMD_H]) ** 2)
-        r_arm = jp.exp(-4.0 * jp.mean((q[15:29] - cmd[CMD_ARMS]) ** 2))
-        r_up = jp.exp(-6.0 * (1.0 - tilt) ** 2)
-        r_rate = jp.clip(-0.15 * jp.mean((a - prev_a) ** 2), -1.0, 0.0)
-        r_tau = jp.clip(-1e-6 * tau_acc, -1.5, 0.0)
-        reward = r_up + r_h + r_arm + 1.0 + r_tau + r_rate + (r_vx if self.stage >= STAGE_VX else 0.4 * r_vx)
-        if self.stage >= STAGE_FULL:
-            reward = reward + 0.5 * r_vy + 0.5 * r_wz
-        if self.stage >= STAGE_VX:
-            r_geoms = self.spec.r_geoms[:1]
-            l_geoms = self.spec.l_geoms[:1]
-            air_r = dx.geom_xpos[r_geoms[0], 2] > 0.035 if r_geoms else jp.bool_(False)
-            air_l = dx.geom_xpos[l_geoms[0], 2] > 0.035 if l_geoms else jp.bool_(False)
-            r_air = jp.where(air_l != air_r, jp.float32(0.05), jp.float32(-0.05))
-            reward = reward + jp.where(jp.abs(cmd[CMD_VX]) > 0.12, r_air, 0.0)
-        done = (tilt < TILT_LIM) | (z < FALL_Z)
-        reward = reward - jp.where(done, 8.0, 0.0)
+        gyro = dx.cvel[self.spec.torso_id, :3]
+        v_xy = dx.qvel[0:2]
+        v_cmd = jp.array([cmd[CMD_VX], cmd[CMD_VY]])
+        r_h = jp.exp(-10.0 * jp.abs(z - cmd[CMD_H]))
+        r_up = jp.exp(-5.0 * (1.0 - tilt * tilt))
+        r_vel = jp.exp(-2.0 * jp.sum((v_b[:2] - v_cmd) ** 2))
+        r_rate = -0.01 * jp.sum((a - last_a) ** 2)
+        r_acc = -0.005 * jp.sum((a - 2.0 * last_a + prev_a) ** 2)
+        r_ang = -0.05 * (gyro[0] ** 2 + gyro[1] ** 2)
+        r_lin = jp.where(jp.linalg.norm(v_cmd) < 0.05, -0.1 * jp.sum(v_xy ** 2), 0.0)
+        def _fp(body_id):
+            R = self._xmat3(dx, body_id)
+            return jp.arctan2(-R[2, 0], R[2, 2])
+        r_foot = -0.1 * (_fp(self.spec.r_foot_id) ** 2 + _fp(self.spec.l_foot_id) ** 2)
+        r_arm = 0.4 * jp.exp(-4.0 * jp.mean((q[15:29] - cmd[CMD_ARMS]) ** 2))
+        reward = r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm
+        fall = (tilt < TRAIN_TILT) | (z < TRAIN_FALL_Z)
+        time_left = time_left - 1
+        timeout = time_left <= 0
+        done = fall | timeout
+        reward = reward - jp.where(fall, jp.float32(TERMINAL_PENALTY), 0.0)
+        push_left = jp.maximum(push_left - 1, 0)
+        push_wait = push_wait - 1
+        rng, k1, k2, k3 = jax.random.split(rng, 4)
+        mag = jax.random.uniform(k1, (), minval=PUSH_FORCE[0], maxval=PUSH_FORCE[1])
+        ang = jax.random.uniform(k2, (), minval=0.0, maxval=2.0 * jp.pi)
+        new_xy = mag * jp.array([jp.cos(ang), jp.sin(ang)])
+        start = (push_wait <= 0) & (push_left <= 0)
+        push_xy = jp.where(start, new_xy, push_xy)
+        push_left = jp.where(start, jp.array(10, dtype=jp.int32), push_left)
+        push_wait = jp.where(start, jax.random.randint(k3, (), 100, 151), push_wait)
         cmd_left = cmd_left - 1
         rng, new_cmd = self._sample_cmd(rng)
         cmd = jp.where(cmd_left <= 0, new_cmd, cmd)
-        cmd_left = jp.where(cmd_left <= 0, jp.array(200, dtype=jp.int32), cmd_left)
-        rng, dx_r, last_a_r, cmd_r, prev_r, left_r, off_r = self._reset_one(rng)
+        cmd_left = jp.where(cmd_left <= 0, jp.array(150, dtype=jp.int32), cmd_left)
+        rng, dx_r, last_a_r, cmd_r, prev_r, left_r, off_r, time_r, wait_r, plow_r, pxy_r = self._reset_one(rng)
         dx = jax.tree_util.tree_map(lambda a, b: jp.where(done, b, a), dx, dx_r)
         last_a_out = jp.where(done, last_a_r, a)
         cmd = jp.where(done, cmd_r, cmd)
         prev_a = jp.where(done, prev_r, last_a)
         cmd_left = jp.where(done, left_r, cmd_left)
         off_prev = jp.where(done, off_r, off_prev)
+        time_left = jp.where(done, time_r, time_left)
+        push_wait = jp.where(done, wait_r, push_wait)
+        push_left = jp.where(done, plow_r, push_left)
+        push_xy = jp.where(done, pxy_r, push_xy)
         obs = self._obs(dx, last_a_out, cmd)
-        return rng, dx, last_a_out, cmd, prev_a, cmd_left, off_prev, obs, reward, done
+        return (
+            rng, dx, last_a_out, cmd, prev_a, cmd_left, off_prev,
+            time_left, push_wait, push_left, push_xy, obs, reward, done,
+        )
 
     def _compile(self) -> None:
         jax = self.jax
         self._reset_v = jax.jit(jax.vmap(self._reset_one))
-        self._step_v = jax.jit(jax.vmap(self._step_one, in_axes=(0, 0, 0, 0, 0, 0, 0, 0)))
+        self._step_v = jax.jit(jax.vmap(self._step_one, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)))
 
     def reset(self, rng):
-        rngs = self.jax.random.split(rng, self.n)
-        rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev = self._reset_v(rngs)
+        jax = self.jax
+        rngs = jax.random.split(rng, self.n)
+        rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy = self._reset_v(rngs)
         obs = jax.vmap(self._obs)(dx, last_a, cmd)
-        self._state = (rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev)
+        self._state = (rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy)
         return obs
 
     def step(self, actions):
-        rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev = self._state
-        rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, obs, rew, done = self._step_v(
-            rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, actions
+        rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy = self._state
+        (
+            rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev,
+            time_left, push_wait, push_left, push_xy, obs, rew, done,
+        ) = self._step_v(
+            rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, actions
         )
-        self._state = (rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev)
+        self._state = (rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy)
         return obs, rew, done

@@ -1,4 +1,4 @@
 <mujoco model="Unitree H2 train">
   <include file="scene.xml"/>
-  <option timestep="0.005" gravity="0 0 -9.81" integrator="implicitfast"/>
+  <option timestep="0.005" gravity="0 0 -9.81" integrator="Euler" solver="CG" jacobian="sparse"/>
 </mujoco>

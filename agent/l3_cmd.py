@@ -67,3 +67,18 @@ def stand_command() -> np.ndarray:
     cmd = np.zeros(L2_CMD_DIM, dtype=np.float32)
     cmd[CMD_H] = 1.02
     return cmd
+
+
+def reach_command(*, pitch: float = 1.0, asymmetric: bool = False) -> np.ndarray:
+    """Arms forward. pitch=1 → 90° (ARM_RAISE)."""
+    cmd = stand_command()
+    p = float(np.clip(pitch, 0.0, 1.0))
+    t = TeacherIntent(r_arm=p, l_arm=0.35 if asymmetric else p)
+    cmd[CMD_ARMS] = arm_targets(t)
+    return cmd
+
+
+def deep_squat_command(*, h_m: float = 0.70) -> np.ndarray:
+    cmd = stand_command()
+    cmd[CMD_H] = float(np.clip(h_m, 0.60, 1.02))
+    return cmd

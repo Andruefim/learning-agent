@@ -23,7 +23,9 @@ exec docker run --rm --name learning-agent-jax \
   -w /workspace/learning-agent \
   -e HIP_VISIBLE_DEVICES=0 \
   -e MUJOCO_GL=osmesa \
+  -e PYOPENGL_PLATFORM=osmesa \
   -e PYTHONPATH=/opt/extra \
+  -e JAX_COMPILATION_CACHE_DIR=/opt/extra/jax_cache \
   -e LD_LIBRARY_PATH="/usr/lib/wsl/lib:${CORE}" \
   "$IMAGE" \
   bash /workspace/learning-agent/scripts/jax_docker_entry.sh \

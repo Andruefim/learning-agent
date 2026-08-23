@@ -119,6 +119,17 @@ def disable_mesh_contacts(model: mujoco.MjModel) -> int:
     return n
 
 
+def mjx_rocm_options(model: mujoco.MjModel) -> None:
+    """Avoid hipSOLVER FFI. WSL overlays host HSA, so jax_rocm7_plugin's
+    `rocm_plugin_extension.so` fails (`hsa_amd_vmem_export_fabric_handle`) and
+    `cho_factor` dies with hipsolver_potrf_ffi. Dense MJX `factor_m` uses that
+    path; sparse LDL + Euler + CG stay in pure XLA.
+    """
+    model.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
+    model.opt.solver = mujoco.mjtSolver.mjSOL_CG
+    model.opt.jacobian = mujoco.mjtJacobian.mjJAC_SPARSE
+
+
 def cylinders_to_capsules(model: mujoco.MjModel) -> int:
     """Official H2 shins are cylinders; MJX-JAX has no cylinder-box contacts."""
     n = 0

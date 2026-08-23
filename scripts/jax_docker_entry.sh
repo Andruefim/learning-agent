@@ -7,6 +7,16 @@
 set -euo pipefail
 export PYTHONPATH="/opt/extra${PYTHONPATH:+:$PYTHONPATH}"
 export MUJOCO_GL="${MUJOCO_GL:-osmesa}"
+export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-osmesa}"
+export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/opt/extra/jax_cache}"
+mkdir -p "$JAX_COMPILATION_CACHE_DIR"
+
+# --rm container: apt packages do not persist. MuJoCo 3.12 imports OSMesa on load.
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+    libosmesa6 libgl1 libegl1 libgles2 >/dev/null
+fi
 
 _wipe_extra_numpy() {
   rm -rf /opt/extra/numpy /opt/extra/numpy.libs \
@@ -86,7 +96,7 @@ _install_mjx() {
 
 # Skip a full wipe if the overlay is already on the volume (pip --target
 # otherwise reinstalls mujoco every container start and drops mjx).
-if [[ ! -d /opt/extra/mujoco/mjx ]] || ! python -c "from mujoco import mjx" >/dev/null 2>&1; then
+if [[ ! -f /opt/extra/mujoco/mjx/__init__.py ]]; then
   _install_mjx
 fi
 

@@ -1,6 +1,7 @@
 """Command-conditioned whole-body foundation policy (Level 3).
 
 Obs (117): grav(3)+gyro(3)+qerr(31)+qvel(31)+last_a(31)+cmd(18).
+last_a is a_{t-1} (31-DoF previous motor command) so ankles can damp phase lag.
 Act (31): residual around a command-conditioned default pose.
 Policy rate 50 Hz; Joint-PD at 200 Hz (decimation=4).
 """
@@ -30,8 +31,17 @@ DECIMATION = 4
 ACTION_SCALE = 0.5
 OBS_DIM = 3 + 3 + N_ACT + N_ACT + N_ACT + L2_CMD_DIM  # 117
 ACT_DIM = N_ACT
-TILT_LIM = 0.65
+TILT_LIM = 0.65  # app / engine
 FALL_Z = 0.40
+TRAIN_TILT = 0.70
+TRAIN_FALL_Z = 0.40
+TERMINAL_PENALTY = 50.0
+EPISODE_SEC = (15.0, 20.0)
+HEIGHT_RANGE = (0.65, 1.02)
+REACH_FRAC = 0.40
+PUSH_EVERY_SEC = (2.0, 3.0)
+PUSH_DUR_SEC = 0.20
+PUSH_FORCE = (40.0, 60.0)
 HIDDEN = (256, 256, 128)
 
 
@@ -162,6 +172,11 @@ def balance_delta(err_xy: np.ndarray, d_xy: np.ndarray, *, height_01: float = 1.
     dlt[R_HP] = dlt[L_HP] = sag_hy
     dlt[R_HR] = dlt[L_HR] = pd_hx
     return dlt
+
+
+def foot_pitch_from_xmat(xmat) -> float:
+    R = np.asarray(xmat, dtype=np.float64).reshape(3, 3)
+    return float(np.arctan2(-R[2, 0], R[2, 2]))
 
 
 def build_obs(data, torso_id: int, q: np.ndarray, qd: np.ndarray, last_a: np.ndarray, cmd: np.ndarray) -> np.ndarray:

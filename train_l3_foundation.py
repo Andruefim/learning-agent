@@ -1,7 +1,8 @@
 """Playground-style PPO for HumanoidFoundationPolicy.
 
 Prefers MJX-JAX on ROCm (512+ envs). Falls back to in-process MuJoCo vec envs.
-Writes flywheel_data/l3_foundation.pt only after in-place stand/squat/arms hold ≥4 s.
+Writes flywheel_data/l3_foundation.pt only if eval_reach, eval_deep_squat, and
+eval_push_recovery all pass (honest 15s reach / deep squat / push recovery).
 
 Run:  python train_l3_foundation.py
       python train_l3_foundation.py --iters 200 --envs 512
@@ -84,8 +85,11 @@ def save_if_stand(policy: HumanoidFoundationPolicy, path: Path, device: torch.de
         f"tilt={c['tilt_min']:.3f}{' fell' if c.get('fell') else ''})"
         for name, c in cases.items()
     )
-    print(f"inplace eval: {'ok' if report['ok'] else 'fail'} {bits}", flush=True)
+    gate = ("reach", "deep_squat", "push_recovery")
+    print(f"eval suite: {'PASS' if report['ok'] else 'fail'} {bits}", flush=True)
     if not report["ok"]:
+        missing = [n for n in gate if not cases.get(n, {}).get("ok")]
+        print(f"production gate blocked save ({', '.join(missing) or 'unknown'})", flush=True)
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(policy.state_dict(), path)
@@ -338,7 +342,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--iters", type=int, default=None, help="PPO iterations. Default 200 on JAX GPU, 0 otherwise.")
     p.add_argument("--envs", type=int, default=512)
-    p.add_argument("--unroll", type=int, default=24)
+    p.add_argument("--unroll", type=int, default=64)
     p.add_argument("--device", default=os.getenv("L2_DEVICE", "cpu"))
     p.add_argument("--out", default=str(AGENT_ROOT / "flywheel_data" / "l3_foundation.pt"))
     p.add_argument("--seed", type=int, default=0)
