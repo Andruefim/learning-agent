@@ -89,8 +89,12 @@ def latest_path_for(out_path: Path) -> Path:
 def save_latest(policy: HumanoidFoundationPolicy, path: Path) -> None:
     """Unconditional snapshot for resuming/inspecting training. Not gated,
     not loaded by the live app - only `save_if_stand`'s output is."""
+    sd = policy.state_dict()
+    if not all(torch.isfinite(v).all() for v in sd.values() if torch.is_tensor(v)):
+        print(f"resume checkpoint skipped (non-finite weights) {path}", flush=True)
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(policy.state_dict(), path)
+    torch.save(sd, path)
     print(f"resume checkpoint saved {path}", flush=True)
 
 
@@ -271,7 +275,7 @@ def ppo_jax(
         for _ in range(unroll):
             key, k = jax.random.split(key)
             mean = mlp_forward(jp, actor, obs)
-            std = jp.exp(log_std)
+            std = jp.clip(jp.exp(log_std), 1e-3, 1.0)
             eps = jax.random.normal(k, mean.shape)
             raw = mean + std * eps
             logp = -0.5 * (((raw - mean) / std) ** 2 + 2.0 * jp.log(std) + jp.log(2.0 * jp.pi)).sum(-1)
@@ -289,7 +293,7 @@ def ppo_jax(
         raw = jp.stack(buf_raw)
         logp = jp.stack(buf_lp)
         v = jp.stack(buf_v)
-        rew = jp.stack(buf_r)
+        rew = jp.nan_to_num(jp.stack(buf_r), nan=0.0)
         done = jp.stack(buf_d)
         mean_ret = float(np.asarray(rew.sum(0).mean()))
         sps = (n_envs * unroll) / max(time.time() - t0, 1e-6)
@@ -311,12 +315,14 @@ def ppo_jax(
             adv = adv.at[t].set(last_gae)
         ret = adv + v
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        adv = jp.nan_to_num(adv, nan=0.0)
+        ret = jp.nan_to_num(ret, nan=0.0)
 
         def loss_fn(actor, critic, log_std):
             mean = mlp_forward(jp, actor, o)
-            std = jp.exp(log_std)
+            std = jp.clip(jp.exp(log_std), 1e-3, 1.0)
             new_lp = -0.5 * (((raw - mean) / std) ** 2 + 2.0 * jp.log(std) + jp.log(2.0 * jp.pi)).sum(-1)
-            ratio = jp.exp(new_lp - logp)
+            ratio = jp.exp(jp.clip(new_lp - logp, -20.0, 20.0))
             surr1 = ratio * adv
             surr2 = jp.clip(ratio, 0.8, 1.2) * adv
             pol = -jp.minimum(surr1, surr2).mean()
@@ -324,10 +330,18 @@ def ppo_jax(
             return pol + vf
 
         grads = jax.grad(loss_fn, argnums=(0, 1, 2))(actor, critic, log_std)
+
+        def _clip_grads(tree, max_norm=1.0):
+            leaves = jax.tree_util.tree_leaves(tree)
+            sq = sum(jp.sum(g * g) for g in leaves)
+            scale = jp.minimum(1.0, max_norm / jp.sqrt(sq + 1e-8))
+            return jax.tree_util.tree_map(lambda g: jp.nan_to_num(g * scale, nan=0.0), tree)
+
+        grads = (_clip_grads(grads[0]), _clip_grads(grads[1]), _clip_grads(grads[2]))
         lr = 3e-4
         actor = jax.tree_util.tree_map(lambda p, g: p - lr * g, actor, grads[0])
         critic = jax.tree_util.tree_map(lambda p, g: p - lr * g, critic, grads[1])
-        log_std = log_std - lr * grads[2]
+        log_std = jp.clip(log_std - lr * grads[2], -5.0, 0.0)
         if it % RESUME_EVERY == 0 or it == iters:
             policy.load_state_dict(jax_params_to_state_dict(actor))
             save_latest(policy, latest_path_for(out_path))

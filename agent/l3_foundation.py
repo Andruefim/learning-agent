@@ -36,6 +36,7 @@ FALL_Z = 0.40
 TRAIN_TILT = 0.70
 TRAIN_FALL_Z = 0.40
 TERMINAL_PENALTY = 50.0
+REWARD_CLIP = 8.0
 EPISODE_SEC = (15.0, 20.0)
 HEIGHT_RANGE = (0.65, 1.02)
 REACH_FRAC = 0.40
@@ -88,8 +89,8 @@ def jax_params_to_state_dict(params) -> dict:
     sd: dict[str, torch.Tensor] = {}
     for i, layer in enumerate(linear_indices()):
         w, b = params[i]
-        sd[f"net.{layer}.weight"] = torch.as_tensor(np.asarray(w).T.copy())
-        sd[f"net.{layer}.bias"] = torch.as_tensor(np.asarray(b).copy())
+        sd[f"net.{layer}.weight"] = torch.as_tensor(np.array(w, copy=True).T)
+        sd[f"net.{layer}.bias"] = torch.as_tensor(np.array(b, copy=True))
     return sd
 
 

@@ -47,6 +47,7 @@ from agent.l3_foundation import (
     PUSH_EVERY_SEC,
     PUSH_FORCE,
     REACH_FRAC,
+    REWARD_CLIP,
     TERMINAL_PENALTY,
     TRAIN_FALL_Z,
     TRAIN_TILT,
@@ -281,15 +282,15 @@ class FoundationEnv:
         r_h = float(np.exp(-10.0 * abs(z - float(self.cmd[CMD_H]))))
         r_up = float(np.exp(-5.0 * (1.0 - g_z * g_z)))
         r_vel = float(np.exp(-2.0 * float(np.sum((v_b[:2] - v_cmd) ** 2))))
-        r_rate = -0.01 * float(np.sum(da**2))
-        r_acc = -0.005 * float(np.sum(dda**2))
-        r_ang = -0.05 * float(gyro[0] ** 2 + gyro[1] ** 2)
+        r_rate = float(np.clip(-0.01 * float(np.sum(da**2)), -1.0, 0.0))
+        r_acc = float(np.clip(-0.005 * float(np.sum(dda**2)), -1.0, 0.0))
+        r_ang = float(np.clip(-0.05 * float(gyro[0] ** 2 + gyro[1] ** 2), -2.0, 0.0))
         r_lin = 0.0
         if float(np.linalg.norm(v_cmd)) < 0.05:
-            r_lin = -0.1 * float(np.sum(v_xy**2))
+            r_lin = float(np.clip(-0.1 * float(np.sum(v_xy**2)), -2.0, 0.0))
         p_r = foot_pitch_from_xmat(self.data.xmat[self.r_foot_id])
         p_l = foot_pitch_from_xmat(self.data.xmat[self.l_foot_id])
-        r_foot = -0.1 * (p_r * p_r + p_l * p_l)
+        r_foot = float(np.clip(-0.1 * (p_r * p_r + p_l * p_l), -1.0, 0.0))
         q = self._hinges()
         r_arm = 0.4 * float(np.exp(-4.0 * np.mean((q[15:29] - self.cmd[CMD_ARMS]) ** 2)))
         reward = r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm
@@ -298,9 +299,12 @@ class FoundationEnv:
         if self._horizon:
             self._time_left -= 1
             timeout = self._time_left <= 0
+        if not np.isfinite(z) or not np.isfinite(g_z) or not np.isfinite(reward):
+            fall = True
         done = fall or timeout
         if fall:
             reward -= TERMINAL_PENALTY
+        reward = float(np.clip(np.nan_to_num(reward, nan=-TERMINAL_PENALTY), -TERMINAL_PENALTY - REWARD_CLIP, REWARD_CLIP))
         return self._obs(), float(reward), bool(done)
 
 

@@ -43,6 +43,7 @@ from agent.l3_foundation import (
     PUSH_EVERY_SEC,
     PUSH_FORCE,
     REACH_FRAC,
+    REWARD_CLIP,
     TERMINAL_PENALTY,
     TRAIN_FALL_Z,
     TRAIN_TILT,
@@ -260,7 +261,7 @@ class MjxFoundationEnv:
         gyro = dx.cvel[self.spec.torso_id, :3]
         q = dx.qpos[self.qadr]
         qd = dx.qvel[self.vadr]
-        return jp.concatenate([grav, gyro, q - self.stand_q, qd, last_a, cmd]).astype(jp.float32)
+        return jp.nan_to_num(jp.concatenate([grav, gyro, q - self.stand_q, qd, last_a, cmd]), nan=0.0).astype(jp.float32)
 
     def _reset_one(self, rng):
         jax, jp, mjx = self.jax, self.jp, self.mjx
@@ -312,21 +313,24 @@ class MjxFoundationEnv:
         r_h = jp.exp(-10.0 * jp.abs(z - cmd[CMD_H]))
         r_up = jp.exp(-5.0 * (1.0 - tilt * tilt))
         r_vel = jp.exp(-2.0 * jp.sum((v_b[:2] - v_cmd) ** 2))
-        r_rate = -0.01 * jp.sum((a - last_a) ** 2)
-        r_acc = -0.005 * jp.sum((a - 2.0 * last_a + prev_a) ** 2)
-        r_ang = -0.05 * (gyro[0] ** 2 + gyro[1] ** 2)
-        r_lin = jp.where(jp.linalg.norm(v_cmd) < 0.05, -0.1 * jp.sum(v_xy ** 2), 0.0)
+        r_rate = jp.clip(-0.01 * jp.sum((a - last_a) ** 2), -1.0, 0.0)
+        r_acc = jp.clip(-0.005 * jp.sum((a - 2.0 * last_a + prev_a) ** 2), -1.0, 0.0)
+        r_ang = jp.clip(-0.05 * (gyro[0] ** 2 + gyro[1] ** 2), -2.0, 0.0)
+        r_lin = jp.where(jp.linalg.norm(v_cmd) < 0.05, jp.clip(-0.1 * jp.sum(v_xy ** 2), -2.0, 0.0), 0.0)
         def _fp(body_id):
             R = self._xmat3(dx, body_id)
             return jp.arctan2(-R[2, 0], R[2, 2])
-        r_foot = -0.1 * (_fp(self.spec.r_foot_id) ** 2 + _fp(self.spec.l_foot_id) ** 2)
+        r_foot = jp.clip(-0.1 * (_fp(self.spec.r_foot_id) ** 2 + _fp(self.spec.l_foot_id) ** 2), -1.0, 0.0)
         r_arm = 0.4 * jp.exp(-4.0 * jp.mean((q[15:29] - cmd[CMD_ARMS]) ** 2))
         reward = r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm
         fall = (tilt < TRAIN_TILT) | (z < TRAIN_FALL_Z)
+        bad = ~(jp.isfinite(z) & jp.isfinite(tilt) & jp.isfinite(jp.sum(dx.qvel)) & jp.isfinite(reward))
+        fall = fall | bad
         time_left = time_left - 1
         timeout = time_left <= 0
         done = fall | timeout
         reward = reward - jp.where(fall, jp.float32(TERMINAL_PENALTY), 0.0)
+        reward = jp.clip(jp.nan_to_num(reward, nan=-TERMINAL_PENALTY), -TERMINAL_PENALTY - REWARD_CLIP, REWARD_CLIP)
         push_left = jp.maximum(push_left - 1, 0)
         push_wait = push_wait - 1
         rng, k1, k2, k3 = jax.random.split(rng, 4)
