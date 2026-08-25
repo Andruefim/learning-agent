@@ -1,7 +1,7 @@
 # Official ROCm JAX image via Docker Desktop (WSL2 backend, RX 9070).
 # Usage:
 #   .\scripts\run_jax_docker.ps1
-#   .\scripts\run_jax_docker.ps1 python train_l3_foundation.py --iters 200 --envs 512
+#   .\scripts\run_jax_docker.ps1 python train_l3_foundation.py --iters 200 --envs 512 --resume
 $ErrorActionPreference = "Stop"
 function ConvertTo-WslPath([string]$p) {
     $full = [System.IO.Path]::GetFullPath($p)

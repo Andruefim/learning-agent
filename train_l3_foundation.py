@@ -6,12 +6,14 @@ eval_push_recovery all pass (honest 15s reach / deep squat / push recovery).
 
 Run:  python train_l3_foundation.py
       python train_l3_foundation.py --iters 200 --envs 512
+      python train_l3_foundation.py --iters 200 --envs 512 --resume
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import pickle
 import sys
 import time
 from pathlib import Path
@@ -43,6 +45,7 @@ from agent.l3_foundation import (
     OBS_DIM,
     HumanoidFoundationPolicy,
     jax_params_to_state_dict,
+    state_dict_to_jax,
 )
 from agent.policy import resolve_device
 
@@ -78,6 +81,7 @@ def curriculum_stage(it: int, iters: int) -> int:
 
 
 RESUME_EVERY = 5  # unconditional checkpoint cadence, independent of the production gate
+CHECKPOINT_VERSION = 1
 
 
 def latest_path_for(out_path: Path) -> Path:
@@ -86,15 +90,92 @@ def latest_path_for(out_path: Path) -> Path:
     return out_path.with_name(f"{out_path.stem}.latest.pt")
 
 
-def save_latest(policy: HumanoidFoundationPolicy, path: Path) -> None:
-    """Unconditional snapshot for resuming/inspecting training. Not gated,
-    not loaded by the live app - only `save_if_stand`'s output is."""
-    sd = policy.state_dict()
-    if not all(torch.isfinite(v).all() for v in sd.values() if torch.is_tensor(v)):
-        print(f"resume checkpoint skipped (non-finite weights) {path}", flush=True)
+def _torch_load(path: Path, device: torch.device):
+    """Load a local resume checkpoint. Prefer safe mode; fall back for numpy blobs."""
+    kwargs = {"map_location": device}
+    try:
+        return torch.load(path, weights_only=True, **kwargs)
+    except TypeError:
+        return torch.load(path, **kwargs)
+    except (pickle.UnpicklingError, RuntimeError) as exc:
+        msg = str(exc).lower()
+        if "weights only" in msg or "weights_only" in msg or "unpickler" in msg or "safe_globals" in msg:
+            return torch.load(path, weights_only=False, **kwargs)
+        raise
+
+
+def _is_actor_state_dict(blob: dict) -> bool:
+    return any(str(k).startswith("net.") for k in blob)
+
+
+def load_training_checkpoint(path: Path, device: torch.device) -> dict | None:
+    """Load resume blob. Supports v1 (actor+critic+log_std) and legacy actor-only."""
+    if not path.is_file():
+        return None
+    blob = _torch_load(path, device)
+    if not isinstance(blob, dict):
+        return None
+    if blob.get("version") == CHECKPOINT_VERSION:
+        out: dict = {"actor": blob["actor"], "backend": blob.get("backend")}
+        if "critic" in blob:
+            out["critic"] = blob["critic"]
+        if "critic_jax" in blob:
+            out["critic_jax"] = blob["critic_jax"]
+        if "log_std" in blob:
+            ls = blob["log_std"]
+            out["log_std"] = ls if torch.is_tensor(ls) else torch.as_tensor(np.asarray(ls), dtype=torch.float32)
+        return out
+    if _is_actor_state_dict(blob):
+        return {"actor": blob, "backend": None}
+    return None
+
+
+def apply_critic_jax_to_torch(critic_jax, critic: nn.Sequential) -> None:
+    for layer_idx, (w, b) in zip((0, 2, 4), critic_jax):
+        critic[layer_idx].weight.data.copy_(torch.as_tensor(np.asarray(w).T, dtype=torch.float32))
+        critic[layer_idx].bias.data.copy_(torch.as_tensor(np.asarray(b), dtype=torch.float32))
+
+
+def apply_resume_to_net(net: ActorCritic, resume: dict) -> str:
+    net.actor.load_state_dict(resume["actor"])
+    parts = ["actor"]
+    if "critic" in resume:
+        net.critic.load_state_dict(resume["critic"])
+        parts.append("critic")
+    elif "critic_jax" in resume:
+        apply_critic_jax_to_torch(resume["critic_jax"], net.critic)
+        parts.append("critic")
+    if "log_std" in resume:
+        net.log_std.data.copy_(resume["log_std"].reshape(ACT_DIM))
+        parts.append("log_std")
+    return "+".join(parts)
+
+
+def save_training_checkpoint(
+    path: Path,
+    *,
+    actor_sd: dict,
+    backend: str,
+    critic_sd: dict | None = None,
+    critic_jax=None,
+    log_std=None,
+) -> None:
+    """Unconditional PPO snapshot for resume. Not gated, not loaded by the live app."""
+    if not all(torch.isfinite(v).all() for v in actor_sd.values() if torch.is_tensor(v)):
+        print(f"resume checkpoint skipped (non-finite actor weights) {path}", flush=True)
         return
+    payload: dict = {"version": CHECKPOINT_VERSION, "actor": actor_sd, "backend": backend}
+    if critic_sd is not None:
+        payload["critic"] = critic_sd
+    if critic_jax is not None:
+        payload["critic_jax"] = [
+            (torch.as_tensor(np.asarray(w), dtype=torch.float32), torch.as_tensor(np.asarray(b), dtype=torch.float32))
+            for w, b in critic_jax
+        ]
+    if log_std is not None:
+        payload["log_std"] = log_std.detach().cpu() if torch.is_tensor(log_std) else torch.as_tensor(log_std, dtype=torch.float32)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(sd, path)
+    torch.save(payload, path)
     print(f"resume checkpoint saved {path}", flush=True)
 
 
@@ -216,7 +297,13 @@ def ppo_torch(
             )
         t0 = time.time()
         if it % RESUME_EVERY == 0 or it == iters:
-            save_latest(net.actor, latest_path_for(out_path))
+            save_training_checkpoint(
+                latest_path_for(out_path),
+                actor_sd=net.actor.state_dict(),
+                critic_sd=net.critic.state_dict(),
+                log_std=net.log_std,
+                backend="torch",
+            )
         if it == iters or it % 20 == 0:
             save_if_stand(net.actor, out_path, device)
     return net.actor
@@ -230,6 +317,7 @@ def ppo_jax(
     seed: int,
     out_path: Path,
     torch_device: torch.device,
+    resume: dict | None = None,
 ) -> HumanoidFoundationPolicy:
     import jax
     import jax.numpy as jp
@@ -239,7 +327,10 @@ def ppo_jax(
     env = MjxFoundationEnv(n_envs, stage=STAGE_STAND)
     key = jax.random.PRNGKey(seed)
     key, k_p, k_c = jax.random.split(key, 3)
-    actor = mlp_init(jax, jp, k_p, zero_out=True)
+    if resume is not None:
+        actor = state_dict_to_jax(resume["actor"])
+    else:
+        actor = mlp_init(jax, jp, k_p, zero_out=True)
 
     def init_critic(k):
         k1, k2, k3 = jax.random.split(k, 3)
@@ -249,8 +340,23 @@ def ppo_jax(
             (jp.zeros((256, 1)), jp.zeros((1,))),
         ]
 
-    critic = init_critic(k_c)
-    log_std = jp.full((ACT_DIM,), -1.2)
+    if resume is not None and "critic_jax" in resume:
+        critic = [(jp.asarray(w), jp.asarray(b)) for w, b in resume["critic_jax"]]
+    elif resume is not None and "critic" in resume:
+        critic = init_critic(k_c)
+        net_tmp = ActorCritic().to(torch_device)
+        net_tmp.critic.load_state_dict(resume["critic"])
+        for layer_idx, jax_i in zip((0, 2, 4), range(3)):
+            w = net_tmp.critic[layer_idx].weight.detach().cpu().numpy().T
+            b = net_tmp.critic[layer_idx].bias.detach().cpu().numpy()
+            critic[jax_i] = (jp.asarray(w), jp.asarray(b))
+    else:
+        critic = init_critic(k_c)
+
+    if resume is not None and "log_std" in resume:
+        log_std = jp.asarray(resume["log_std"].detach().cpu().numpy(), dtype=jp.float32)
+    else:
+        log_std = jp.full((ACT_DIM,), -1.2)
     policy = HumanoidFoundationPolicy(zero_out=True)
     rng = jax.random.PRNGKey(seed + 1)
     obs = env.reset(rng)
@@ -344,7 +450,13 @@ def ppo_jax(
         log_std = jp.clip(log_std - lr * grads[2], -5.0, 0.0)
         if it % RESUME_EVERY == 0 or it == iters:
             policy.load_state_dict(jax_params_to_state_dict(actor))
-            save_latest(policy, latest_path_for(out_path))
+            save_training_checkpoint(
+                latest_path_for(out_path),
+                actor_sd=policy.state_dict(),
+                critic_jax=critic,
+                log_std=np.asarray(log_std),
+                backend="jax",
+            )
         if it == iters or it % 20 == 0:
             policy.load_state_dict(jax_params_to_state_dict(actor))
             save_if_stand(policy, out_path, torch_device)
@@ -382,6 +494,14 @@ def main() -> None:
     p.add_argument("--device", default=os.getenv("L2_DEVICE", "cpu"))
     p.add_argument("--out", default=str(AGENT_ROOT / "flywheel_data" / "l3_foundation.pt"))
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--resume",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Resume from l3_foundation.latest.pt (default) or the given checkpoint.",
+    )
     args = p.parse_args()
     device = resolve_device(args.device)
     out_path = Path(args.out)
@@ -391,14 +511,27 @@ def main() -> None:
     if mjx_err is not None:
         print(f"jax/mjx import: {mjx_err}", flush=True)
     iters = args.iters if args.iters is not None else (200 if gpu_jax else 0)
+    resume_path: Path | None = None
+    if args.resume is not None:
+        resume_path = latest_path_for(out_path) if args.resume == "" else Path(args.resume)
     print(
         f"foundation PPO obs={OBS_DIM} act={ACT_DIM} torch={device} jax={kind} "
-        f"iters={iters} envs={args.envs}",
+        f"iters={iters} envs={args.envs}"
+        + (f" resume={resume_path}" if resume_path else ""),
         flush=True,
     )
     net = ActorCritic().to(device)
-    # Zero-init last layer + default_q + PD should already stand; save that first.
-    save_if_stand(net.actor, out_path, device)
+    resume: dict | None = None
+    if resume_path is not None:
+        resume = load_training_checkpoint(resume_path, device)
+        if resume is None:
+            print(f"resume failed: missing or invalid checkpoint {resume_path}", flush=True)
+            sys.exit(1)
+        loaded = apply_resume_to_net(net, resume)
+        print(f"resumed {loaded} from {resume_path}", flush=True)
+    else:
+        # Zero-init last layer + default_q + PD should already stand; save that first.
+        save_if_stand(net.actor, out_path, device)
     if iters <= 0:
         return
     if try_mjx(int(args.envs)):
@@ -409,6 +542,7 @@ def main() -> None:
             seed=int(args.seed),
             out_path=out_path,
             torch_device=device,
+            resume=resume,
         )
         return
     n_cpu = int(args.envs) if gpu_jax else min(int(args.envs), 8)
