@@ -4,6 +4,9 @@ Prefers MJX-JAX on ROCm (512+ envs). Falls back to in-process MuJoCo vec envs.
 Writes flywheel_data/l3_foundation.pt only if eval_reach, eval_deep_squat, and
 eval_push_recovery all pass (honest 15s reach / deep squat / push recovery).
 
+JAX and Torch PPO both use multi-epoch minibatch updates + entropy bonus.
+Curriculum stages follow absolute global_iter (saved in .latest), not per-run it.
+
 Run:  python train_l3_foundation.py
       python train_l3_foundation.py --iters 200 --envs 512
       python train_l3_foundation.py --iters 200 --envs 512 --resume
@@ -72,16 +75,27 @@ class ActorCritic(nn.Module):
         return self.critic(obs).squeeze(-1)
 
 
-def curriculum_stage(it: int, iters: int) -> int:
-    if it < max(1, iters // 5):
+# Absolute curriculum boundaries (independent of --iters / resume length).
+# Matches the old 200-iter schedule: stand 1–39, vx 40–79, full from 80.
+CURRICULUM_HORIZON = 200
+RESUME_EVERY = 5  # unconditional checkpoint cadence, independent of the production gate
+CHECKPOINT_VERSION = 2
+ENTROPY_COEF = 0.01
+PPO_EPOCHS = 4
+PPO_LR = 3e-4
+PPO_CLIP = 0.2
+PPO_TARGET_KL = 0.02
+PPO_GAMMA = 0.99
+PPO_LAM = 0.95
+JAX_MINIBATCH = 4096
+
+
+def curriculum_stage(global_it: int, horizon: int = CURRICULUM_HORIZON) -> int:
+    if global_it < max(1, horizon // 5):
         return STAGE_STAND
-    if it < max(2, (2 * iters) // 5):
+    if global_it < max(2, (2 * horizon) // 5):
         return STAGE_VX
     return STAGE_FULL
-
-
-RESUME_EVERY = 5  # unconditional checkpoint cadence, independent of the production gate
-CHECKPOINT_VERSION = 1
 
 
 def latest_path_for(out_path: Path) -> Path:
@@ -109,14 +123,15 @@ def _is_actor_state_dict(blob: dict) -> bool:
 
 
 def load_training_checkpoint(path: Path, device: torch.device) -> dict | None:
-    """Load resume blob. Supports v1 (actor+critic+log_std) and legacy actor-only."""
+    """Load resume blob. Supports v2/v1 (actor+critic+log_std[+global_iter]) and legacy actor-only."""
     if not path.is_file():
         return None
     blob = _torch_load(path, device)
     if not isinstance(blob, dict):
         return None
-    if blob.get("version") == CHECKPOINT_VERSION:
-        out: dict = {"actor": blob["actor"], "backend": blob.get("backend")}
+    ver = blob.get("version")
+    if ver in (1, 2, CHECKPOINT_VERSION):
+        out: dict = {"actor": blob["actor"], "backend": blob.get("backend"), "global_iter": int(blob.get("global_iter", 0))}
         if "critic" in blob:
             out["critic"] = blob["critic"]
         if "critic_jax" in blob:
@@ -126,7 +141,7 @@ def load_training_checkpoint(path: Path, device: torch.device) -> dict | None:
             out["log_std"] = ls if torch.is_tensor(ls) else torch.as_tensor(np.asarray(ls), dtype=torch.float32)
         return out
     if _is_actor_state_dict(blob):
-        return {"actor": blob, "backend": None}
+        return {"actor": blob, "backend": None, "global_iter": 0}
     return None
 
 
@@ -156,6 +171,7 @@ def save_training_checkpoint(
     *,
     actor_sd: dict,
     backend: str,
+    global_iter: int,
     critic_sd: dict | None = None,
     critic_jax=None,
     log_std=None,
@@ -164,7 +180,12 @@ def save_training_checkpoint(
     if not all(torch.isfinite(v).all() for v in actor_sd.values() if torch.is_tensor(v)):
         print(f"resume checkpoint skipped (non-finite actor weights) {path}", flush=True)
         return
-    payload: dict = {"version": CHECKPOINT_VERSION, "actor": actor_sd, "backend": backend}
+    payload: dict = {
+        "version": CHECKPOINT_VERSION,
+        "actor": actor_sd,
+        "backend": backend,
+        "global_iter": int(global_iter),
+    }
     if critic_sd is not None:
         payload["critic"] = critic_sd
     if critic_jax is not None:
@@ -176,7 +197,7 @@ def save_training_checkpoint(
         payload["log_std"] = log_std.detach().cpu() if torch.is_tensor(log_std) else torch.as_tensor(log_std, dtype=torch.float32)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
-    print(f"resume checkpoint saved {path}", flush=True)
+    print(f"resume checkpoint saved {path} global_iter={global_iter}", flush=True)
 
 
 def save_if_stand(policy: HumanoidFoundationPolicy, path: Path, device: torch.device) -> bool:
@@ -214,13 +235,15 @@ def ppo_torch(
     minibatch: int,
     target_kl: float,
     out_path: Path,
+    start_iter: int = 0,
 ) -> HumanoidFoundationPolicy:
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     obs = torch.as_tensor(envs.reset(), device=device, dtype=torch.float32)
     t0 = time.time()
     n = envs.n
-    for it in range(1, iters + 1):
-        envs.stage = curriculum_stage(it, iters)
+    for local in range(1, iters + 1):
+        global_it = start_iter + local
+        envs.stage = curriculum_stage(global_it)
         buf_o, buf_a, buf_lp, buf_v, buf_r, buf_d = [], [], [], [], [], []
         env_steps = 0
         for _ in range(unroll):
@@ -275,7 +298,7 @@ def ppo_torch(
                 surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * adv_f[mb]
                 pol = -torch.min(surr1, surr2).mean()
                 vf = 0.5 * (net.value(o_f[mb]) - ret_f[mb]).pow(2).mean()
-                ent = -0.01 * dist.entropy().sum(-1).mean()
+                ent = -ENTROPY_COEF * dist.entropy().sum(-1).mean()
                 loss = pol + vf + ent
                 approx_kl = float((lp_f[mb] - logp).mean().item())
                 if approx_kl > 1.5 * target_kl:
@@ -289,22 +312,23 @@ def ppo_torch(
                 break
         mean_ret = float(r.sum(0).mean().cpu())
         sps = env_steps / max(time.time() - t0, 1e-6)
-        if it == 1 or it % 5 == 0 or it == iters:
+        if local == 1 or local % 5 == 0 or local == iters:
             print(
-                f"iter {it}/{iters} stage={envs.stage} ret={mean_ret:.2f} "
+                f"iter {global_it} (+{local}/{iters}) stage={envs.stage} ret={mean_ret:.2f} "
                 f"env-steps/s={sps:.0f} elapsed={time.time() - t0:.0f}s",
                 flush=True,
             )
         t0 = time.time()
-        if it % RESUME_EVERY == 0 or it == iters:
+        if local % RESUME_EVERY == 0 or local == iters:
             save_training_checkpoint(
                 latest_path_for(out_path),
                 actor_sd=net.actor.state_dict(),
                 critic_sd=net.critic.state_dict(),
                 log_std=net.log_std,
                 backend="torch",
+                global_iter=global_it,
             )
-        if it == iters or it % 20 == 0:
+        if local == iters or local % 20 == 0:
             save_if_stand(net.actor, out_path, device)
     return net.actor
 
@@ -318,6 +342,9 @@ def ppo_jax(
     out_path: Path,
     torch_device: torch.device,
     resume: dict | None = None,
+    start_iter: int = 0,
+    epochs: int = PPO_EPOCHS,
+    minibatch: int = JAX_MINIBATCH,
 ) -> HumanoidFoundationPolicy:
     import jax
     import jax.numpy as jp
@@ -341,7 +368,7 @@ def ppo_jax(
         ]
 
     if resume is not None and "critic_jax" in resume:
-        critic = [(jp.asarray(w), jp.asarray(b)) for w, b in resume["critic_jax"]]
+        critic = [(jp.asarray(np.asarray(w)), jp.asarray(np.asarray(b))) for w, b in resume["critic_jax"]]
     elif resume is not None and "critic" in resume:
         critic = init_critic(k_c)
         net_tmp = ActorCritic().to(torch_device)
@@ -354,13 +381,17 @@ def ppo_jax(
         critic = init_critic(k_c)
 
     if resume is not None and "log_std" in resume:
-        log_std = jp.asarray(resume["log_std"].detach().cpu().numpy(), dtype=jp.float32)
+        log_std = jp.asarray(np.asarray(resume["log_std"].detach().cpu().numpy()), dtype=jp.float32)
     else:
         log_std = jp.full((ACT_DIM,), -1.2)
     policy = HumanoidFoundationPolicy(zero_out=True)
     rng = jax.random.PRNGKey(seed + 1)
+    # Align env stage with resumed curriculum before first reset.
+    env.stage = curriculum_stage(start_iter + 1)
+    env._compile()
     obs = env.reset(rng)
     t0 = time.time()
+    mb = max(1, min(int(minibatch), n_envs * unroll))
 
     def critic_apply(params, x):
         h = x
@@ -370,12 +401,40 @@ def ppo_jax(
         w, b = params[-1]
         return (h @ w + b).squeeze(-1)
 
-    for it in range(1, iters + 1):
-        new_stage = curriculum_stage(it, iters)
+    def _clip_grads(tree, max_norm=1.0):
+        leaves = jax.tree_util.tree_leaves(tree)
+        sq = sum(jp.sum(g * g) for g in leaves)
+        scale = jp.minimum(1.0, max_norm / jp.sqrt(sq + 1e-8))
+        return jax.tree_util.tree_map(lambda g: jp.nan_to_num(g * scale, nan=0.0), tree)
+
+    def mb_loss(actor, critic, log_std, o_mb, raw_mb, lp_mb, adv_mb, ret_mb):
+        mean = mlp_forward(jp, actor, o_mb)
+        std = jp.clip(jp.exp(log_std), 1e-3, 1.0)
+        new_lp = -0.5 * (((raw_mb - mean) / std) ** 2 + 2.0 * jp.log(std) + jp.log(2.0 * jp.pi)).sum(-1)
+        ratio = jp.exp(jp.clip(new_lp - lp_mb, -20.0, 20.0))
+        surr1 = ratio * adv_mb
+        surr2 = jp.clip(ratio, 1.0 - PPO_CLIP, 1.0 + PPO_CLIP) * adv_mb
+        pol = -jp.minimum(surr1, surr2).mean()
+        vf = 0.5 * ((critic_apply(critic, o_mb) - ret_mb) ** 2).mean()
+        ent = 0.5 * (1.0 + jp.log(2.0 * jp.pi) + 2.0 * jp.log(std)).sum(-1).mean()
+        return pol + vf - ENTROPY_COEF * ent, new_lp
+
+    def loss_only(actor, critic, log_std, o_mb, raw_mb, lp_mb, adv_mb, ret_mb):
+        loss, _ = mb_loss(actor, critic, log_std, o_mb, raw_mb, lp_mb, adv_mb, ret_mb)
+        return loss
+
+    grad_fn = jax.jit(jax.grad(loss_only, argnums=(0, 1, 2)))
+    kl_fn = jax.jit(lambda actor, critic, log_std, o_mb, raw_mb, lp_mb, adv_mb, ret_mb: mb_loss(
+        actor, critic, log_std, o_mb, raw_mb, lp_mb, adv_mb, ret_mb
+    )[1])
+
+    for local in range(1, iters + 1):
+        global_it = start_iter + local
+        new_stage = curriculum_stage(global_it)
         if new_stage != env.stage:
             env.stage = new_stage
             env._compile()
-            rng = jax.random.PRNGKey(seed + it)
+            rng = jax.random.PRNGKey(seed + global_it)
             obs = env.reset(rng)
         buf_o, buf_raw, buf_lp, buf_v, buf_r, buf_d = [], [], [], [], [], []
         for _ in range(unroll):
@@ -403,9 +462,9 @@ def ppo_jax(
         done = jp.stack(buf_d)
         mean_ret = float(np.asarray(rew.sum(0).mean()))
         sps = (n_envs * unroll) / max(time.time() - t0, 1e-6)
-        if it == 1 or it % 5 == 0 or it == iters:
+        if local == 1 or local % 5 == 0 or local == iters:
             print(
-                f"iter {it}/{iters} stage={env.stage} ret={mean_ret:.2f} "
+                f"iter {global_it} (+{local}/{iters}) stage={env.stage} ret={mean_ret:.2f} "
                 f"env-steps/s={sps:.0f} elapsed={time.time() - t0:.0f}s jax",
                 flush=True,
             )
@@ -416,39 +475,53 @@ def ppo_jax(
         for t in range(unroll - 1, -1, -1):
             nxt_v = last_v if t == unroll - 1 else v[t + 1]
             mask = 1.0 - done[t]
-            delta = rew[t] + 0.99 * nxt_v * mask - v[t]
-            last_gae = delta + 0.99 * 0.95 * mask * last_gae
+            delta = rew[t] + PPO_GAMMA * nxt_v * mask - v[t]
+            last_gae = delta + PPO_GAMMA * PPO_LAM * mask * last_gae
             adv = adv.at[t].set(last_gae)
         ret = adv + v
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         adv = jp.nan_to_num(adv, nan=0.0)
         ret = jp.nan_to_num(ret, nan=0.0)
 
-        def loss_fn(actor, critic, log_std):
-            mean = mlp_forward(jp, actor, o)
-            std = jp.clip(jp.exp(log_std), 1e-3, 1.0)
-            new_lp = -0.5 * (((raw - mean) / std) ** 2 + 2.0 * jp.log(std) + jp.log(2.0 * jp.pi)).sum(-1)
-            ratio = jp.exp(jp.clip(new_lp - logp, -20.0, 20.0))
-            surr1 = ratio * adv
-            surr2 = jp.clip(ratio, 0.8, 1.2) * adv
-            pol = -jp.minimum(surr1, surr2).mean()
-            vf = 0.5 * ((critic_apply(critic, o) - ret) ** 2).mean()
-            return pol + vf
+        o_f = o.reshape(-1, OBS_DIM)
+        raw_f = raw.reshape(-1, ACT_DIM)
+        lp_f = logp.reshape(-1)
+        adv_f = adv.reshape(-1)
+        ret_f = ret.reshape(-1)
+        n_samples = int(o_f.shape[0])
+        updates = 0
+        for _epoch in range(epochs):
+            key, k_perm = jax.random.split(key)
+            perm = jax.random.permutation(k_perm, n_samples)
+            stop = False
+            for s in range(0, n_samples, mb):
+                end = min(s + mb, n_samples)
+                # Drop undersized trailing shard so the jitted shapes stay fixed.
+                if end - s < mb:
+                    break
+                idx = perm[s:end]
+                o_mb = o_f[idx]
+                raw_mb = raw_f[idx]
+                lp_mb = lp_f[idx]
+                adv_mb = adv_f[idx]
+                ret_mb = ret_f[idx]
+                new_lp = kl_fn(actor, critic, log_std, o_mb, raw_mb, lp_mb, adv_mb, ret_mb)
+                approx_kl = float(np.asarray((lp_mb - new_lp).mean()))
+                if approx_kl > 1.5 * PPO_TARGET_KL:
+                    stop = True
+                    break
+                grads = grad_fn(actor, critic, log_std, o_mb, raw_mb, lp_mb, adv_mb, ret_mb)
+                grads = (_clip_grads(grads[0]), _clip_grads(grads[1]), _clip_grads(grads[2]))
+                actor = jax.tree_util.tree_map(lambda p, g: p - PPO_LR * g, actor, grads[0])
+                critic = jax.tree_util.tree_map(lambda p, g: p - PPO_LR * g, critic, grads[1])
+                log_std = jp.clip(log_std - PPO_LR * grads[2], -5.0, 0.0)
+                updates += 1
+            if stop:
+                break
+        if local == 1 or local % 5 == 0 or local == iters:
+            print(f"  ppo updates={updates} mb={mb} epochs<={epochs}", flush=True)
 
-        grads = jax.grad(loss_fn, argnums=(0, 1, 2))(actor, critic, log_std)
-
-        def _clip_grads(tree, max_norm=1.0):
-            leaves = jax.tree_util.tree_leaves(tree)
-            sq = sum(jp.sum(g * g) for g in leaves)
-            scale = jp.minimum(1.0, max_norm / jp.sqrt(sq + 1e-8))
-            return jax.tree_util.tree_map(lambda g: jp.nan_to_num(g * scale, nan=0.0), tree)
-
-        grads = (_clip_grads(grads[0]), _clip_grads(grads[1]), _clip_grads(grads[2]))
-        lr = 3e-4
-        actor = jax.tree_util.tree_map(lambda p, g: p - lr * g, actor, grads[0])
-        critic = jax.tree_util.tree_map(lambda p, g: p - lr * g, critic, grads[1])
-        log_std = jp.clip(log_std - lr * grads[2], -5.0, 0.0)
-        if it % RESUME_EVERY == 0 or it == iters:
+        if local % RESUME_EVERY == 0 or local == iters:
             policy.load_state_dict(jax_params_to_state_dict(actor))
             save_training_checkpoint(
                 latest_path_for(out_path),
@@ -456,8 +529,9 @@ def ppo_jax(
                 critic_jax=critic,
                 log_std=np.asarray(log_std),
                 backend="jax",
+                global_iter=global_it,
             )
-        if it == iters or it % 20 == 0:
+        if local == iters or local % 20 == 0:
             policy.load_state_dict(jax_params_to_state_dict(actor))
             save_if_stand(policy, out_path, torch_device)
     policy.load_state_dict(jax_params_to_state_dict(actor))
@@ -502,6 +576,12 @@ def main() -> None:
         metavar="PATH",
         help="Resume from l3_foundation.latest.pt (default) or the given checkpoint.",
     )
+    p.add_argument(
+        "--start-iter",
+        type=int,
+        default=None,
+        help="Override global_iter after resume (for old checkpoints without the field).",
+    )
     args = p.parse_args()
     device = resolve_device(args.device)
     out_path = Path(args.out)
@@ -516,19 +596,30 @@ def main() -> None:
         resume_path = latest_path_for(out_path) if args.resume == "" else Path(args.resume)
     print(
         f"foundation PPO obs={OBS_DIM} act={ACT_DIM} torch={device} jax={kind} "
-        f"iters={iters} envs={args.envs}"
+        f"iters={iters} envs={args.envs} curriculum_horizon={CURRICULUM_HORIZON} "
+        f"ppo_epochs={PPO_EPOCHS} jax_mb={JAX_MINIBATCH}"
         + (f" resume={resume_path}" if resume_path else ""),
         flush=True,
     )
     net = ActorCritic().to(device)
     resume: dict | None = None
+    start_iter = 0
     if resume_path is not None:
         resume = load_training_checkpoint(resume_path, device)
         if resume is None:
             print(f"resume failed: missing or invalid checkpoint {resume_path}", flush=True)
             sys.exit(1)
         loaded = apply_resume_to_net(net, resume)
-        print(f"resumed {loaded} from {resume_path}", flush=True)
+        start_iter = int(resume.get("global_iter", 0))
+        if args.start_iter is not None:
+            start_iter = int(args.start_iter)
+        print(
+            f"resumed {loaded} from {resume_path} global_iter={start_iter} "
+            f"next_stage={curriculum_stage(start_iter + 1)}",
+            flush=True,
+        )
+    elif args.start_iter is not None:
+        start_iter = int(args.start_iter)
     else:
         # Zero-init last layer + default_q + PD should already stand; save that first.
         save_if_stand(net.actor, out_path, device)
@@ -543,25 +634,27 @@ def main() -> None:
             out_path=out_path,
             torch_device=device,
             resume=resume,
+            start_iter=start_iter,
         )
         return
     n_cpu = int(args.envs) if gpu_jax else min(int(args.envs), 8)
     print(f"CPU/PyTorch vec envs n={n_cpu}", flush=True)
-    envs = VecFoundationEnv(n_cpu, stage=STAGE_STAND)
+    envs = VecFoundationEnv(n_cpu, stage=curriculum_stage(start_iter + 1))
     ppo_torch(
         net=net,
         envs=envs,
         iters=iters,
         unroll=int(args.unroll),
         device=device,
-        lr=3e-4,
-        gamma=0.99,
-        lam=0.95,
-        clip=0.2,
-        epochs=4,
+        lr=PPO_LR,
+        gamma=PPO_GAMMA,
+        lam=PPO_LAM,
+        clip=PPO_CLIP,
+        epochs=PPO_EPOCHS,
         minibatch=min(256, n_cpu * int(args.unroll)),
-        target_kl=0.02,
+        target_kl=PPO_TARGET_KL,
         out_path=out_path,
+        start_iter=start_iter,
     )
 
 
