@@ -1,7 +1,9 @@
 # Official ROCm JAX image via Docker Desktop (WSL2 backend, RX 9070).
 # Usage:
 #   .\scripts\run_jax_docker.ps1
-#   .\scripts\run_jax_docker.ps1 python train_l3_foundation.py --iters 200 --envs 512 --resume
+#   .\scripts\run_jax_docker.ps1 python train_l3_foundation.py --iters 200 --envs 2048 --resume
+#   Stage A is stand-only (no vx). Look for `metrics ... tilt_min=` and `fall_rate=`.
+#   If VRAM allows, --envs 4096. First iter compiles the JAX scan (slow once).
 #   # --iters is "how many more this run"; curriculum uses saved global_iter (horizon=200).
 #   # Old .latest without global_iter: add --start-iter N if you know approx progress.
 $ErrorActionPreference = "Stop"

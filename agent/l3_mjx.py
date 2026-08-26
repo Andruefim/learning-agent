@@ -34,16 +34,22 @@ from agent.l3_env import STAGE_FULL, STAGE_STAND, STAGE_VX, load_train_model
 from agent.l3_foundation import (
     ACT_DIM,
     ACTION_SCALE,
+    ALIVE_BONUS,
+    ANG_VEL_CLIP,
+    ANG_VEL_COEF,
+    BALANCE_PRIOR_SCALE,
     DECIMATION,
     EPISODE_SEC,
     HEIGHT_RANGE,
     HIDDEN,
+    LIN_VEL_COEF,
     OBS_DIM,
     PUSH_DUR_SEC,
     PUSH_EVERY_SEC,
     PUSH_FORCE,
     REACH_FRAC,
     REWARD_CLIP,
+    STAND_ONLY,
     TERMINAL_PENALTY,
     TRAIN_FALL_Z,
     TRAIN_TILT,
@@ -203,10 +209,10 @@ class MjxFoundationEnv:
         u = jax.random.uniform(k1, ())
         arms = jp.where(u < REACH_FRAC, reach_arms, jp.where(u < REACH_FRAC + 0.12, mild, jp.zeros((14,), dtype=jp.float32)))
         cmd = cmd.at[4:18].set(arms)
-        if self.stage >= STAGE_VX:
+        if (not STAND_ONLY) and self.stage >= STAGE_VX:
             rng, k = jax.random.split(rng)
             cmd = cmd.at[CMD_VX].set(jax.random.uniform(k, (), minval=-0.15, maxval=0.70))
-        if self.stage >= STAGE_FULL:
+        if (not STAND_ONLY) and self.stage >= STAGE_FULL:
             rng, k1, k2 = jax.random.split(rng, 3)
             cmd = cmd.at[CMD_VY].set(jax.random.uniform(k1, (), minval=-0.15, maxval=0.15))
             cmd = cmd.at[CMD_WZ].set(jax.random.uniform(k2, (), minval=-0.40, maxval=0.40))
@@ -245,7 +251,7 @@ class MjxFoundationEnv:
         dlt = dlt.at[R_AP].set(sag_ak).at[L_AP].set(sag_ak)
         dlt = dlt.at[R_HP].set(sag_hy).at[L_HP].set(sag_hy)
         dlt = dlt.at[R_HR].set(pd_hx).at[L_HR].set(pd_hx)
-        return dlt, off
+        return dlt * jp.float32(BALANCE_PRIOR_SCALE), off
 
     def _pd(self, dx, q_tgt):
         jp = self.jp
@@ -310,19 +316,24 @@ class MjxFoundationEnv:
         gyro = dx.cvel[self.spec.torso_id, :3]
         v_xy = dx.qvel[0:2]
         v_cmd = jp.array([cmd[CMD_VX], cmd[CMD_VY]])
+        r_alive = jp.float32(ALIVE_BONUS)
         r_h = jp.exp(-10.0 * jp.abs(z - cmd[CMD_H]))
         r_up = jp.exp(-5.0 * (1.0 - tilt * tilt))
         r_vel = jp.exp(-2.0 * jp.sum((v_b[:2] - v_cmd) ** 2))
         r_rate = jp.clip(-0.01 * jp.sum((a - last_a) ** 2), -1.0, 0.0)
         r_acc = jp.clip(-0.005 * jp.sum((a - 2.0 * last_a + prev_a) ** 2), -1.0, 0.0)
-        r_ang = jp.clip(-0.05 * (gyro[0] ** 2 + gyro[1] ** 2), -2.0, 0.0)
-        r_lin = jp.where(jp.linalg.norm(v_cmd) < 0.05, jp.clip(-0.1 * jp.sum(v_xy ** 2), -2.0, 0.0), 0.0)
+        r_ang = jp.clip(-jp.float32(ANG_VEL_COEF) * (gyro[0] ** 2 + gyro[1] ** 2), -jp.float32(ANG_VEL_CLIP), 0.0)
+        r_lin = jp.where(
+            jp.linalg.norm(v_cmd) < 0.05,
+            jp.clip(-jp.float32(LIN_VEL_COEF) * jp.sum(v_xy ** 2), -2.0, 0.0),
+            0.0,
+        )
         def _fp(body_id):
             R = self._xmat3(dx, body_id)
             return jp.arctan2(-R[2, 0], R[2, 2])
         r_foot = jp.clip(-0.1 * (_fp(self.spec.r_foot_id) ** 2 + _fp(self.spec.l_foot_id) ** 2), -1.0, 0.0)
         r_arm = 0.4 * jp.exp(-4.0 * jp.mean((q[15:29] - cmd[CMD_ARMS]) ** 2))
-        reward = r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm
+        reward = r_alive + r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm
         fall = (tilt < TRAIN_TILT) | (z < TRAIN_FALL_Z)
         bad = ~(jp.isfinite(z) & jp.isfinite(tilt) & jp.isfinite(jp.sum(dx.qvel)) & jp.isfinite(reward))
         fall = fall | bad

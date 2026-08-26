@@ -33,16 +33,25 @@ OBS_DIM = 3 + 3 + N_ACT + N_ACT + N_ACT + L2_CMD_DIM  # 117
 ACT_DIM = N_ACT
 TILT_LIM = 0.65  # app / engine
 FALL_Z = 0.40
-TRAIN_TILT = 0.70
+# Stage A: terminate near upright (~26°), not after the robot is already falling.
+TRAIN_TILT = 0.90
 TRAIN_FALL_Z = 0.40
 TERMINAL_PENALTY = 50.0
-REWARD_CLIP = 8.0
+REWARD_CLIP = 12.0
 EPISODE_SEC = (15.0, 20.0)
 HEIGHT_RANGE = (0.65, 1.02)
 REACH_FRAC = 0.40
 PUSH_EVERY_SEC = (2.0, 3.0)
 PUSH_DUR_SEC = 0.20
-PUSH_FORCE = (40.0, 60.0)
+# Training pushes: light enough to survive TRAIN_TILT=0.90. Eval still uses 50 N.
+PUSH_FORCE = (12.0, 22.0)
+ALIVE_BONUS = 1.0
+ANG_VEL_COEF = 0.50
+ANG_VEL_CLIP = 4.0
+LIN_VEL_COEF = 0.50
+# Scale of the hardcoded IPM prior. 1.0 was a limit-cycle; policy must learn the rest.
+BALANCE_PRIOR_SCALE = 0.25
+STAND_ONLY = True
 HIDDEN = (256, 256, 128)
 
 
@@ -172,7 +181,39 @@ def balance_delta(err_xy: np.ndarray, d_xy: np.ndarray, *, height_01: float = 1.
     dlt[R_AP] = dlt[L_AP] = sag_ak
     dlt[R_HP] = dlt[L_HP] = sag_hy
     dlt[R_HR] = dlt[L_HR] = pd_hx
-    return dlt
+    return dlt * float(BALANCE_PRIOR_SCALE)
+
+
+def shaped_reward(
+    *,
+    z: float,
+    h_cmd: float,
+    tilt: float,
+    v_b: np.ndarray,
+    v_cmd: np.ndarray,
+    da: np.ndarray,
+    dda: np.ndarray,
+    gyro: np.ndarray,
+    v_xy: np.ndarray,
+    foot_pitch_sq: float,
+    arm_mse: float,
+) -> float:
+    """Dense stand-first reward. Terminal fall penalty is applied by the env."""
+    r_alive = float(ALIVE_BONUS)
+    r_h = float(np.exp(-10.0 * abs(float(z) - float(h_cmd))))
+    r_up = float(np.exp(-5.0 * (1.0 - float(tilt) * float(tilt))))
+    dv = np.asarray(v_b[:2], dtype=np.float64) - np.asarray(v_cmd, dtype=np.float64)
+    r_vel = float(np.exp(-2.0 * float(np.sum(dv ** 2))))
+    r_rate = float(np.clip(-0.01 * float(np.sum(np.asarray(da, dtype=np.float64) ** 2)), -1.0, 0.0))
+    r_acc = float(np.clip(-0.005 * float(np.sum(np.asarray(dda, dtype=np.float64) ** 2)), -1.0, 0.0))
+    gx, gy = float(gyro[0]), float(gyro[1])
+    r_ang = float(np.clip(-ANG_VEL_COEF * (gx * gx + gy * gy), -ANG_VEL_CLIP, 0.0))
+    r_lin = 0.0
+    if float(np.linalg.norm(v_cmd)) < 0.05:
+        r_lin = float(np.clip(-LIN_VEL_COEF * float(np.sum(np.asarray(v_xy, dtype=np.float64) ** 2)), -2.0, 0.0))
+    r_foot = float(np.clip(-0.1 * float(foot_pitch_sq), -1.0, 0.0))
+    r_arm = 0.4 * float(np.exp(-4.0 * float(arm_mse)))
+    return float(r_alive + r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm)
 
 
 def foot_pitch_from_xmat(xmat) -> float:

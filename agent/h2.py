@@ -53,6 +53,9 @@ def _h2_leg_pose(*, hip: float, knee: float, ankle: float) -> np.ndarray:
 
 STAND_Q = _h2_leg_pose(hip=-0.20, knee=0.40, ankle=-0.25)
 STAND_Q[WAIST_P] = 0.05
+# Slight hip abduction so the support polygon is not a knife-edge.
+STAND_Q[L_HR] = 0.12
+STAND_Q[R_HR] = -0.12
 SQUAT_Q = _h2_leg_pose(hip=-0.55, knee=1.00, ankle=-0.40)
 SQUAT_Q[WAIST_P] = 0.12
 # Software Joint-PD gains (Nm/rad, Nm·s/rad). Motors stay torque in XML.

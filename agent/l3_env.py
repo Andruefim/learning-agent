@@ -48,6 +48,7 @@ from agent.l3_foundation import (
     PUSH_FORCE,
     REACH_FRAC,
     REWARD_CLIP,
+    STAND_ONLY,
     TERMINAL_PENALTY,
     TRAIN_FALL_Z,
     TRAIN_TILT,
@@ -59,6 +60,7 @@ from agent.l3_foundation import (
     heading_z,
     height_01,
     q_from_action,
+    shaped_reward,
 )
 
 STAGE_STAND = 0
@@ -97,9 +99,9 @@ def _sample_command(rng: np.random.Generator, stage: int) -> np.ndarray:
         cmd[CMD_ARMS] = rng.uniform(-0.4, 0.2, size=14).astype(np.float32)
         cmd[4] = float(rng.uniform(-1.55, 0.0))
         cmd[11] = float(rng.uniform(-1.55, 0.0))
-    if stage >= STAGE_VX:
+    if (not STAND_ONLY) and stage >= STAGE_VX:
         cmd[CMD_VX] = float(rng.uniform(-0.15, 0.70))
-    if stage >= STAGE_FULL:
+    if (not STAND_ONLY) and stage >= STAGE_FULL:
         cmd[CMD_VY] = float(rng.uniform(-0.15, 0.15))
         cmd[CMD_WZ] = float(rng.uniform(-0.40, 0.40))
     return cmd.astype(np.float32)
@@ -279,21 +281,22 @@ class FoundationEnv:
         gyro = self._omega()
         v_xy = np.asarray(self.data.qvel[0:2], dtype=np.float64)
         v_cmd = np.array([float(self.cmd[CMD_VX]), float(self.cmd[CMD_VY])], dtype=np.float64)
-        r_h = float(np.exp(-10.0 * abs(z - float(self.cmd[CMD_H]))))
-        r_up = float(np.exp(-5.0 * (1.0 - g_z * g_z)))
-        r_vel = float(np.exp(-2.0 * float(np.sum((v_b[:2] - v_cmd) ** 2))))
-        r_rate = float(np.clip(-0.01 * float(np.sum(da**2)), -1.0, 0.0))
-        r_acc = float(np.clip(-0.005 * float(np.sum(dda**2)), -1.0, 0.0))
-        r_ang = float(np.clip(-0.05 * float(gyro[0] ** 2 + gyro[1] ** 2), -2.0, 0.0))
-        r_lin = 0.0
-        if float(np.linalg.norm(v_cmd)) < 0.05:
-            r_lin = float(np.clip(-0.1 * float(np.sum(v_xy**2)), -2.0, 0.0))
         p_r = foot_pitch_from_xmat(self.data.xmat[self.r_foot_id])
         p_l = foot_pitch_from_xmat(self.data.xmat[self.l_foot_id])
-        r_foot = float(np.clip(-0.1 * (p_r * p_r + p_l * p_l), -1.0, 0.0))
         q = self._hinges()
-        r_arm = 0.4 * float(np.exp(-4.0 * np.mean((q[15:29] - self.cmd[CMD_ARMS]) ** 2)))
-        reward = r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm
+        reward = shaped_reward(
+            z=z,
+            h_cmd=float(self.cmd[CMD_H]),
+            tilt=g_z,
+            v_b=v_b,
+            v_cmd=v_cmd,
+            da=da,
+            dda=dda,
+            gyro=gyro,
+            v_xy=v_xy,
+            foot_pitch_sq=p_r * p_r + p_l * p_l,
+            arm_mse=float(np.mean((q[15:29] - self.cmd[CMD_ARMS]) ** 2)),
+        )
         fall = self._terminated()
         timeout = False
         if self._horizon:
