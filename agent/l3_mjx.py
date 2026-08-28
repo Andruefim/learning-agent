@@ -24,6 +24,7 @@ from agent.h2 import (
     STAND_Q,
     SQUAT_Q,
     actuator_addrs,
+    arm_hang_cmd,
     box_geom,
     colliding_geoms,
     joint_limits,
@@ -38,6 +39,9 @@ from agent.l3_foundation import (
     ANG_VEL_CLIP,
     ANG_VEL_COEF,
     BALANCE_PRIOR_SCALE,
+    CONTACT_Z_ELBOW,
+    CONTACT_Z_HAND,
+    CONTACT_Z_KNEE,
     DECIMATION,
     EPISODE_SEC,
     HEIGHT_RANGE,
@@ -47,6 +51,9 @@ from agent.l3_foundation import (
     PUSH_DUR_SEC,
     PUSH_EVERY_SEC,
     PUSH_FORCE,
+    QVEL_CLIP,
+    QVEL_COEF,
+    RATE_COEF,
     REACH_FRAC,
     REWARD_CLIP,
     STAND_ONLY,
@@ -111,6 +118,12 @@ class MjxSpec:
     l_geoms: tuple[int, ...]
     r_fg: int
     l_fg: int
+    l_knee_id: int
+    r_knee_id: int
+    l_elbow_id: int
+    r_elbow_id: int
+    l_wrist_id: int
+    r_wrist_id: int
     nq: int
     nv: int
     nu: int
@@ -139,6 +152,12 @@ def make_spec(model) -> MjxSpec:
         l_geoms=tuple(colliding_geoms(model, l_foot)),
         r_fg=box_geom(model, colliding_geoms(model, r_foot), colliding_geoms(model, r_foot)[0] if colliding_geoms(model, r_foot) else 0),
         l_fg=box_geom(model, colliding_geoms(model, l_foot), colliding_geoms(model, l_foot)[0] if colliding_geoms(model, l_foot) else 0),
+        l_knee_id=int(model.body("left_knee_link").id),
+        r_knee_id=int(model.body("right_knee_link").id),
+        l_elbow_id=int(model.body("left_elbow_link").id),
+        r_elbow_id=int(model.body("right_elbow_link").id),
+        l_wrist_id=int(model.body("left_wrist_yaw_link").id),
+        r_wrist_id=int(model.body("right_wrist_yaw_link").id),
         nq=int(model.nq),
         nv=int(model.nv),
         nu=int(model.nu),
@@ -179,6 +198,7 @@ class MjxFoundationEnv:
         self.tau_hi = jp.asarray(s.tau_hi)
         self.stand_q = jp.asarray(STAND_Q)
         self.squat_q = jp.asarray(SQUAT_Q)
+        self.hang_arms = jp.asarray(arm_hang_cmd())
         self.upper = jp.asarray(np.arange(15, 29, dtype=np.int32))
 
     def _xmat3(self, dx, body: int):
@@ -189,8 +209,9 @@ class MjxFoundationEnv:
     def _sample_cmd(self, rng):
         jax, jp = self.jax, self.jp
         rng, k1, k2, k3, k4, k5, k6, k7, k8 = jax.random.split(rng, 9)
+        hang = self.hang_arms
         h = jax.random.uniform(k1, (), minval=HEIGHT_RANGE[0], maxval=HEIGHT_RANGE[1])
-        cmd = jp.zeros((L2_CMD_DIM,), dtype=jp.float32).at[CMD_H].set(h)
+        cmd = jp.zeros((L2_CMD_DIM,), dtype=jp.float32).at[CMD_H].set(h).at[4:18].set(hang)
         pitch = jax.random.uniform(k3, (), minval=0.33, maxval=1.0)
         asym = jax.random.bernoulli(k4, 0.45)
         l_arm = jp.where(asym, jax.random.uniform(k5, (), minval=0.20, maxval=1.0) * pitch, pitch)
@@ -199,15 +220,15 @@ class MjxFoundationEnv:
         l_out = jax.random.uniform(k6, (), minval=-0.2, maxval=0.6)
         r_out = jax.random.uniform(k7, (), minval=-0.2, maxval=0.6)
         raise_q = jp.float32(ARM_RAISE)
-        reach_arms = jp.zeros((14,), dtype=jp.float32)
-        reach_arms = reach_arms.at[0].set(raise_q * l_arm).at[7].set(raise_q * r_arm)
-        reach_arms = reach_arms.at[1].set(1.20 * l_out).at[8].set(-1.20 * r_out)
-        reach_arms = reach_arms.at[3].set(0.90 * l_arm).at[10].set(0.90 * r_arm)
-        mild = jax.random.uniform(k8, (14,), minval=-0.4, maxval=0.2)
-        sp = jax.random.uniform(k2, (2,), minval=-1.55, maxval=0.0)
-        mild = mild.at[0].set(sp[0]).at[7].set(sp[1])
-        u = jax.random.uniform(k1, ())
-        arms = jp.where(u < REACH_FRAC, reach_arms, jp.where(u < REACH_FRAC + 0.12, mild, jp.zeros((14,), dtype=jp.float32)))
+        reach_arms = hang
+        reach_arms = reach_arms.at[0].set(hang[0] + (raise_q - hang[0]) * l_arm)
+        reach_arms = reach_arms.at[7].set(hang[7] + (raise_q - hang[7]) * r_arm)
+        reach_arms = reach_arms.at[1].set(hang[1] + 1.20 * l_out).at[8].set(hang[8] - 1.20 * r_out)
+        reach_arms = reach_arms.at[3].set(hang[3] + (jp.float32(0.90) - hang[3]) * l_arm)
+        reach_arms = reach_arms.at[10].set(hang[10] + (jp.float32(0.90) - hang[10]) * r_arm)
+        mild = hang + jax.random.uniform(k8, (14,), minval=-0.15, maxval=0.15)
+        u = jax.random.uniform(k2, ())
+        arms = jp.where(u < REACH_FRAC, reach_arms, jp.where(u < REACH_FRAC + 0.12, mild, hang))
         cmd = cmd.at[4:18].set(arms)
         if (not STAND_ONLY) and self.stage >= STAGE_VX:
             rng, k = jax.random.split(rng)
@@ -320,7 +341,7 @@ class MjxFoundationEnv:
         r_h = jp.exp(-10.0 * jp.abs(z - cmd[CMD_H]))
         r_up = jp.exp(-5.0 * (1.0 - tilt * tilt))
         r_vel = jp.exp(-2.0 * jp.sum((v_b[:2] - v_cmd) ** 2))
-        r_rate = jp.clip(-0.01 * jp.sum((a - last_a) ** 2), -1.0, 0.0)
+        r_rate = jp.clip(-jp.float32(RATE_COEF) * jp.sum((a - last_a) ** 2), -1.0, 0.0)
         r_acc = jp.clip(-0.005 * jp.sum((a - 2.0 * last_a + prev_a) ** 2), -1.0, 0.0)
         r_ang = jp.clip(-jp.float32(ANG_VEL_COEF) * (gyro[0] ** 2 + gyro[1] ** 2), -jp.float32(ANG_VEL_CLIP), 0.0)
         r_lin = jp.where(
@@ -333,8 +354,13 @@ class MjxFoundationEnv:
             return jp.arctan2(-R[2, 0], R[2, 2])
         r_foot = jp.clip(-0.1 * (_fp(self.spec.r_foot_id) ** 2 + _fp(self.spec.l_foot_id) ** 2), -1.0, 0.0)
         r_arm = 0.4 * jp.exp(-4.0 * jp.mean((q[15:29] - cmd[CMD_ARMS]) ** 2))
-        reward = r_alive + r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm
-        fall = (tilt < TRAIN_TILT) | (z < TRAIN_FALL_Z)
+        r_qvel = jp.clip(-jp.float32(QVEL_COEF) * jp.sum(dx.qvel[self.vadr] ** 2), -jp.float32(QVEL_CLIP), 0.0)
+        reward = r_alive + r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm + r_qvel
+        knee_z = jp.minimum(dx.xpos[self.spec.l_knee_id, 2], dx.xpos[self.spec.r_knee_id, 2])
+        hand_z = jp.minimum(dx.xpos[self.spec.l_wrist_id, 2], dx.xpos[self.spec.r_wrist_id, 2])
+        elbow_z = jp.minimum(dx.xpos[self.spec.l_elbow_id, 2], dx.xpos[self.spec.r_elbow_id, 2])
+        contact = (knee_z < CONTACT_Z_KNEE) | (hand_z < CONTACT_Z_HAND) | (elbow_z < CONTACT_Z_ELBOW)
+        fall = (tilt < TRAIN_TILT) | (z < TRAIN_FALL_Z) | contact
         bad = ~(jp.isfinite(z) & jp.isfinite(tilt) & jp.isfinite(jp.sum(dx.qvel)) & jp.isfinite(reward))
         fall = fall | bad
         time_left = time_left - 1

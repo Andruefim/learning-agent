@@ -18,6 +18,7 @@ from agent.h2 import (
     STAND_Q,
     TRAIN_XML,
     actuator_addrs,
+    arm_hang_cmd,
     box_geom,
     colliding_geoms,
     cylinders_to_capsules,
@@ -46,6 +47,9 @@ from agent.l3_foundation import (
     PUSH_DUR_SEC,
     PUSH_EVERY_SEC,
     PUSH_FORCE,
+    CONTACT_Z_ELBOW,
+    CONTACT_Z_HAND,
+    CONTACT_Z_KNEE,
     REACH_FRAC,
     REWARD_CLIP,
     STAND_ONLY,
@@ -95,10 +99,8 @@ def _sample_command(rng: np.random.Generator, stage: int) -> np.ndarray:
             l_out=float(rng.uniform(-0.2, 0.6)),
         )
         cmd[CMD_ARMS] = arm_targets(t)
-    elif rng.random() < 0.20:
-        cmd[CMD_ARMS] = rng.uniform(-0.4, 0.2, size=14).astype(np.float32)
-        cmd[4] = float(rng.uniform(-1.55, 0.0))
-        cmd[11] = float(rng.uniform(-1.55, 0.0))
+    elif rng.random() < 0.12:
+        cmd[CMD_ARMS] = (arm_hang_cmd() + rng.uniform(-0.15, 0.15, size=14).astype(np.float32))
     if (not STAND_ONLY) and stage >= STAGE_VX:
         cmd[CMD_VX] = float(rng.uniform(-0.15, 0.70))
     if (not STAND_ONLY) and stage >= STAGE_FULL:
@@ -117,6 +119,12 @@ class FoundationEnv:
         self.torso_id = self.model.body("torso_link").id
         self.r_foot_id = self.model.body("right_ankle_pitch_link").id
         self.l_foot_id = self.model.body("left_ankle_pitch_link").id
+        self.l_knee_id = self.model.body("left_knee_link").id
+        self.r_knee_id = self.model.body("right_knee_link").id
+        self.l_elbow_id = self.model.body("left_elbow_link").id
+        self.r_elbow_id = self.model.body("right_elbow_link").id
+        self.l_wrist_id = self.model.body("left_wrist_yaw_link").id
+        self.r_wrist_id = self.model.body("right_wrist_yaw_link").id
         self.r_geoms = colliding_geoms(self.model, self.r_foot_id)
         self.l_geoms = colliding_geoms(self.model, self.l_foot_id)
         self.r_fg = box_geom(self.model, self.r_geoms, self.r_geoms[0] if self.r_geoms else 0)
@@ -173,8 +181,29 @@ class FoundationEnv:
     def _omega(self) -> np.ndarray:
         return np.asarray(self.data.cvel[self.torso_id, :3], dtype=np.float64)
 
+    def _nonfoot_contact(self) -> bool:
+        """Knees / hands / torso on the floor — not a stand, even if pelvis is high."""
+        xpos = self.data.xpos
+        if min(float(xpos[self.l_knee_id, 2]), float(xpos[self.r_knee_id, 2])) < CONTACT_Z_KNEE:
+            return True
+        if min(float(xpos[self.l_wrist_id, 2]), float(xpos[self.r_wrist_id, 2])) < CONTACT_Z_HAND:
+            return True
+        if min(float(xpos[self.l_elbow_id, 2]), float(xpos[self.r_elbow_id, 2])) < CONTACT_Z_ELBOW:
+            return True
+        feet = set(self.r_geoms) | set(self.l_geoms)
+        for i in range(int(self.data.ncon)):
+            c = self.data.contact[i]
+            g1, g2 = int(c.geom1), int(c.geom2)
+            if g1 in feet or g2 in feet:
+                continue
+            z1 = float(self.data.geom_xpos[g1, 2])
+            z2 = float(self.data.geom_xpos[g2, 2])
+            if min(z1, z2) < 0.08:
+                return True
+        return False
+
     def _terminated(self) -> bool:
-        return self._tilt() < TRAIN_TILT or self._z() < TRAIN_FALL_Z
+        return self._tilt() < TRAIN_TILT or self._z() < TRAIN_FALL_Z or self._nonfoot_contact()
 
     def apply_impulse(self, fx: float, fy: float, *, duration_sec: float = PUSH_DUR_SEC) -> None:
         self.data.xfrc_applied[self.torso_id] = 0
@@ -296,6 +325,7 @@ class FoundationEnv:
             v_xy=v_xy,
             foot_pitch_sq=p_r * p_r + p_l * p_l,
             arm_mse=float(np.mean((q[15:29] - self.cmd[CMD_ARMS]) ** 2)),
+            qvel=self._qd(),
         )
         fall = self._terminated()
         timeout = False

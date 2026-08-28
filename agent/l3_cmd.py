@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from agent.h2 import ACTION_DIM, ARM_RAISE
+from agent.h2 import ACTION_DIM, ARM_RAISE, arm_hang_cmd
 from agent.plan import Plan, TeacherIntent, parse_requested_yaw
 
 # vx, vy, wz, h_m, 14 arm joints (actuator order, both arms)
@@ -16,13 +16,16 @@ CMD_ARMS = slice(4, 18)
 
 
 def arm_targets(t: TeacherIntent) -> np.ndarray:
-    q = np.zeros(ARM_DOF, dtype=np.float32)
-    q[0] = float(ARM_RAISE) * float(np.clip(t.l_arm, 0.0, 1.0))
-    q[7] = float(ARM_RAISE) * float(np.clip(t.r_arm, 0.0, 1.0))
-    q[1] = 1.20 * float(np.clip(t.l_out, -1.0, 1.0))
-    q[8] = -1.20 * float(np.clip(t.r_out, -1.0, 1.0))
-    q[3] = 0.90 * float(np.clip(t.l_arm, 0.0, 1.0))
-    q[10] = 0.90 * float(np.clip(t.r_arm, 0.0, 1.0))
+    """Lerp hang → reach. l_arm/r_arm=0 keeps hands at the sides, not CAD-forward."""
+    q = arm_hang_cmd()
+    l = float(np.clip(t.l_arm, 0.0, 1.0))
+    r = float(np.clip(t.r_arm, 0.0, 1.0))
+    q[0] = q[0] + (float(ARM_RAISE) - q[0]) * l
+    q[7] = q[7] + (float(ARM_RAISE) - q[7]) * r
+    q[1] = q[1] + 1.20 * float(np.clip(t.l_out, -1.0, 1.0))
+    q[8] = q[8] - 1.20 * float(np.clip(t.r_out, -1.0, 1.0))
+    q[3] = q[3] + (0.90 - q[3]) * l
+    q[10] = q[10] + (0.90 - q[10]) * r
     return q
 
 
@@ -66,6 +69,7 @@ def clip_command(cmd: np.ndarray) -> np.ndarray:
 def stand_command() -> np.ndarray:
     cmd = np.zeros(L2_CMD_DIM, dtype=np.float32)
     cmd[CMD_H] = 1.02
+    cmd[CMD_ARMS] = arm_hang_cmd()
     return cmd
 
 

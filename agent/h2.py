@@ -39,8 +39,26 @@ R_SX, L_SX = R_SR, L_SR
 HIP_YAW_LIM = 1.0
 SPAWN_Z = 1.02
 ARM_RAISE = -1.55
+# CAD q=0 on the arms is not a hang: the forearm body sits along +X, so zeros
+# reach ~90° forward and shove CoM past the toes. Hang = positive shoulder
+# pitch (arms back) + bent elbow so the hands sit beside the hips.
+ARM_HANG_SP = 0.30
+ARM_HANG_EL = 1.40
+ARM_HANG_SR = 0.18
 # Upright stand: CoM sits nearly over the foot boxes.
 STAND_COM_X = 0.018
+
+
+def arm_hang_cmd() -> np.ndarray:
+    """14-D arm command (actuator order L then R). Stand / idle default."""
+    q = np.zeros(14, dtype=np.float32)
+    q[0] = ARM_HANG_SP
+    q[1] = ARM_HANG_SR
+    q[3] = ARM_HANG_EL
+    q[7] = ARM_HANG_SP
+    q[8] = -ARM_HANG_SR
+    q[10] = ARM_HANG_EL
+    return q
 
 
 def _h2_leg_pose(*, hip: float, knee: float, ankle: float) -> np.ndarray:
@@ -51,12 +69,18 @@ def _h2_leg_pose(*, hip: float, knee: float, ankle: float) -> np.ndarray:
     return q
 
 
-STAND_Q = _h2_leg_pose(hip=-0.20, knee=0.40, ankle=-0.25)
+def _apply_arm_hang(q: np.ndarray) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float32)
+    q[15:29] = arm_hang_cmd()
+    return q
+
+
+STAND_Q = _apply_arm_hang(_h2_leg_pose(hip=-0.20, knee=0.40, ankle=-0.25))
 STAND_Q[WAIST_P] = 0.05
 # Slight hip abduction so the support polygon is not a knife-edge.
 STAND_Q[L_HR] = 0.12
 STAND_Q[R_HR] = -0.12
-SQUAT_Q = _h2_leg_pose(hip=-0.55, knee=1.00, ankle=-0.40)
+SQUAT_Q = _apply_arm_hang(_h2_leg_pose(hip=-0.55, knee=1.00, ankle=-0.40))
 SQUAT_Q[WAIST_P] = 0.12
 # Software Joint-PD gains (Nm/rad, Nm·s/rad). Motors stay torque in XML.
 KP, KD = kp_kd_vectors()

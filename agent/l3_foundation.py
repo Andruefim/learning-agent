@@ -33,22 +33,29 @@ OBS_DIM = 3 + 3 + N_ACT + N_ACT + N_ACT + L2_CMD_DIM  # 117
 ACT_DIM = N_ACT
 TILT_LIM = 0.65  # app / engine
 FALL_Z = 0.40
-# Stage A: terminate near upright (~26°), not after the robot is already falling.
-TRAIN_TILT = 0.90
+# Stage A: ~21°. Softer 0.90 let the policy farm a 27° kneel/plank.
+TRAIN_TILT = 0.93
 TRAIN_FALL_Z = 0.40
+# Body-frame z floors. Deep squat at h=0.65 still has knee≈0.21; kneeling is ~0.08.
+CONTACT_Z_KNEE = 0.14
+CONTACT_Z_HAND = 0.12
+CONTACT_Z_ELBOW = 0.15
 TERMINAL_PENALTY = 50.0
 REWARD_CLIP = 12.0
 EPISODE_SEC = (15.0, 20.0)
 HEIGHT_RANGE = (0.65, 1.02)
-REACH_FRAC = 0.40
+REACH_FRAC = 0.10
 PUSH_EVERY_SEC = (2.0, 3.0)
 PUSH_DUR_SEC = 0.20
-# Training pushes: light enough to survive TRAIN_TILT=0.90. Eval still uses 50 N.
+# Training pushes: light enough to survive TRAIN_TILT. Eval still uses 50 N.
 PUSH_FORCE = (12.0, 22.0)
 ALIVE_BONUS = 1.0
 ANG_VEL_COEF = 0.50
 ANG_VEL_CLIP = 4.0
 LIN_VEL_COEF = 0.50
+RATE_COEF = 0.04
+QVEL_COEF = 0.002
+QVEL_CLIP = 2.0
 # Scale of the hardcoded IPM prior. 1.0 was a limit-cycle; policy must learn the rest.
 BALANCE_PRIOR_SCALE = 0.25
 STAND_ONLY = True
@@ -197,6 +204,7 @@ def shaped_reward(
     v_xy: np.ndarray,
     foot_pitch_sq: float,
     arm_mse: float,
+    qvel: np.ndarray | None = None,
 ) -> float:
     """Dense stand-first reward. Terminal fall penalty is applied by the env."""
     r_alive = float(ALIVE_BONUS)
@@ -204,7 +212,7 @@ def shaped_reward(
     r_up = float(np.exp(-5.0 * (1.0 - float(tilt) * float(tilt))))
     dv = np.asarray(v_b[:2], dtype=np.float64) - np.asarray(v_cmd, dtype=np.float64)
     r_vel = float(np.exp(-2.0 * float(np.sum(dv ** 2))))
-    r_rate = float(np.clip(-0.01 * float(np.sum(np.asarray(da, dtype=np.float64) ** 2)), -1.0, 0.0))
+    r_rate = float(np.clip(-RATE_COEF * float(np.sum(np.asarray(da, dtype=np.float64) ** 2)), -1.0, 0.0))
     r_acc = float(np.clip(-0.005 * float(np.sum(np.asarray(dda, dtype=np.float64) ** 2)), -1.0, 0.0))
     gx, gy = float(gyro[0]), float(gyro[1])
     r_ang = float(np.clip(-ANG_VEL_COEF * (gx * gx + gy * gy), -ANG_VEL_CLIP, 0.0))
@@ -213,7 +221,10 @@ def shaped_reward(
         r_lin = float(np.clip(-LIN_VEL_COEF * float(np.sum(np.asarray(v_xy, dtype=np.float64) ** 2)), -2.0, 0.0))
     r_foot = float(np.clip(-0.1 * float(foot_pitch_sq), -1.0, 0.0))
     r_arm = 0.4 * float(np.exp(-4.0 * float(arm_mse)))
-    return float(r_alive + r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm)
+    r_qvel = 0.0
+    if qvel is not None:
+        r_qvel = float(np.clip(-QVEL_COEF * float(np.sum(np.asarray(qvel, dtype=np.float64) ** 2)), -QVEL_CLIP, 0.0))
+    return float(r_alive + r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm + r_qvel)
 
 
 def foot_pitch_from_xmat(xmat) -> float:
