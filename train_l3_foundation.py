@@ -49,7 +49,9 @@ from agent.l3_foundation import (
     ACT_DIM,
     BALANCE_PRIOR_SCALE,
     OBS_DIM,
+    PUSH_FORCE,
     REACH_FRAC,
+    SQUAT_FRAC,
     STAND_ONLY,
     TRAIN_TILT,
     HumanoidFoundationPolicy,
@@ -648,7 +650,8 @@ def main() -> None:
         f"foundation PPO obs={OBS_DIM} act={ACT_DIM} torch={device} jax={kind} "
         f"iters={iters} envs={args.envs} curriculum_horizon={CURRICULUM_HORIZON} "
         f"stand_only={STAND_ONLY} train_tilt={TRAIN_TILT} prior_scale={BALANCE_PRIOR_SCALE} "
-        f"hang_arms=1 contact_term=1 reach_frac={REACH_FRAC} "
+        f"hang_arms=1 contact_term=1 reach_frac={REACH_FRAC} squat_frac={SQUAT_FRAC} "
+        f"push={PUSH_FORCE[0]:.0f}-{PUSH_FORCE[1]:.0f}N "
         f"ppo_epochs={PPO_EPOCHS} jax_mb={JAX_MINIBATCH}"
         + (f" resume={resume_path}" if resume_path else ""),
         flush=True,

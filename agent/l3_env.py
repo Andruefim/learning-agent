@@ -35,11 +35,16 @@ from agent.l3_cmd import (
     CMD_WZ,
     L2_CMD_DIM,
     arm_targets,
+    sample_reach_intent,
     stand_command,
 )
-from agent.plan import TeacherIntent
 from agent.l3_foundation import (
     ACT_DIM,
+    ARM_LEFT_FRAC,
+    ARM_RIGHT_FRAC,
+    CONTACT_Z_ELBOW,
+    CONTACT_Z_HAND,
+    CONTACT_Z_KNEE,
     DECIMATION,
     EPISODE_SEC,
     HEIGHT_RANGE,
@@ -47,11 +52,10 @@ from agent.l3_foundation import (
     PUSH_DUR_SEC,
     PUSH_EVERY_SEC,
     PUSH_FORCE,
-    CONTACT_Z_ELBOW,
-    CONTACT_Z_HAND,
-    CONTACT_Z_KNEE,
     REACH_FRAC,
     REWARD_CLIP,
+    SQUAT_FRAC,
+    SQUAT_TICKS,
     STAND_ONLY,
     TERMINAL_PENALTY,
     TRAIN_FALL_Z,
@@ -65,6 +69,7 @@ from agent.l3_foundation import (
     height_01,
     q_from_action,
     shaped_reward,
+    squat_cmd_height,
 )
 
 STAGE_STAND = 0
@@ -86,27 +91,37 @@ def load_train_model(xml: Path | None = None) -> mujoco.MjModel:
     return model
 
 
-def _sample_command(rng: np.random.Generator, stage: int) -> np.ndarray:
-    cmd = stand_command()
-    cmd[CMD_H] = float(rng.uniform(*HEIGHT_RANGE))
-    if rng.random() < REACH_FRAC:
-        pitch = float(rng.uniform(0.33, 1.0))
-        asym = bool(rng.random() < 0.45)
-        t = TeacherIntent(
-            r_arm=pitch,
-            l_arm=float(rng.uniform(0.20, pitch)) if asym else pitch,
-            r_out=float(rng.uniform(-0.2, 0.6)),
-            l_out=float(rng.uniform(-0.2, 0.6)),
-        )
-        cmd[CMD_ARMS] = arm_targets(t)
-    elif rng.random() < 0.12:
-        cmd[CMD_ARMS] = (arm_hang_cmd() + rng.uniform(-0.15, 0.15, size=14).astype(np.float32))
+def _apply_locomotion(cmd: np.ndarray, rng: np.random.Generator, stage: int) -> np.ndarray:
     if (not STAND_ONLY) and stage >= STAGE_VX:
         cmd[CMD_VX] = float(rng.uniform(-0.15, 0.70))
     if (not STAND_ONLY) and stage >= STAGE_FULL:
         cmd[CMD_VY] = float(rng.uniform(-0.15, 0.15))
         cmd[CMD_WZ] = float(rng.uniform(-0.40, 0.40))
-    return cmd.astype(np.float32)
+    return cmd
+
+
+def _sample_command(rng: np.random.Generator, stage: int) -> tuple[np.ndarray, bool, int]:
+    """Mutually exclusive squat traj / reach / mild / hang. Returns cmd, squat_on, cmd_left."""
+    cmd = stand_command()
+    u = float(rng.random())
+    squat_on = False
+    if u < SQUAT_FRAC:
+        squat_on = True
+        cmd[CMD_H] = squat_cmd_height(0.0)
+        cmd_left = int(SQUAT_TICKS)
+    elif u < SQUAT_FRAC + REACH_FRAC:
+        cmd[CMD_H] = float(rng.uniform(*HEIGHT_RANGE))
+        cmd[CMD_ARMS] = arm_targets(sample_reach_intent(rng, left_frac=ARM_LEFT_FRAC, right_frac=ARM_RIGHT_FRAC))
+        cmd_left = int(rng.integers(100, 201))
+    elif u < SQUAT_FRAC + REACH_FRAC + 0.12:
+        cmd[CMD_H] = float(rng.uniform(*HEIGHT_RANGE))
+        cmd[CMD_ARMS] = (arm_hang_cmd() + rng.uniform(-0.15, 0.15, size=14).astype(np.float32))
+        cmd_left = int(rng.integers(100, 201))
+    else:
+        cmd[CMD_H] = float(rng.uniform(*HEIGHT_RANGE))
+        cmd_left = int(rng.integers(100, 201))
+    cmd = _apply_locomotion(cmd, rng, stage)
+    return cmd.astype(np.float32), squat_on, cmd_left
 
 
 class FoundationEnv:
@@ -148,6 +163,8 @@ class FoundationEnv:
         self._pushes = True
         self._horizon = True
         self._off_prev = np.zeros(2, dtype=np.float32)
+        self._squat_on = False
+        self._squat_tick = 0
         self.reset()
 
     def _tilt(self) -> float:
@@ -237,9 +254,12 @@ class FoundationEnv:
         self._pushes = cmd is None
         self._horizon = cmd is None
         if cmd is None:
-            self.cmd = _sample_command(self._rng, self.stage)
+            self.cmd, self._squat_on, self._cmd_left = _sample_command(self._rng, self.stage)
+        else:
+            self._squat_on = False
+            self._cmd_left = int(self._rng.integers(100, 201))
+        self._squat_tick = 0
         pdt = self._policy_dt()
-        self._cmd_left = int(self._rng.integers(100, 201))
         sec = float(self._rng.uniform(*EPISODE_SEC))
         self._time_left = int(round(sec / pdt))
         self._push_left = 0
@@ -277,6 +297,10 @@ class FoundationEnv:
         self._push_wait = int(round(float(self._rng.uniform(*PUSH_EVERY_SEC)) / pdt))
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool]:
+        if self._squat_on and not self._cmd_frozen:
+            self.cmd = self.cmd.copy()
+            self.cmd[CMD_H] = squat_cmd_height(self._squat_tick * self._policy_dt())
+            self._squat_tick += 1
         a = np.clip(np.asarray(action, dtype=np.float32).reshape(ACT_DIM), -1.0, 1.0)
         base = q_from_action(self.cmd, a)
         da = a - self.last_a
@@ -301,8 +325,8 @@ class FoundationEnv:
         self.last_a = a
         self._cmd_left -= 1
         if self._cmd_left <= 0 and not self._cmd_frozen:
-            self.cmd = _sample_command(self._rng, self.stage)
-            self._cmd_left = int(self._rng.integers(100, 201))
+            self.cmd, self._squat_on, self._cmd_left = _sample_command(self._rng, self.stage)
+            self._squat_tick = 0
 
         v_b, _wz = self._body_vel()
         z = self._z()

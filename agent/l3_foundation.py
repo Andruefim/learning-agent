@@ -44,11 +44,22 @@ TERMINAL_PENALTY = 50.0
 REWARD_CLIP = 12.0
 EPISODE_SEC = (15.0, 20.0)
 HEIGHT_RANGE = (0.65, 1.02)
-REACH_FRAC = 0.10
+REACH_FRAC = 0.40
+# Of reach samples: left-only / right-only / both.
+ARM_LEFT_FRAC = 0.30
+ARM_RIGHT_FRAC = 0.30
+SQUAT_FRAC = 0.25
+SQUAT_H_STAND = 1.02
+SQUAT_H_LOW = 0.70
+SQUAT_DOWN_SEC = 1.5
+SQUAT_HOLD_SEC = 5.0
+SQUAT_UP_SEC = 1.5
+POLICY_DT = 0.005 * DECIMATION  # matches scene_train timestep
+SQUAT_TICKS = int(round((SQUAT_DOWN_SEC + SQUAT_HOLD_SEC + SQUAT_UP_SEC) / POLICY_DT))
 PUSH_EVERY_SEC = (2.0, 3.0)
 PUSH_DUR_SEC = 0.20
-# Training pushes: light enough to survive TRAIN_TILT. Eval still uses 50 N.
-PUSH_FORCE = (12.0, 22.0)
+# Toward the 50 N eval; still below the eval impulse so Stage A can survive.
+PUSH_FORCE = (30.0, 45.0)
 ALIVE_BONUS = 1.0
 ANG_VEL_COEF = 0.50
 ANG_VEL_CLIP = 4.0
@@ -126,6 +137,20 @@ def torso_imu(data, torso_id: int) -> tuple[np.ndarray, np.ndarray]:
     grav = rot.T @ np.array([0.0, 0.0, -1.0], dtype=np.float64)
     gyro = np.asarray(data.cvel[torso_id, :3], dtype=np.float64)
     return grav.astype(np.float32), gyro.astype(np.float32)
+
+
+def squat_cmd_height(t_sec: float) -> float:
+    """Stand → 0.70 m → stand. Matches eval_deep_squat / UI «присядь»."""
+    t = float(t_sec)
+    down, hold, up = float(SQUAT_DOWN_SEC), float(SQUAT_HOLD_SEC), float(SQUAT_UP_SEC)
+    h0, h1 = float(SQUAT_H_STAND), float(SQUAT_H_LOW)
+    if t < down:
+        return h0 + (h1 - h0) * (t / max(down, 1e-6))
+    if t < down + hold:
+        return h1
+    if t < down + hold + up:
+        return h1 + (h0 - h1) * ((t - down - hold) / max(up, 1e-6))
+    return h0
 
 
 def height_01(h_m: float) -> float:

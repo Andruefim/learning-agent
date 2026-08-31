@@ -6,7 +6,7 @@ import numpy as np
 
 from agent.l3_cmd import CMD_H, CMD_VX, CMD_WZ, reach_command, stand_command
 from agent.l3_env import STAGE_STAND, FoundationEnv, _policy_act, load_train_model
-from agent.l3_foundation import DECIMATION
+from agent.l3_foundation import DECIMATION, squat_cmd_height
 
 
 def _omega_norm(env: FoundationEnv) -> float:
@@ -75,15 +75,7 @@ def eval_deep_squat(policy, *, device, model) -> dict:
 
     def cmd_at(t: float):
         cmd = stand_command()
-        if t < down:
-            h = 1.02 + (0.70 - 1.02) * (t / down)
-        elif t < down + hold:
-            h = 0.70
-        elif t < down + hold + up:
-            h = 0.70 + (1.02 - 0.70) * ((t - down - hold) / up)
-        else:
-            h = 1.02
-        cmd[CMD_H] = float(h)
+        cmd[CMD_H] = squat_cmd_height(t)
         return cmd
 
     raw = _rollout(policy, env, obs, ticks=ticks, device=device, cmd_fn=cmd_at)

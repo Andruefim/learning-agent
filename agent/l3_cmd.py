@@ -15,6 +15,29 @@ CMD_VX, CMD_VY, CMD_WZ, CMD_H = 0, 1, 2, 3
 CMD_ARMS = slice(4, 18)
 
 
+def sample_reach_intent(
+    rng: np.random.Generator,
+    *,
+    left_frac: float = 0.30,
+    right_frac: float = 0.30,
+) -> TeacherIntent:
+    """Left / right / both. Hanging arm stays at hang (l_arm/r_arm=0)."""
+    pitch = float(rng.uniform(0.33, 1.0))
+    u = float(rng.random())
+    if u < left_frac:
+        l_arm, r_arm = pitch, 0.0
+    elif u < left_frac + right_frac:
+        l_arm, r_arm = 0.0, pitch
+    else:
+        l_arm, r_arm = pitch, pitch
+    return TeacherIntent(
+        l_arm=l_arm,
+        r_arm=r_arm,
+        l_out=float(rng.uniform(-0.2, 0.6)) if l_arm > 0.0 else 0.0,
+        r_out=float(rng.uniform(-0.2, 0.6)) if r_arm > 0.0 else 0.0,
+    )
+
+
 def arm_targets(t: TeacherIntent) -> np.ndarray:
     """Lerp hang → reach. l_arm/r_arm=0 keeps hands at the sides, not CAD-forward."""
     q = arm_hang_cmd()
