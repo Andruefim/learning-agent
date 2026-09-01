@@ -27,12 +27,16 @@ def _nonfoot_ground(env: FoundationEnv) -> bool:
     return False
 
 
+def _pelvis_x(env: FoundationEnv) -> float:
+    return float(env.data.xpos[env.pelvis_id, 0])
+
+
 def _rollout(policy, env: FoundationEnv, obs, *, ticks: int, device, cmd_fn=None):
     z_hist, tilt_hist, pitch_hist = [], [], []
     nonfoot = False
     done = False
     pdt = env.dt * DECIMATION
-    x0 = float(env._pelvis()[0])
+    x0 = _pelvis_x(env)
     for t in range(max(1, ticks)):
         if cmd_fn is not None:
             env.cmd = cmd_fn(t * pdt)
@@ -55,7 +59,7 @@ def _rollout(policy, env: FoundationEnv, obs, *, ticks: int, device, cmd_fn=None
         "pitch": pitch_hist,
         "nonfoot": bool(nonfoot),
         "omega": _omega_norm(env),
-        "x_delta": float(env._pelvis()[0]) - x0,
+        "x_delta": _pelvis_x(env) - x0,
     }
 
 
@@ -201,6 +205,18 @@ def eval_static_60s(policy, *, device, model, seconds: float = 60.0) -> dict:
 
 def eval_suite(policy, *, device=None, static_sec: float = 60.0) -> dict:
     model = load_train_model()
+    if WALK_ONLY:
+        loco = eval_locomotion(policy, device=device, model=model)
+        static = eval_static_60s(policy, device=device, model=model, seconds=min(4.0, static_sec))
+        return {
+            "ok": False,
+            "seconds": loco["seconds"],
+            "z_min": loco["z_min"],
+            "tilt_min": loco["tilt_min"],
+            "ticks": loco.get("ticks", 0),
+            "need": loco.get("need", 0),
+            "cases": {"locomotion": loco, "static_60s": static},
+        }
     reach = eval_reach(policy, device=device, model=model)
     squat = eval_deep_squat(policy, device=device, model=model)
     push = eval_push_recovery(policy, device=device, model=model)

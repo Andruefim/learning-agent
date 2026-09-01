@@ -244,7 +244,12 @@ def save_if_stand(policy: HumanoidFoundationPolicy, path: Path, device: torch.de
         )
     if not report["ok"]:
         missing = [n for n in gate if not cases.get(n, {}).get("ok")]
-        print(f"production gate blocked save ({', '.join(missing) or 'unknown'})", flush=True)
+        if missing:
+            print(f"production gate blocked save ({', '.join(missing)})", flush=True)
+        elif WALK_ONLY:
+            print("walk eval only; production l3_foundation.pt not overwritten", flush=True)
+        else:
+            print("production gate blocked save (unknown)", flush=True)
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(policy.state_dict(), path)
