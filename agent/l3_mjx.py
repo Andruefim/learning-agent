@@ -35,6 +35,7 @@ from agent.l3_env import STAGE_FULL, STAGE_STAND, STAGE_VX, load_train_model
 from agent.l3_foundation import (
     ACT_DIM,
     ACTION_SCALE,
+    AIR_COEF,
     ALIVE_BONUS,
     ANG_VEL_CLIP,
     ANG_VEL_COEF,
@@ -70,6 +71,9 @@ from agent.l3_foundation import (
     TERMINAL_PENALTY,
     TRAIN_FALL_Z,
     TRAIN_TILT,
+    VX_RANGE,
+    VX_ZERO_FRAC,
+    WALK_ONLY,
 )
 
 
@@ -218,8 +222,15 @@ class MjxFoundationEnv:
 
     def _sample_cmd(self, rng):
         jax, jp = self.jax, self.jp
-        rng, k_u, k_h, k_p, k_kind, k6, k7, k8, k_left = jax.random.split(rng, 9)
         hang = self.hang_arms
+        if WALK_ONLY:
+            rng, k_vx, k_z, k_left = jax.random.split(rng, 4)
+            cmd = jp.zeros((L2_CMD_DIM,), dtype=jp.float32).at[CMD_H].set(jp.float32(1.02)).at[4:18].set(hang)
+            vx = jax.random.uniform(k_vx, (), minval=VX_RANGE[0], maxval=VX_RANGE[1])
+            cmd = cmd.at[CMD_VX].set(jp.where(jax.random.uniform(k_z, ()) < VX_ZERO_FRAC, jp.float32(0.0), vx))
+            cmd_left = jax.random.randint(k_left, (), 150, 301)
+            return rng, cmd, jp.bool_(False), cmd_left
+        rng, k_u, k_h, k_p, k_kind, k6, k7, k8, k_left = jax.random.split(rng, 9)
         u = jax.random.uniform(k_u, ())
         squat_on = u < SQUAT_FRAC
         reach_on = (u >= SQUAT_FRAC) & (u < SQUAT_FRAC + REACH_FRAC)
@@ -374,15 +385,17 @@ class MjxFoundationEnv:
         gyro = dx.cvel[self.spec.torso_id, :3]
         v_xy = dx.qvel[0:2]
         v_cmd = jp.array([cmd[CMD_VX], cmd[CMD_VY]])
+        vnorm = jp.linalg.norm(v_cmd)
         r_alive = jp.float32(ALIVE_BONUS)
         r_h = jp.exp(-10.0 * jp.abs(z - cmd[CMD_H]))
         r_up = jp.exp(-5.0 * (1.0 - tilt * tilt))
-        r_vel = jp.exp(-2.0 * jp.sum((v_b[:2] - v_cmd) ** 2))
+        vel_k = jp.where(vnorm >= 0.08, jp.float32(8.0), jp.float32(2.0))
+        r_vel = jp.exp(-vel_k * jp.sum((v_b[:2] - v_cmd) ** 2))
         r_rate = jp.clip(-jp.float32(RATE_COEF) * jp.sum((a - last_a) ** 2), -1.0, 0.0)
         r_acc = jp.clip(-0.005 * jp.sum((a - 2.0 * last_a + prev_a) ** 2), -1.0, 0.0)
         r_ang = jp.clip(-jp.float32(ANG_VEL_COEF) * (gyro[0] ** 2 + gyro[1] ** 2), -jp.float32(ANG_VEL_CLIP), 0.0)
         r_lin = jp.where(
-            jp.linalg.norm(v_cmd) < 0.05,
+            vnorm < 0.05,
             jp.clip(-jp.float32(LIN_VEL_COEF) * jp.sum(v_xy ** 2), -2.0, 0.0),
             0.0,
         )
@@ -391,8 +404,20 @@ class MjxFoundationEnv:
             return jp.arctan2(-R[2, 0], R[2, 2])
         r_foot = jp.clip(-0.1 * (_fp(self.spec.r_foot_id) ** 2 + _fp(self.spec.l_foot_id) ** 2), -1.0, 0.0)
         r_arm = 0.4 * jp.exp(-4.0 * jp.mean((q[15:29] - cmd[CMD_ARMS]) ** 2))
-        r_qvel = jp.clip(-jp.float32(QVEL_COEF) * jp.sum(dx.qvel[self.vadr] ** 2), -jp.float32(QVEL_CLIP), 0.0)
-        reward = r_alive + r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm + r_qvel
+        r_qvel = jp.where(
+            vnorm < 0.08,
+            jp.clip(-jp.float32(QVEL_COEF) * jp.sum(dx.qvel[self.vadr] ** 2), -jp.float32(QVEL_CLIP), 0.0),
+            0.0,
+        )
+        air_l = dx.geom_xpos[self.spec.l_fg, 2] > 0.035
+        air_r = dx.geom_xpos[self.spec.r_fg, 2] > 0.035
+        n_air = air_l.astype(jp.float32) + air_r.astype(jp.float32)
+        r_air = jp.where(
+            vnorm >= 0.08,
+            jp.where(n_air == 1.0, jp.float32(AIR_COEF), jp.where(n_air == 2.0, -jp.float32(AIR_COEF), 0.0)),
+            0.0,
+        )
+        reward = r_alive + r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm + r_qvel + r_air
         knee_z = jp.minimum(dx.xpos[self.spec.l_knee_id, 2], dx.xpos[self.spec.r_knee_id, 2])
         hand_z = jp.minimum(dx.xpos[self.spec.l_wrist_id, 2], dx.xpos[self.spec.r_wrist_id, 2])
         elbow_z = jp.minimum(dx.xpos[self.spec.l_elbow_id, 2], dx.xpos[self.spec.r_elbow_id, 2])

@@ -5,9 +5,8 @@ Writes flywheel_data/l3_foundation.pt only if eval_reach, eval_deep_squat, and
 eval_push_recovery all pass (honest 15s reach / deep squat / push recovery).
 
 JAX and Torch PPO both use multi-epoch minibatch updates + entropy bonus.
-Stage A (STAND_ONLY): curriculum stays at stand — no vx/yaw until the policy
-can hold tilt without rocking. Curriculum stages follow absolute global_iter
-when STAND_ONLY is flipped off.
+Stage A (STAND_ONLY): stand only. Stage W (WALK_ONLY): vx crawl, no yaw.
+WALK_ONLY ignores global_iter so a stand checkpoint does not jump to FULL.
 
 Run:  python train_l3_foundation.py
       python train_l3_foundation.py --iters 200 --envs 2048
@@ -54,6 +53,8 @@ from agent.l3_foundation import (
     SQUAT_FRAC,
     STAND_ONLY,
     TRAIN_TILT,
+    VX_RANGE,
+    WALK_ONLY,
     HumanoidFoundationPolicy,
     jax_params_to_state_dict,
     state_dict_to_jax,
@@ -103,6 +104,9 @@ JAX_DEFAULT_ENVS = 2048
 def curriculum_stage(global_it: int, horizon: int = CURRICULUM_HORIZON) -> int:
     if STAND_ONLY:
         return STAGE_STAND
+    if WALK_ONLY:
+        # Ignore global_iter so a stand checkpoint at 535 does not jump to FULL.
+        return STAGE_VX
     if global_it < max(1, horizon // 5):
         return STAGE_STAND
     if global_it < max(2, (2 * horizon) // 5):
@@ -234,7 +238,8 @@ def save_if_stand(policy: HumanoidFoundationPolicy, path: Path, device: torch.de
             continue
         print(
             f"metrics {name} z_min={c['z_min']:.3f} z_last={c.get('z_last', c['z_min']):.3f} "
-            f"tilt_min={c['tilt_min']:.3f} fell={int(bool(c.get('fell')))} ok={int(bool(c['ok']))}",
+            f"tilt_min={c['tilt_min']:.3f} fell={int(bool(c.get('fell')))} ok={int(bool(c['ok']))}"
+            + (f" x_delta={c['x_delta']:.2f}" if "x_delta" in c else ""),
             flush=True,
         )
     if not report["ok"]:
@@ -649,7 +654,8 @@ def main() -> None:
     print(
         f"foundation PPO obs={OBS_DIM} act={ACT_DIM} torch={device} jax={kind} "
         f"iters={iters} envs={args.envs} curriculum_horizon={CURRICULUM_HORIZON} "
-        f"stand_only={STAND_ONLY} train_tilt={TRAIN_TILT} prior_scale={BALANCE_PRIOR_SCALE} "
+        f"stand_only={STAND_ONLY} walk_only={WALK_ONLY} vx={VX_RANGE[0]:.2f}-{VX_RANGE[1]:.2f} "
+        f"train_tilt={TRAIN_TILT} prior_scale={BALANCE_PRIOR_SCALE} "
         f"hang_arms=1 contact_term=1 reach_frac={REACH_FRAC} squat_frac={SQUAT_FRAC} "
         f"push={PUSH_FORCE[0]:.0f}-{PUSH_FORCE[1]:.0f}N "
         f"ppo_epochs={PPO_EPOCHS} jax_mb={JAX_MINIBATCH}"

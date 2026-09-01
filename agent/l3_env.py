@@ -60,6 +60,9 @@ from agent.l3_foundation import (
     TERMINAL_PENALTY,
     TRAIN_FALL_Z,
     TRAIN_TILT,
+    VX_RANGE,
+    VX_ZERO_FRAC,
+    WALK_ONLY,
     balance_delta,
     body_xy,
     build_obs,
@@ -92,9 +95,14 @@ def load_train_model(xml: Path | None = None) -> mujoco.MjModel:
 
 
 def _apply_locomotion(cmd: np.ndarray, rng: np.random.Generator, stage: int) -> np.ndarray:
-    if (not STAND_ONLY) and stage >= STAGE_VX:
-        cmd[CMD_VX] = float(rng.uniform(-0.15, 0.70))
-    if (not STAND_ONLY) and stage >= STAGE_FULL:
+    if STAND_ONLY:
+        return cmd
+    if WALK_ONLY or stage >= STAGE_VX:
+        if WALK_ONLY:
+            cmd[CMD_VX] = 0.0 if rng.random() < VX_ZERO_FRAC else float(rng.uniform(*VX_RANGE))
+        else:
+            cmd[CMD_VX] = float(rng.uniform(-0.15, 0.70))
+    if (not WALK_ONLY) and stage >= STAGE_FULL:
         cmd[CMD_VY] = float(rng.uniform(-0.15, 0.15))
         cmd[CMD_WZ] = float(rng.uniform(-0.40, 0.40))
     return cmd
@@ -102,6 +110,9 @@ def _apply_locomotion(cmd: np.ndarray, rng: np.random.Generator, stage: int) -> 
 
 def _sample_command(rng: np.random.Generator, stage: int) -> tuple[np.ndarray, bool, int]:
     """Mutually exclusive squat traj / reach / mild / hang. Returns cmd, squat_on, cmd_left."""
+    if WALK_ONLY:
+        cmd = _apply_locomotion(stand_command(), rng, stage)
+        return cmd.astype(np.float32), False, int(rng.integers(150, 301))
     cmd = stand_command()
     u = float(rng.random())
     squat_on = False
@@ -350,6 +361,8 @@ class FoundationEnv:
             foot_pitch_sq=p_r * p_r + p_l * p_l,
             arm_mse=float(np.mean((q[15:29] - self.cmd[CMD_ARMS]) ** 2)),
             qvel=self._qd(),
+            air_l=self._foot_air(self.l_geoms),
+            air_r=self._foot_air(self.r_geoms),
         )
         fall = self._terminated()
         timeout = False

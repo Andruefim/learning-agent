@@ -6,7 +6,7 @@ import numpy as np
 
 from agent.l3_cmd import CMD_H, CMD_VX, CMD_WZ, reach_command, stand_command
 from agent.l3_env import STAGE_STAND, FoundationEnv, _policy_act, load_train_model
-from agent.l3_foundation import DECIMATION, squat_cmd_height
+from agent.l3_foundation import DECIMATION, WALK_ONLY, squat_cmd_height
 
 
 def _omega_norm(env: FoundationEnv) -> float:
@@ -32,6 +32,7 @@ def _rollout(policy, env: FoundationEnv, obs, *, ticks: int, device, cmd_fn=None
     nonfoot = False
     done = False
     pdt = env.dt * DECIMATION
+    x0 = float(env._pelvis()[0])
     for t in range(max(1, ticks)):
         if cmd_fn is not None:
             env.cmd = cmd_fn(t * pdt)
@@ -54,6 +55,7 @@ def _rollout(policy, env: FoundationEnv, obs, *, ticks: int, device, cmd_fn=None
         "pitch": pitch_hist,
         "nonfoot": bool(nonfoot),
         "omega": _omega_norm(env),
+        "x_delta": float(env._pelvis()[0]) - x0,
     }
 
 
@@ -128,12 +130,16 @@ def eval_push_recovery(policy, *, device, model) -> dict:
 
 
 def eval_locomotion(policy, *, device, model, seconds: float = 10.0) -> dict:
-    cases = (("fwd", {CMD_VX: 0.5}), ("back", {CMD_VX: -0.3}), ("yaw", {CMD_WZ: 0.5}))
+    if WALK_ONLY:
+        cases = (("fwd", {CMD_VX: 0.5}),)
+    else:
+        cases = (("fwd", {CMD_VX: 0.5}), ("back", {CMD_VX: -0.3}), ("yaw", {CMD_WZ: 0.5}))
     reports = []
     all_ok = True
     z_min = 10.0
     tilt_min = 10.0
     fell = False
+    x_delta = 0.0
     for name, fields in cases:
         env = FoundationEnv(model, stage=STAGE_STAND)
         cmd = stand_command()
@@ -142,19 +148,36 @@ def eval_locomotion(policy, *, device, model, seconds: float = 10.0) -> dict:
         obs = env.reset(cmd)
         ticks = int(round(seconds / env._policy_dt()))
         raw = _rollout(policy, env, obs, ticks=ticks, device=device)
-        ok = (not raw["fell"]) and raw["full"] and (not raw["nonfoot"])
-        reports.append({"name": name, "ok": ok, "fell": raw["fell"], "nonfoot": raw["nonfoot"], "z_min": raw["z_min"]})
+        progressed = True
+        if name == "fwd":
+            progressed = float(raw.get("x_delta", 0.0)) > 0.4
+        elif name == "back":
+            progressed = float(raw.get("x_delta", 0.0)) < -0.2
+        ok = (not raw["fell"]) and raw["full"] and (not raw["nonfoot"]) and progressed
+        reports.append(
+            {
+                "name": name,
+                "ok": ok,
+                "fell": raw["fell"],
+                "nonfoot": raw["nonfoot"],
+                "z_min": raw["z_min"],
+                "x_delta": raw.get("x_delta", 0.0),
+            }
+        )
         all_ok = all_ok and ok
         z_min = min(z_min, raw["z_min"])
         tilt_min = min(tilt_min, raw["tilt_min"])
         fell = fell or raw["fell"]
+        x_delta = float(raw.get("x_delta", 0.0))
     return {
         "ok": bool(all_ok),
         "name": "locomotion",
         "z_min": float(z_min),
+        "z_last": float(z_min),
         "tilt_min": float(tilt_min),
         "fell": bool(fell),
         "seconds": float(seconds),
+        "x_delta": float(x_delta),
         "trials": reports,
     }
 
