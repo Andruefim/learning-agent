@@ -135,7 +135,7 @@ def eval_push_recovery(policy, *, device, model) -> dict:
 
 def eval_locomotion(policy, *, device, model, seconds: float = 10.0) -> dict:
     if WALK_ONLY:
-        cases = (("fwd", {CMD_VX: 0.5}),)
+        cases = (("fwd", {CMD_VX: 0.30}),)
     else:
         cases = (("fwd", {CMD_VX: 0.5}), ("back", {CMD_VX: -0.3}), ("yaw", {CMD_WZ: 0.5}))
     reports = []
@@ -144,6 +144,7 @@ def eval_locomotion(policy, *, device, model, seconds: float = 10.0) -> dict:
     tilt_min = 10.0
     fell = False
     x_delta = 0.0
+    z_last = 0.0
     for name, fields in cases:
         env = FoundationEnv(model, stage=STAGE_STAND)
         cmd = stand_command()
@@ -173,11 +174,12 @@ def eval_locomotion(policy, *, device, model, seconds: float = 10.0) -> dict:
         tilt_min = min(tilt_min, raw["tilt_min"])
         fell = fell or raw["fell"]
         x_delta = float(raw.get("x_delta", 0.0))
+        z_last = float(raw.get("z_last", raw["z_min"]))
     return {
         "ok": bool(all_ok),
         "name": "locomotion",
         "z_min": float(z_min),
-        "z_last": float(z_min),
+        "z_last": float(z_last),
         "tilt_min": float(tilt_min),
         "fell": bool(fell),
         "seconds": float(seconds),

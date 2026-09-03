@@ -68,6 +68,7 @@ from agent.l3_foundation import (
     SQUAT_TICKS,
     SQUAT_UP_SEC,
     STAND_ONLY,
+    SLIP_COEF,
     TERMINAL_PENALTY,
     TRAIN_FALL_Z,
     TRAIN_TILT,
@@ -314,6 +315,7 @@ class MjxFoundationEnv:
         hy_lim = jp.clip(0.20 + 1.5 * jp.abs(err_x), 0.20, 0.50)
         sag_ak = jp.clip(2.4 * err_x - 5.0 * d_x, -ak_lim, ak_lim) * scale
         sag_hy = jp.clip(4.0 * err_x - 8.0 * d_x, -hy_lim, hy_lim) * scale
+        sag_hy = jp.where(jp.abs(vx) > 0.08, jp.float32(0.0), sag_hy)
         pd_hx = jp.clip(1.2 * err_y - 6.0 * d_y, -0.25, 0.25)
         dlt = jp.zeros((ACT_DIM,), dtype=jp.float32)
         dlt = dlt.at[R_AP].set(sag_ak).at[L_AP].set(sag_ak)
@@ -417,7 +419,16 @@ class MjxFoundationEnv:
             jp.where(n_air == 1.0, jp.float32(AIR_COEF), jp.where(n_air == 2.0, -jp.float32(AIR_COEF), 0.0)),
             0.0,
         )
-        reward = r_alive + r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm + r_qvel + r_air
+        v_foot_l = self._xmat3(dx, self.spec.l_foot_id) @ dx.cvel[self.spec.l_foot_id, 3:6]
+        v_foot_r = self._xmat3(dx, self.spec.r_foot_id) @ dx.cvel[self.spec.r_foot_id, 3:6]
+        slip_l = jp.sum(v_foot_l[:2] ** 2) * (1.0 - air_l.astype(jp.float32))
+        slip_r = jp.sum(v_foot_r[:2] ** 2) * (1.0 - air_r.astype(jp.float32))
+        r_slip = jp.where(
+            vnorm >= 0.08,
+            jp.clip(-jp.float32(SLIP_COEF) * (slip_l + slip_r), -2.0, 0.0),
+            0.0,
+        )
+        reward = r_alive + r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm + r_qvel + r_air + r_slip
         knee_z = jp.minimum(dx.xpos[self.spec.l_knee_id, 2], dx.xpos[self.spec.r_knee_id, 2])
         hand_z = jp.minimum(dx.xpos[self.spec.l_wrist_id, 2], dx.xpos[self.spec.r_wrist_id, 2])
         elbow_z = jp.minimum(dx.xpos[self.spec.l_elbow_id, 2], dx.xpos[self.spec.r_elbow_id, 2])

@@ -68,6 +68,7 @@ from agent.l3_foundation import (
     build_obs,
     com_err_xy,
     foot_pitch_from_xmat,
+    foot_world_xy_speed_sq,
     heading_z,
     height_01,
     q_from_action,
@@ -348,6 +349,10 @@ class FoundationEnv:
         p_r = foot_pitch_from_xmat(self.data.xmat[self.r_foot_id])
         p_l = foot_pitch_from_xmat(self.data.xmat[self.l_foot_id])
         q = self._hinges()
+        air_l = self._foot_air(self.l_geoms)
+        air_r = self._foot_air(self.r_geoms)
+        slip_l = 0.0 if air_l else foot_world_xy_speed_sq(self.data.xmat[self.l_foot_id], self.data.cvel[self.l_foot_id])
+        slip_r = 0.0 if air_r else foot_world_xy_speed_sq(self.data.xmat[self.r_foot_id], self.data.cvel[self.r_foot_id])
         reward = shaped_reward(
             z=z,
             h_cmd=float(self.cmd[CMD_H]),
@@ -361,8 +366,9 @@ class FoundationEnv:
             foot_pitch_sq=p_r * p_r + p_l * p_l,
             arm_mse=float(np.mean((q[15:29] - self.cmd[CMD_ARMS]) ** 2)),
             qvel=self._qd(),
-            air_l=self._foot_air(self.l_geoms),
-            air_r=self._foot_air(self.r_geoms),
+            air_l=air_l,
+            air_r=air_r,
+            slip_foot=slip_l + slip_r,
         )
         fall = self._terminated()
         timeout = False

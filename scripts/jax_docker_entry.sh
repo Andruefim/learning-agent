@@ -118,7 +118,6 @@ except Exception:
 try:
     import jax
     print("jax", jax.__version__, jax.__file__, flush=True)
-    print("jax.devices", jax.devices(), flush=True)
 except Exception:
     traceback.print_exc()
 try:
@@ -137,6 +136,13 @@ try:
 except Exception:
     traceback.print_exc()
 PY
+
+# jax.devices() can SIGSEGV on ROCm/WSL (plugin init). Do not abort the entry.
+if python -c "import jax; print('jax.devices', jax.devices(), flush=True)"; then
+  :
+else
+  echo "jax.devices probe failed (non-fatal); GPU init continues in train" >&2
+fi
 
 if ! _mjx_ok; then
   echo "FATAL: jax + mujoco.mjx must import for GPU PPO" >&2

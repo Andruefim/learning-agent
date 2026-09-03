@@ -33,8 +33,8 @@ OBS_DIM = 3 + 3 + N_ACT + N_ACT + N_ACT + L2_CMD_DIM  # 117
 ACT_DIM = N_ACT
 TILT_LIM = 0.65  # app / engine
 FALL_Z = 0.40
-# Stage A: ~21°. Walk allows more torso pitch (~30°).
-TRAIN_TILT = 0.87
+# Stage A: ~21°. Walk allows more torso pitch (~34°).
+TRAIN_TILT = 0.83
 TRAIN_FALL_Z = 0.40
 # Body-frame z floors. Deep squat at h=0.65 still has knee≈0.21; kneeling is ~0.08.
 CONTACT_Z_KNEE = 0.14
@@ -67,14 +67,15 @@ LIN_VEL_COEF = 0.50
 RATE_COEF = 0.04
 QVEL_COEF = 0.002
 QVEL_CLIP = 2.0
-AIR_COEF = 0.25
+AIR_COEF = 0.80
+SLIP_COEF = 4.0
 # Scale of the hardcoded IPM prior. 1.0 was a limit-cycle; policy must learn the rest.
 BALANCE_PRIOR_SCALE = 0.25
 STAND_ONLY = False
 WALK_ONLY = True
 # Crawl first (~1.3 km/h). 4 km/h = 1.11 m/s is a later cap, not the start.
 VX_RANGE = (0.0, 0.35)
-VX_ZERO_FRAC = 0.15
+VX_ZERO_FRAC = 0.35
 HIDDEN = (256, 256, 128)
 
 
@@ -213,6 +214,8 @@ def balance_delta(err_xy: np.ndarray, d_xy: np.ndarray, *, height_01: float = 1.
     hy_lim = float(np.clip(0.20 + 1.5 * abs(err_x), 0.20, 0.50))
     sag_ak = float(np.clip(2.4 * err_x - 5.0 * d_x, -ak_lim, ak_lim)) * scale
     sag_hy = float(np.clip(4.0 * err_x - 8.0 * d_x, -hy_lim, hy_lim)) * scale
+    if abs(float(vx)) > 0.08:
+        sag_hy = 0.0
     pd_hx = float(np.clip(1.2 * err_y - 6.0 * d_y, -0.25, 0.25))
     dlt = np.zeros(N_ACT, dtype=np.float32)
     dlt[R_AP] = dlt[L_AP] = sag_ak
@@ -237,6 +240,7 @@ def shaped_reward(
     qvel: np.ndarray | None = None,
     air_l: bool = False,
     air_r: bool = False,
+    slip_foot: float = 0.0,
 ) -> float:
     """Dense stand-first reward. Terminal fall penalty is applied by the env."""
     r_alive = float(ALIVE_BONUS)
@@ -259,18 +263,27 @@ def shaped_reward(
     if qvel is not None and vnorm < 0.08:
         r_qvel = float(np.clip(-QVEL_COEF * float(np.sum(np.asarray(qvel, dtype=np.float64) ** 2)), -QVEL_CLIP, 0.0))
     r_air = 0.0
+    r_slip = 0.0
     if vnorm >= 0.08:
         n_air = int(bool(air_l)) + int(bool(air_r))
         if n_air == 1:
             r_air = float(AIR_COEF)
         elif n_air == 2:
             r_air = -float(AIR_COEF)
-    return float(r_alive + r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm + r_qvel + r_air)
+        r_slip = float(np.clip(-SLIP_COEF * float(slip_foot), -2.0, 0.0))
+    return float(r_alive + r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm + r_qvel + r_air + r_slip)
 
 
 def foot_pitch_from_xmat(xmat) -> float:
     R = np.asarray(xmat, dtype=np.float64).reshape(3, 3)
     return float(np.arctan2(-R[2, 0], R[2, 2]))
+
+
+def foot_world_xy_speed_sq(xmat, cvel) -> float:
+    """World-frame horizontal speed² of a body COM. cvel lin is body-frame."""
+    R = np.asarray(xmat, dtype=np.float64).reshape(3, 3)
+    v = R @ np.asarray(cvel, dtype=np.float64).reshape(-1)[3:6]
+    return float(v[0] * v[0] + v[1] * v[1])
 
 
 def build_obs(data, torso_id: int, q: np.ndarray, qd: np.ndarray, last_a: np.ndarray, cmd: np.ndarray) -> np.ndarray:
