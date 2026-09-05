@@ -16,9 +16,11 @@ from agent.h2 import (
     L_AP,
     L_HP,
     L_HR,
+    L_KN,
     R_AP,
     R_HP,
     R_HR,
+    R_KN,
     SPAWN_Z,
     STAND_COM_X,
     STAND_Q,
@@ -47,6 +49,8 @@ from agent.l3_foundation import (
     CONTACT_Z_KNEE,
     DECIMATION,
     EPISODE_SEC,
+    GAIT_HZ,
+    GAIT_VX_ON,
     HEIGHT_RANGE,
     HIDDEN,
     LIN_VEL_COEF,
@@ -72,6 +76,7 @@ from agent.l3_foundation import (
     TERMINAL_PENALTY,
     TRAIN_FALL_Z,
     TRAIN_TILT,
+    VEL_TILT,
     VX_RANGE,
     VX_ZERO_FRAC,
     WALK_ONLY,
@@ -287,19 +292,33 @@ class MjxFoundationEnv:
         h_up = h1 + (h0 - h1) * ((t - down - hold) / up)
         return jp.where(t < down, h_down, jp.where(t < down + hold, h_hold, jp.where(t < down + hold + up, h_up, h0)))
 
-    def _default_q(self, cmd):
+    def _default_q(self, cmd, phi):
         jp = self.jp
         h = jp.clip((cmd[CMD_H] - 0.62) / 0.40, 0.0, 1.0)
         q = (1.0 - h) * self.squat_q + h * self.stand_q
         q = q.at[self.upper].set(cmd[4:18])
+        vx = cmd[CMD_VX]
+        amp = jp.clip((jp.abs(vx) - jp.float32(GAIT_VX_ON)) / jp.float32(0.22), 0.0, 1.0)
+        amp = jp.where(jp.abs(vx) < jp.float32(GAIT_VX_ON), jp.float32(0.0), amp)
+        s = jp.sin(phi)
+        c = jp.cos(phi)
+        hip = jp.float32(0.18) * amp
+        knee = jp.float32(0.32) * amp
+        ankle = jp.float32(0.16) * amp
+        roll = jp.float32(0.045) * amp
+        swing_l = jp.maximum(s, 0.0)
+        swing_r = jp.maximum(-s, 0.0)
+        q = q.at[L_HP].add(-hip * s).at[R_HP].add(hip * s)
+        q = q.at[L_KN].add(knee * swing_l).at[R_KN].add(knee * swing_r)
+        q = q.at[L_AP].add(-ankle * swing_l).at[R_AP].add(-ankle * swing_r)
+        q = q.at[L_HR].add(roll * c).at[R_HR].add(-roll * c)
         return q
 
     def _balance(self, dx, cmd, off_prev):
         jp = self.jp
         com = dx.subtree_com[self.spec.pelvis_id, :2]
         feet = 0.5 * (dx.geom_xpos[self.spec.r_fg, :2] + dx.geom_xpos[self.spec.l_fg, :2])
-        vx = cmd[CMD_VX]
-        off = com - feet - jp.array([STAND_COM_X + 0.035 * vx, 0.0])
+        off = com - feet - jp.array([STAND_COM_X, 0.0])
         dlt_w = off - off_prev
         w, x, y, z = dx.qpos[3], dx.qpos[4], dx.qpos[5], dx.qpos[6]
         yaw = jp.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
@@ -310,12 +329,10 @@ class MjxFoundationEnv:
         d_y = -s * dlt_w[0] + c * dlt_w[1]
         h01 = jp.clip((cmd[CMD_H] - 0.62) / 0.40, 0.0, 1.0)
         scale = jp.clip(h01, 0.5, 1.0)
-        scale = jp.where(jp.abs(vx) > 0.08, scale * jp.clip(1.0 - (jp.abs(vx) - 0.08) / 0.42, 0.2, 1.0), scale)
         ak_lim = jp.clip(0.14 + 0.8 * jp.abs(err_x), 0.14, 0.28)
         hy_lim = jp.clip(0.20 + 1.5 * jp.abs(err_x), 0.20, 0.50)
         sag_ak = jp.clip(2.4 * err_x - 5.0 * d_x, -ak_lim, ak_lim) * scale
         sag_hy = jp.clip(4.0 * err_x - 8.0 * d_x, -hy_lim, hy_lim) * scale
-        sag_hy = jp.where(jp.abs(vx) > 0.08, jp.float32(0.0), sag_hy)
         pd_hx = jp.clip(1.2 * err_y - 6.0 * d_y, -0.25, 0.25)
         dlt = jp.zeros((ACT_DIM,), dtype=jp.float32)
         dlt = dlt.at[R_AP].set(sag_ak).at[L_AP].set(sag_ak)
@@ -358,13 +375,20 @@ class MjxFoundationEnv:
         push_left = jp.array(0, dtype=jp.int32)
         push_xy = jp.zeros((2,), dtype=jp.float32)
         squat_tick = jp.array(0, dtype=jp.int32)
-        return rng, dx, last_a, cmd, last_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, squat_on, squat_tick
+        gait_phi = jp.float32(0.0)
+        return rng, dx, last_a, cmd, last_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, squat_on, squat_tick, gait_phi
 
-    def _step_one(self, rng, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, squat_on, squat_tick, action):
+    def _step_one(self, rng, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, squat_on, squat_tick, gait_phi, action):
         jax, jp, mjx = self.jax, self.jp, self.mjx
         a = jp.clip(action, -1.0, 1.0)
         cmd = jp.where(squat_on, cmd.at[CMD_H].set(self._squat_h(squat_tick)), cmd)
-        base = self._default_q(cmd) + ACTION_SCALE * a
+        vx = cmd[CMD_VX]
+        gait_phi = jp.where(
+            jp.abs(vx) < jp.float32(GAIT_VX_ON),
+            jp.float32(0.0),
+            jp.mod(gait_phi + jp.float32(2.0 * np.pi * GAIT_HZ) * jp.float32(POLICY_DT), jp.float32(2.0 * np.pi)),
+        )
+        base = self._default_q(cmd, gait_phi) + ACTION_SCALE * a
         force = jp.where(push_left > 0, push_xy, jp.zeros((2,), dtype=jp.float32))
         tid = self.spec.torso_id
 
@@ -393,6 +417,11 @@ class MjxFoundationEnv:
         r_up = jp.exp(-5.0 * (1.0 - tilt * tilt))
         vel_k = jp.where(vnorm >= 0.08, jp.float32(8.0), jp.float32(2.0))
         r_vel = jp.exp(-vel_k * jp.sum((v_b[:2] - v_cmd) ** 2))
+        r_vel = r_vel * jp.where(
+            vnorm >= 0.08,
+            jp.clip((tilt - jp.float32(VEL_TILT)) / jp.float32(0.06), 0.0, 1.0),
+            1.0,
+        )
         r_rate = jp.clip(-jp.float32(RATE_COEF) * jp.sum((a - last_a) ** 2), -1.0, 0.0)
         r_acc = jp.clip(-0.005 * jp.sum((a - 2.0 * last_a + prev_a) ** 2), -1.0, 0.0)
         r_ang = jp.clip(-jp.float32(ANG_VEL_COEF) * (gyro[0] ** 2 + gyro[1] ** 2), -jp.float32(ANG_VEL_CLIP), 0.0)
@@ -459,7 +488,7 @@ class MjxFoundationEnv:
         squat_on = jp.where(refresh, new_sq, squat_on)
         cmd_left = jp.where(refresh, new_left, cmd_left)
         squat_tick = jp.where(refresh, jp.array(0, dtype=jp.int32), squat_tick)
-        rng, dx_r, last_a_r, cmd_r, prev_r, left_r, off_r, time_r, wait_r, plow_r, pxy_r, sq_r, tick_r = self._reset_one(rng)
+        rng, dx_r, last_a_r, cmd_r, prev_r, left_r, off_r, time_r, wait_r, plow_r, pxy_r, sq_r, tick_r, phi_r = self._reset_one(rng)
         dx = jax.tree_util.tree_map(lambda a, b: jp.where(done, b, a), dx, dx_r)
         last_a_out = jp.where(done, last_a_r, a)
         cmd = jp.where(done, cmd_r, cmd)
@@ -472,32 +501,33 @@ class MjxFoundationEnv:
         push_xy = jp.where(done, pxy_r, push_xy)
         squat_on = jp.where(done, sq_r, squat_on)
         squat_tick = jp.where(done, tick_r, squat_tick)
+        gait_phi = jp.where(done, phi_r, gait_phi)
         obs = self._obs(dx, last_a_out, cmd)
         return (
             rng, dx, last_a_out, cmd, prev_a, cmd_left, off_prev,
-            time_left, push_wait, push_left, push_xy, squat_on, squat_tick, obs, reward, done,
+            time_left, push_wait, push_left, push_xy, squat_on, squat_tick, gait_phi, obs, reward, done,
         )
 
     def _compile(self) -> None:
         jax = self.jax
         self._reset_v = jax.jit(jax.vmap(self._reset_one))
-        self._step_v = jax.jit(jax.vmap(self._step_one, in_axes=(0,) * 14))
+        self._step_v = jax.jit(jax.vmap(self._step_one, in_axes=(0,) * 15))
 
     def reset(self, rng):
         jax = self.jax
         rngs = jax.random.split(rng, self.n)
-        rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, squat_on, squat_tick = self._reset_v(rngs)
+        rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, squat_on, squat_tick, gait_phi = self._reset_v(rngs)
         obs = jax.vmap(self._obs)(dx, last_a, cmd)
-        self._state = (rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, squat_on, squat_tick)
+        self._state = (rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, squat_on, squat_tick, gait_phi)
         return obs
 
     def step(self, actions):
-        rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, squat_on, squat_tick = self._state
+        rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, squat_on, squat_tick, gait_phi = self._state
         (
             rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev,
-            time_left, push_wait, push_left, push_xy, squat_on, squat_tick, obs, rew, done,
+            time_left, push_wait, push_left, push_xy, squat_on, squat_tick, gait_phi, obs, rew, done,
         ) = self._step_v(
-            rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, squat_on, squat_tick, actions
+            rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, squat_on, squat_tick, gait_phi, actions
         )
-        self._state = (rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, squat_on, squat_tick)
+        self._state = (rngs, dx, last_a, cmd, prev_a, cmd_left, off_prev, time_left, push_wait, push_left, push_xy, squat_on, squat_tick, gait_phi)
         return obs, rew, done

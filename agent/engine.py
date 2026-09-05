@@ -36,7 +36,6 @@ from agent.h2 import (
     MODEL_XML,
     N_ACT,
     SPAWN_Z,
-    STAND_COM_X,
     STAND_Q,
     actuator_addrs,
     box_geom,
@@ -57,6 +56,7 @@ from agent.l3_foundation import (
     com_err_xy,
     height_01,
     q_from_action,
+    advance_gait_phi,
 )
 from agent.plan import Plan, parse_requested_yaw, wrap_angle
 from agent.planner import Level1Planner
@@ -145,6 +145,7 @@ class RobotEngine(FlywheelMixin):
         self._jpeg = b""
         self._eye_rgb = np.zeros((VISION_H, VISION_W, 3), dtype=np.uint8)
         self._tick = 0
+        self._gait_phi = 0.0
         self._step_count = 0
         self._steps_done = 0
         self._steps_goal = 0
@@ -200,6 +201,7 @@ class RobotEngine(FlywheelMixin):
         self.l1_ok = True
         self.l1_busy = False
         self._tick = 0
+        self._gait_phi = 0.0
         self._step_count = 0
         self._steps_done = 0
         self._steps_goal = 0
@@ -267,7 +269,7 @@ class RobotEngine(FlywheelMixin):
 
     def _balance_err(self) -> np.ndarray:
         vx = self._active_vx()
-        off = self._com_xy() - self._feet_xy() - np.array([STAND_COM_X + 0.035 * vx, 0.0], dtype=np.float32)
+        off = com_err_xy(self.data, self.pelvis_id, self.r_fg, self.l_fg, vx)
         h = float(self._pelvis()[2]) - float(self._cmd[CMD_H])
         return np.array([off[0], off[1], h], dtype=np.float32)
 
@@ -440,11 +442,12 @@ class RobotEngine(FlywheelMixin):
             with torch.no_grad():
                 self._last_a = self.l3.act(x)[0].detach().cpu().numpy().astype(np.float32)
         vx = float(self._cmd[CMD_VX])
+        self._gait_phi = advance_gait_phi(self._gait_phi, vx, float(self.model.opt.timestep))
         off = com_err_xy(self.data, self.pelvis_id, self.r_fg, self.l_fg, vx)
         d_off = off - self._off_prev
         self._off_prev = off.copy()
         yaw = self._heading()
-        q_des = q_from_action(self._cmd, self._last_a) + balance_delta(
+        q_des = q_from_action(self._cmd, self._last_a, self._gait_phi) + balance_delta(
             body_xy(off, yaw),
             body_xy(d_off, yaw),
             height_01=height_01(float(self._cmd[CMD_H])),

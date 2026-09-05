@@ -63,6 +63,7 @@ from agent.l3_foundation import (
     VX_RANGE,
     VX_ZERO_FRAC,
     WALK_ONLY,
+    advance_gait_phi,
     balance_delta,
     body_xy,
     build_obs,
@@ -177,6 +178,7 @@ class FoundationEnv:
         self._off_prev = np.zeros(2, dtype=np.float32)
         self._squat_on = False
         self._squat_tick = 0
+        self._gait_phi = 0.0
         self.reset()
 
     def _tilt(self) -> float:
@@ -271,6 +273,7 @@ class FoundationEnv:
             self._squat_on = False
             self._cmd_left = int(self._rng.integers(100, 201))
         self._squat_tick = 0
+        self._gait_phi = 0.0
         pdt = self._policy_dt()
         sec = float(self._rng.uniform(*EPISODE_SEC))
         self._time_left = int(round(sec / pdt))
@@ -314,7 +317,8 @@ class FoundationEnv:
             self.cmd[CMD_H] = squat_cmd_height(self._squat_tick * self._policy_dt())
             self._squat_tick += 1
         a = np.clip(np.asarray(action, dtype=np.float32).reshape(ACT_DIM), -1.0, 1.0)
-        base = q_from_action(self.cmd, a)
+        self._gait_phi = advance_gait_phi(self._gait_phi, float(self.cmd[CMD_VX]), self._policy_dt())
+        base = q_from_action(self.cmd, a, self._gait_phi)
         da = a - self.last_a
         dda = a - 2.0 * self.last_a + self.prev_a
         h01 = height_01(float(self.cmd[CMD_H]))

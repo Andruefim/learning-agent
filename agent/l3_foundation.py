@@ -17,15 +17,17 @@ from agent.h2 import (
     L_AP,
     L_HP,
     L_HR,
+    L_KN,
     N_ACT,
     R_AP,
     R_HP,
     R_HR,
+    R_KN,
     STAND_COM_X,
     STAND_Q,
     SQUAT_Q,
 )
-from agent.l3_cmd import CMD_ARMS, CMD_H, L2_CMD_DIM, UPPER_IDX
+from agent.l3_cmd import CMD_ARMS, CMD_H, CMD_VX, L2_CMD_DIM, UPPER_IDX
 
 DECIMATION = 4
 ACTION_SCALE = 0.5
@@ -33,9 +35,11 @@ OBS_DIM = 3 + 3 + N_ACT + N_ACT + N_ACT + L2_CMD_DIM  # 117
 ACT_DIM = N_ACT
 TILT_LIM = 0.65  # app / engine
 FALL_Z = 0.40
-# Stage A: ~21°. Walk allows more torso pitch (~34°).
-TRAIN_TILT = 0.83
+# Stage A: ~21°. Walk: ~29°. 0.83 (~34°) let a falling log collect vx reward for ~2s.
+TRAIN_TILT = 0.87
 TRAIN_FALL_Z = 0.40
+# No r_vel credit below this tilt — kills the tree-topple (match vx by leaning).
+VEL_TILT = 0.92
 # Body-frame z floors. Deep squat at h=0.65 still has knee≈0.21; kneeling is ~0.08.
 CONTACT_Z_KNEE = 0.14
 CONTACT_Z_HAND = 0.12
@@ -68,7 +72,10 @@ RATE_COEF = 0.04
 QVEL_COEF = 0.002
 QVEL_CLIP = 2.0
 AIR_COEF = 0.80
-SLIP_COEF = 4.0
+# Stance push-off has some xy; 4.0 made standing-still the only cheap action.
+SLIP_COEF = 1.5
+GAIT_HZ = 1.25
+GAIT_VX_ON = 0.08
 # Scale of the hardcoded IPM prior. 1.0 was a limit-cycle; policy must learn the rest.
 BALANCE_PRIOR_SCALE = 0.25
 STAND_ONLY = False
@@ -163,19 +170,58 @@ def height_01(h_m: float) -> float:
     return float(np.clip((float(h_m) - 0.62) / max(STAND_Z - 0.62, 1e-3), 0.0, 1.0))
 
 
-def default_q(cmd: np.ndarray) -> np.ndarray:
-    """Stand/squat lerp + commanded arms. Not a gait — residual policy adds the rest."""
+def gait_amp(vx: float) -> float:
+    a = abs(float(vx))
+    if a < GAIT_VX_ON:
+        return 0.0
+    return float(np.clip((a - GAIT_VX_ON) / 0.22, 0.0, 1.0))
+
+
+def apply_walk_gait(q: np.ndarray, vx: float, phi: float) -> np.ndarray:
+    """Open-loop biped offset on top of STAND_Q. Amplitude 0 when |vx| is stand."""
+    amp = gait_amp(vx)
+    if amp <= 1e-6:
+        return q
+    q = np.asarray(q, dtype=np.float32).copy()
+    s = float(np.sin(phi))
+    c = float(np.cos(phi))
+    hip = 0.18 * amp
+    knee = 0.32 * amp
+    ankle = 0.16 * amp
+    roll = 0.045 * amp
+    swing_l = max(s, 0.0)
+    swing_r = max(-s, 0.0)
+    q[L_HP] += np.float32(-hip * s)
+    q[R_HP] += np.float32(hip * s)
+    q[L_KN] += np.float32(knee * swing_l)
+    q[R_KN] += np.float32(knee * swing_r)
+    q[L_AP] += np.float32(-ankle * swing_l)
+    q[R_AP] += np.float32(-ankle * swing_r)
+    q[L_HR] += np.float32(roll * c)
+    q[R_HR] += np.float32(-roll * c)
+    return q
+
+
+def advance_gait_phi(phi: float, vx: float, dt: float) -> float:
+    if abs(float(vx)) < GAIT_VX_ON:
+        return 0.0
+    return float((float(phi) + 2.0 * np.pi * GAIT_HZ * float(dt)) % (2.0 * np.pi))
+
+
+def default_q(cmd: np.ndarray, phi: float = 0.0) -> np.ndarray:
+    """Stand/squat lerp + arms + walk gait when |vx| > 0. Residual policy adds the rest."""
     cmd = np.asarray(cmd, dtype=np.float32).reshape(-1)
     h = height_01(float(cmd[CMD_H]) if cmd.shape[0] > CMD_H else STAND_Z)
     q = ((1.0 - h) * SQUAT_Q + h * STAND_Q).astype(np.float32)
     if cmd.shape[0] >= L2_CMD_DIM:
         q[list(UPPER_IDX)] = cmd[CMD_ARMS]
-    return q
+    vx = float(cmd[CMD_VX]) if cmd.shape[0] > CMD_VX else 0.0
+    return apply_walk_gait(q, vx, phi)
 
 
-def q_from_action(cmd: np.ndarray, action: np.ndarray) -> np.ndarray:
+def q_from_action(cmd: np.ndarray, action: np.ndarray, phi: float = 0.0) -> np.ndarray:
     a = np.clip(np.asarray(action, dtype=np.float32).reshape(N_ACT), -1.0, 1.0)
-    return default_q(cmd) + ACTION_SCALE * a
+    return default_q(cmd, phi) + ACTION_SCALE * a
 
 
 def heading_z(qpos: np.ndarray) -> float:
@@ -190,7 +236,7 @@ def com_err_xy(data, pelvis_id: int, r_fg: int, l_fg: int, vx: float = 0.0) -> n
         np.asarray(data.geom_xpos[r_fg, :2], dtype=np.float32)
         + np.asarray(data.geom_xpos[l_fg, :2], dtype=np.float32)
     )
-    return com - feet - np.array([STAND_COM_X + 0.035 * float(vx), 0.0], dtype=np.float32)
+    return com - feet - np.array([STAND_COM_X, 0.0], dtype=np.float32)
 
 
 def body_xy(world_xy: np.ndarray, yaw: float) -> np.ndarray:
@@ -208,14 +254,10 @@ def balance_delta(err_xy: np.ndarray, d_xy: np.ndarray, *, height_01: float = 1.
     err_x, err_y = float(err_xy[0]), float(err_xy[1])
     d_x, d_y = float(d_xy[0]), float(d_xy[1])
     scale = float(np.clip(height_01, 0.5, 1.0))
-    if abs(float(vx)) > 0.08:
-        scale *= float(np.clip(1.0 - (abs(float(vx)) - 0.08) / 0.42, 0.2, 1.0))
     ak_lim = float(np.clip(0.14 + 0.8 * abs(err_x), 0.14, 0.28))
     hy_lim = float(np.clip(0.20 + 1.5 * abs(err_x), 0.20, 0.50))
     sag_ak = float(np.clip(2.4 * err_x - 5.0 * d_x, -ak_lim, ak_lim)) * scale
     sag_hy = float(np.clip(4.0 * err_x - 8.0 * d_x, -hy_lim, hy_lim)) * scale
-    if abs(float(vx)) > 0.08:
-        sag_hy = 0.0
     pd_hx = float(np.clip(1.2 * err_y - 6.0 * d_y, -0.25, 0.25))
     dlt = np.zeros(N_ACT, dtype=np.float32)
     dlt[R_AP] = dlt[L_AP] = sag_ak
@@ -250,6 +292,8 @@ def shaped_reward(
     vnorm = float(np.linalg.norm(v_cmd))
     vel_k = 8.0 if vnorm >= 0.08 else 2.0
     r_vel = float(np.exp(-vel_k * float(np.sum(dv ** 2))))
+    if vnorm >= 0.08:
+        r_vel *= float(np.clip((float(tilt) - VEL_TILT) / 0.06, 0.0, 1.0))
     r_rate = float(np.clip(-RATE_COEF * float(np.sum(np.asarray(da, dtype=np.float64) ** 2)), -1.0, 0.0))
     r_acc = float(np.clip(-0.005 * float(np.sum(np.asarray(dda, dtype=np.float64) ** 2)), -1.0, 0.0))
     gx, gy = float(gyro[0]), float(gyro[1])
