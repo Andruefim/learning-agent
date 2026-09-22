@@ -1,9 +1,8 @@
-"""Unitree H2 body: joint map, stand poses, torque PD gains, MJCF helpers.
+"""Unitree G1 29-DoF body: joint map, stand poses, torque PD gains, MJCF helpers.
 
-Official MJCF is models/unitree_h2/{h2_mujoco.xml,scene.xml,meshes/} — do not edit.
-App loads scene_app.xml. Motors are torque, not position. qpos tree order ≠ actuator
-order (head sits before the arms); always index hinges through qadr/vadr.
-Leg+foot yaw is hip_yaw ±2.827 rad. There is no ankle yaw; ankles are roll+pitch.
+Official MJCF is models/unitree_g1/{g1_29dof.xml,scene.xml,meshes/} — do not edit.
+App loads scene_app.xml. Motors are torque, not position. Index hinges through qadr/vadr.
+Ankles are pitch then roll. The sole contacts are spheres on the ankle-roll link.
 """
 
 from __future__ import annotations
@@ -14,20 +13,19 @@ import mujoco
 from agent.config import PARAM_KEYS, ROOT
 from agent.joint_pd import kp_kd_vectors
 
-MODEL_XML = ROOT / "models" / "unitree_h2" / "scene_app.xml"
-TRAIN_XML = ROOT / "models" / "unitree_h2" / "scene_train.xml"
-N_ACT = 31
+MODEL_XML = ROOT / "models" / "unitree_g1" / "scene_app.xml"
+TRAIN_XML = ROOT / "models" / "unitree_g1" / "scene_train.xml"
+N_ACT = 29
 QPOS_FREE = 7
 # L2 command: vx, vy, wz, h_m, 14 arm targets. Not 31 joint angles.
 ACTION_DIM = 18
 TRIAL_FEAT = N_ACT + ACTION_DIM + len(PARAM_KEYS)
-# Actuator order (see h2_mujoco.xml <actuator>).
-L_HP, L_HR, L_HYA, L_KN, L_AR, L_AP = 0, 1, 2, 3, 4, 5
-R_HP, R_HR, R_HYA, R_KN, R_AR, R_AP = 6, 7, 8, 9, 10, 11
+# Actuator order (see g1_29dof.xml <actuator>). Ankle pitch comes before ankle roll.
+L_HP, L_HR, L_HYA, L_KN, L_AP, L_AR = 0, 1, 2, 3, 4, 5
+R_HP, R_HR, R_HYA, R_KN, R_AP, R_AR = 6, 7, 8, 9, 10, 11
 WAIST_Y, WAIST_R, WAIST_P = 12, 13, 14
 L_SP, L_SR, L_SY, L_EL, L_WR, L_WP, L_WY = 15, 16, 17, 18, 19, 20, 21
 R_SP, R_SR, R_SY, R_EL, R_WR, R_WP, R_WY = 22, 23, 24, 25, 26, 27, 28
-HEAD_P, HEAD_Y = 29, 30
 # Tracker aliases: pitch/roll/yaw of the hip, ankle pitch/roll, shoulder pitch/roll.
 R_HY, L_HY = R_HP, L_HP
 R_HX, L_HX = R_HR, L_HR
@@ -37,7 +35,7 @@ R_AZ, L_AZ = R_AR, L_AR
 R_SH, L_SH = R_SP, L_SP
 R_SX, L_SX = R_SR, L_SR
 HIP_YAW_LIM = 1.0
-SPAWN_Z = 1.02
+SPAWN_Z = 0.783
 ARM_RAISE = -1.55
 # CAD q=0 on the arms is not a hang: the forearm body sits along +X, so zeros
 # reach ~90° forward and shove CoM past the toes. Hang = positive shoulder
@@ -75,11 +73,8 @@ def _apply_arm_hang(q: np.ndarray) -> np.ndarray:
     return q
 
 
-STAND_Q = _apply_arm_hang(_h2_leg_pose(hip=-0.20, knee=0.40, ankle=-0.25))
-STAND_Q[WAIST_P] = 0.05
-# Slight hip abduction so the support polygon is not a knife-edge.
-STAND_Q[L_HR] = 0.12
-STAND_Q[R_HR] = -0.12
+STAND_Q = _apply_arm_hang(_h2_leg_pose(hip=-0.10, knee=0.30, ankle=-0.20))
+STAND_Q[WAIST_P] = 0.0
 SQUAT_Q = _apply_arm_hang(_h2_leg_pose(hip=-0.55, knee=1.00, ankle=-0.40))
 SQUAT_Q[WAIST_P] = 0.12
 # Software Joint-PD gains (Nm/rad, Nm·s/rad). Motors stay torque in XML.

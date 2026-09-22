@@ -29,6 +29,7 @@ from agent.config import (
     VISION_W,
 )
 from agent.flywheel import FlywheelMixin
+from agent.g1_walk import load_g1_walk
 from agent.h2 import (
     ACTION_DIM,
     KD,
@@ -40,11 +41,10 @@ from agent.h2 import (
     actuator_addrs,
     box_geom,
     colliding_geoms,
-    disable_foot_spheres,
     joint_limits,
 )
 from agent.joint_pd import compute_torques
-from agent.l3_cmd import CMD_H, CMD_VX, clip_command, command_from_plan, stand_command
+from agent.l3_cmd import CMD_H, CMD_VX, CMD_VY, CMD_WZ, clip_command, command_from_plan, stand_command
 from agent.l3_foundation import (
     ACTION_FILTER_ALPHA,
     DECIMATION,
@@ -75,14 +75,13 @@ class RobotEngine(FlywheelMixin):
         self.model = mujoco.MjModel.from_xml_path(str(MODEL_XML))
         self.data = mujoco.MjData(self.model)
         if int(self.model.nu) != N_ACT:
-            raise RuntimeError(f"H2 nu={self.model.nu}, expected {N_ACT}")
+            raise RuntimeError(f"G1 nu={self.model.nu}, expected {N_ACT}")
         self.renderer: mujoco.Renderer | None = None
         self.eye: mujoco.Renderer | None = None
         self.pelvis_id = self.model.body("pelvis").id
         self.torso_id = self.model.body("torso_link").id
-        self.r_foot_id = self.model.body("right_ankle_pitch_link").id
-        self.l_foot_id = self.model.body("left_ankle_pitch_link").id
-        disable_foot_spheres(self.model, (self.r_foot_id, self.l_foot_id))
+        self.r_foot_id = self.model.body("right_ankle_roll_link").id
+        self.l_foot_id = self.model.body("left_ankle_roll_link").id
         self.r_foot_geoms = colliding_geoms(self.model, self.r_foot_id)
         self.l_foot_geoms = colliding_geoms(self.model, self.l_foot_id)
         self.r_fg = box_geom(self.model, self.r_foot_geoms, self.r_foot_geoms[0] if self.r_foot_geoms else 0)
@@ -109,6 +108,7 @@ class RobotEngine(FlywheelMixin):
         self.outcome = "ok"
         self.policy.eval()
         load_state(self.policy, self.ckpt, self.device)
+        self.walk = load_g1_walk()
         self.l3_drive = load_state(self.l3, self.l3_ckpt, self.device)
         self.lock = threading.RLock()
         self.errors: collections.deque[np.ndarray] = collections.deque(maxlen=ERROR_LEN)
@@ -188,6 +188,8 @@ class RobotEngine(FlywheelMixin):
         self._last_a = np.zeros(N_ACT, dtype=np.float32)
         self.data.ctrl[:] = 0.0
         self.data.time = 0.0
+        if self.walk is not None:
+            self.walk.reset()
         mujoco.mj_forward(self.model, self.data)
         self.data.ctrl[:] = self._pd_torque(self.q_cmd)
 
@@ -480,7 +482,17 @@ class RobotEngine(FlywheelMixin):
         q_des = np.clip(q_des, self.lo, self.hi)
         self.q_cmd = self._slew(q_des)
         self.data.ctrl[:] = self._pd_torque(self.q_cmd)
+        if self.walk is not None:
+            self.data.ctrl[:12] = self.walk.torque(self.data, self.qadr, self.vadr)
+            self.ctrl_source = "g1-walk"
         mujoco.mj_step(self.model, self.data)
+        if self.walk is not None and (self._tick + 1) % DECIMATION == 0:
+            self.walk.update(
+                self.data,
+                self.qadr,
+                self.vadr,
+                np.array([self._cmd[CMD_VX], self._cmd[CMD_VY], self._cmd[CMD_WZ]], dtype=np.float32),
+            )
         if self._fell():
             self.outcome = "fall"
         elif (

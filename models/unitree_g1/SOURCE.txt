@@ -1,0 +1,5 @@
+Official Unitree G1 29-DoF MJCF from
+https://github.com/unitreerobotics/unitree_mujoco
+path: unitree_robots/g1/ (g1_29dof.xml, scene_29dof.xml, meshes/)
+
+App loads scene_app.xml. The only local edit in g1_29dof.xml replaces the four sole spheres with a foot box so the stance PD does not roll.

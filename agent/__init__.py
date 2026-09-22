@@ -1,4 +1,4 @@
-"""Standing Unitree H2: L1 planner, foundation L3, gated L2 command student."""
+"""Standing Unitree G1: L1 planner, foundation L3, gated L2 command student."""
 
 from agent.config import (
     ALPHA_MAX,

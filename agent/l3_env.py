@@ -22,7 +22,6 @@ from agent.h2 import (
     box_geom,
     colliding_geoms,
     cylinders_to_capsules,
-    disable_foot_spheres,
     disable_mesh_contacts,
     joint_limits,
 )
@@ -87,11 +86,11 @@ STAGE_FULL = 2
 def load_train_model(xml: Path | None = None) -> mujoco.MjModel:
     model = mujoco.MjModel.from_xml_path(str(xml or TRAIN_XML))
     if int(model.nu) != N_ACT:
-        raise RuntimeError(f"H2 nu={model.nu}, expected {N_ACT}")
+        raise RuntimeError(f"G1 nu={model.nu}, expected {N_ACT}")
     pelvis = model.body("pelvis").id
-    r_foot = model.body("right_ankle_pitch_link").id
-    l_foot = model.body("left_ankle_pitch_link").id
-    disable_foot_spheres(model, (r_foot, l_foot))
+    r_foot = model.body("right_ankle_roll_link").id
+    l_foot = model.body("left_ankle_roll_link").id
+    _ = (r_foot, l_foot)
     disable_mesh_contacts(model)
     cylinders_to_capsules(model)
     _ = pelvis
@@ -147,8 +146,8 @@ class FoundationEnv:
         self.data = mujoco.MjData(self.model)
         self.pelvis_id = self.model.body("pelvis").id
         self.torso_id = self.model.body("torso_link").id
-        self.r_foot_id = self.model.body("right_ankle_pitch_link").id
-        self.l_foot_id = self.model.body("left_ankle_pitch_link").id
+        self.r_foot_id = self.model.body("right_ankle_roll_link").id
+        self.l_foot_id = self.model.body("left_ankle_roll_link").id
         self.l_knee_id = self.model.body("left_knee_link").id
         self.r_knee_id = self.model.body("right_knee_link").id
         self.l_elbow_id = self.model.body("left_elbow_link").id

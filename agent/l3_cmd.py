@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from agent.config import STAND_Z
 from agent.h2 import ACTION_DIM, ARM_RAISE, arm_hang_cmd
 from agent.plan import Plan, TeacherIntent, parse_requested_yaw
 
@@ -54,7 +55,7 @@ def arm_targets(t: TeacherIntent) -> np.ndarray:
 
 def height_m(height_01: float) -> float:
     h = float(np.clip(height_01, 0.0, 1.0))
-    return float(0.62 + h * (1.02 - 0.62))
+    return float(0.48 + h * (STAND_Z - 0.48))
 
 
 def command_from_intent(t: TeacherIntent, *, requested_yaw: float | None = None) -> np.ndarray:
@@ -75,7 +76,7 @@ def command_from_plan(plan: Plan, *, exec_bias: dict | None = None) -> np.ndarra
     cmd = command_from_intent(t, requested_yaw=parse_requested_yaw(plan.skill, plan.params))
     bias = exec_bias or {}
     cmd[CMD_VX] = float(np.clip(cmd[CMD_VX] + float(bias.get("vx", 0.0)), -1.2, 1.2))
-    cmd[CMD_H] = float(np.clip(cmd[CMD_H] + float(bias.get("h", 0.0)) * 0.2, 0.60, 1.02))
+    cmd[CMD_H] = float(np.clip(cmd[CMD_H] + float(bias.get("h", 0.0)) * 0.2, 0.45, STAND_Z))
     cmd[CMD_WZ] = float(np.clip(cmd[CMD_WZ] + float(bias.get("yaw", 0.0)) * 0.5, -1.0, 1.0))
     return cmd
 
@@ -85,13 +86,13 @@ def clip_command(cmd: np.ndarray) -> np.ndarray:
     out[CMD_VX] = float(np.clip(out[CMD_VX], -1.2, 1.2))
     out[CMD_VY] = float(np.clip(out[CMD_VY], -0.4, 0.4))
     out[CMD_WZ] = float(np.clip(out[CMD_WZ], -1.0, 1.0))
-    out[CMD_H] = float(np.clip(out[CMD_H], 0.60, 1.02))
+    out[CMD_H] = float(np.clip(out[CMD_H], 0.45, STAND_Z))
     return out
 
 
 def stand_command() -> np.ndarray:
     cmd = np.zeros(L2_CMD_DIM, dtype=np.float32)
-    cmd[CMD_H] = 1.02
+    cmd[CMD_H] = float(STAND_Z)
     cmd[CMD_ARMS] = arm_hang_cmd()
     return cmd
 
@@ -107,5 +108,5 @@ def reach_command(*, pitch: float = 1.0, asymmetric: bool = False) -> np.ndarray
 
 def deep_squat_command(*, h_m: float = 0.70) -> np.ndarray:
     cmd = stand_command()
-    cmd[CMD_H] = float(np.clip(h_m, 0.60, 1.02))
+    cmd[CMD_H] = float(np.clip(h_m, 0.45, STAND_Z))
     return cmd

@@ -31,6 +31,7 @@ from agent.h2 import (
 )
 from agent.joint_pd import kp_kd_vectors
 from agent.l3_cmd import CMD_ARMS, CMD_H, CMD_VX, CMD_VY, CMD_WZ, L2_CMD_DIM
+from agent.config import STAND_Z
 from agent.l3_env import STAGE_FULL, STAGE_STAND, STAGE_VX, load_train_model
 from agent.l3_foundation import (
     ACT_DIM,
@@ -155,8 +156,8 @@ def make_spec(model) -> MjxSpec:
     qadr, vadr = actuator_addrs(model)
     lo, hi = joint_limits(model)
     kp, kd = kp_kd_vectors()
-    r_foot = model.body("right_ankle_pitch_link").id
-    l_foot = model.body("left_ankle_pitch_link").id
+    r_foot = model.body("right_ankle_roll_link").id
+    l_foot = model.body("left_ankle_roll_link").id
     return MjxSpec(
         qadr=qadr,
         vadr=vadr,
@@ -233,7 +234,7 @@ class MjxFoundationEnv:
         hang = self.hang_arms
         if WALK_ONLY:
             rng, k_vx, k_z, k_left = jax.random.split(rng, 4)
-            cmd = jp.zeros((L2_CMD_DIM,), dtype=jp.float32).at[CMD_H].set(jp.float32(1.02)).at[4:18].set(hang)
+            cmd = jp.zeros((L2_CMD_DIM,), dtype=jp.float32).at[CMD_H].set(jp.float32(STAND_Z)).at[4:18].set(hang)
             vx = jax.random.uniform(k_vx, (), minval=VX_RANGE[0], maxval=VX_RANGE[1])
             cmd = cmd.at[CMD_VX].set(jp.where(jax.random.uniform(k_z, ()) < VX_ZERO_FRAC, jp.float32(0.0), vx))
             cmd_left = jax.random.randint(k_left, (), 150, 301)
@@ -296,7 +297,7 @@ class MjxFoundationEnv:
 
     def _default_q(self, cmd):
         jp = self.jp
-        h = jp.clip((cmd[CMD_H] - 0.62) / 0.40, 0.0, 1.0)
+        h = jp.clip((cmd[CMD_H] - 0.48) / jp.float32(STAND_Z - 0.48), 0.0, 1.0)
         q = (1.0 - h) * self.squat_q + h * self.stand_q
         return q.at[self.upper].set(cmd[4:18])
 
@@ -315,7 +316,7 @@ class MjxFoundationEnv:
         err_y = -s * off[0] + c * off[1]
         d_x = c * dlt_w[0] + s * dlt_w[1]
         d_y = -s * dlt_w[0] + c * dlt_w[1]
-        h01 = jp.clip((cmd[CMD_H] - 0.62) / 0.40, 0.0, 1.0)
+        h01 = jp.clip((cmd[CMD_H] - 0.48) / jp.float32(STAND_Z - 0.48), 0.0, 1.0)
         scale = jp.clip(h01, 0.5, 1.0)
         ak_lim = jp.clip(0.14 + 0.8 * jp.abs(err_x), 0.14, 0.28)
         hy_lim = jp.clip(0.20 + 1.5 * jp.abs(err_x), 0.20, 0.50)

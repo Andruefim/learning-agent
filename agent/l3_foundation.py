@@ -27,7 +27,7 @@ from agent.h2 import (
 )
 from agent.l3_cmd import CMD_ARMS, CMD_H, CMD_VX, L2_CMD_DIM, UPPER_IDX
 
-DECIMATION = 4
+DECIMATION = 10  # 0.002 s physics → 50 Hz policy
 ACTION_SCALE = 0.5
 # Low-pass stochastic PPO targets. Independent 50 Hz noise was exciting every
 # H2 joint and causing falls unrelated to useful exploration.
@@ -52,18 +52,18 @@ CONTACT_Z_ELBOW = 0.15
 TERMINAL_PENALTY = 150.0
 REWARD_CLIP = 12.0
 EPISODE_SEC = (15.0, 20.0)
-HEIGHT_RANGE = (0.65, 1.02)
+HEIGHT_RANGE = (0.48, 0.78)
 REACH_FRAC = 0.0
 # Of reach samples: left-only / right-only / both.
 ARM_LEFT_FRAC = 0.30
 ARM_RIGHT_FRAC = 0.30
 SQUAT_FRAC = 0.0
-SQUAT_H_STAND = 1.02
-SQUAT_H_LOW = 0.70
+SQUAT_H_STAND = 0.78
+SQUAT_H_LOW = 0.50
 SQUAT_DOWN_SEC = 1.5
 SQUAT_HOLD_SEC = 5.0
 SQUAT_UP_SEC = 1.5
-POLICY_DT = 0.005 * DECIMATION  # matches scene_train timestep
+POLICY_DT = 0.002 * DECIMATION  # matches scene_train timestep
 SQUAT_TICKS = int(round((SQUAT_DOWN_SEC + SQUAT_HOLD_SEC + SQUAT_UP_SEC) / POLICY_DT))
 PUSH_EVERY_SEC = (2.0, 3.0)
 PUSH_DUR_SEC = 0.20
@@ -197,7 +197,7 @@ def squat_cmd_height(t_sec: float) -> float:
 
 
 def height_01(h_m: float) -> float:
-    return float(np.clip((float(h_m) - 0.62) / max(STAND_Z - 0.62, 1e-3), 0.0, 1.0))
+    return float(np.clip((float(h_m) - 0.48) / max(STAND_Z - 0.48, 1e-3), 0.0, 1.0))
 
 
 def apply_walk_gait(q: np.ndarray, vx: float, phi: float) -> np.ndarray:

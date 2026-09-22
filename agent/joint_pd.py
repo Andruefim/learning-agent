@@ -1,4 +1,4 @@
-"""Software Joint-PD on top of H2 torque motors.
+"""Software Joint-PD on top of G1 torque motors.
 
 `data.ctrl` is Newton-metres. Never write joint angles into ctrl.
 qpos tree order ≠ actuator order (head before arms); always use qadr/vadr.
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 
-# Nm/rad and Nm·s/rad. Proven H2 stance PD (same law as before; ctrl is torque).
+# Nm/rad and Nm·s/rad. Order matches g1_29dof.xml motors: ankle pitch, then ankle roll.
 DEFAULT_KP = {
     "hip_pitch": 500.0,
     "hip_roll": 500.0,
@@ -44,16 +44,16 @@ def kp_kd_vectors() -> tuple[np.ndarray, np.ndarray]:
         kp_d["hip_roll"],
         kp_d["hip_yaw"],
         kp_d["knee"],
-        kp_d["ankle_roll"],
         kp_d["ankle_pitch"],
+        kp_d["ankle_roll"],
     ]
     hip_d = [
         kd_d["hip_pitch"],
         kd_d["hip_roll"],
         kd_d["hip_yaw"],
         kd_d["knee"],
-        kd_d["ankle_roll"],
         kd_d["ankle_pitch"],
+        kd_d["ankle_roll"],
     ]
     arm = [
         kp_d["shoulder"],
@@ -73,14 +73,8 @@ def kp_kd_vectors() -> tuple[np.ndarray, np.ndarray]:
         kd_d["wrist"],
         kd_d["wrist"],
     ]
-    kp = np.array(
-        hip + hip + [kp_d["waist"]] * 3 + arm + arm + [kp_d["head"]] * 2,
-        dtype=np.float32,
-    )
-    kd = np.array(
-        hip_d + hip_d + [kd_d["waist"]] * 3 + arm_d + arm_d + [kd_d["head"]] * 2,
-        dtype=np.float32,
-    )
+    kp = np.array(hip + hip + [kp_d["waist"]] * 3 + arm + arm, dtype=np.float32)
+    kd = np.array(hip_d + hip_d + [kd_d["waist"]] * 3 + arm_d + arm_d, dtype=np.float32)
     return kp, kd
 
 
