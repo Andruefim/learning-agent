@@ -39,12 +39,13 @@ from agent.h2 import (
     SPAWN_Z,
     STAND_Q,
     actuator_addrs,
+    arm_hang_cmd,
     box_geom,
     colliding_geoms,
     joint_limits,
 )
 from agent.joint_pd import compute_torques
-from agent.l3_cmd import CMD_H, CMD_VX, CMD_VY, CMD_WZ, clip_command, command_from_plan, stand_command
+from agent.l3_cmd import CMD_ARMS, CMD_H, CMD_VX, CMD_VY, CMD_WZ, clip_command, command_from_plan, stand_command
 from agent.l3_foundation import (
     ACTION_FILTER_ALPHA,
     DECIMATION,
@@ -482,17 +483,31 @@ class RobotEngine(FlywheelMixin):
         q_des = np.clip(q_des, self.lo, self.hi)
         self.q_cmd = self._slew(q_des)
         self.data.ctrl[:] = self._pd_torque(self.q_cmd)
+        cmd_v = np.array([self._cmd[CMD_VX], self._cmd[CMD_VY], self._cmd[CMD_WZ]], dtype=np.float32)
+        # Arms forward move the mass past the toes. The stiff stand cannot
+        # catch that; the walk net can, by stepping, so it stays in the loop.
+        arms_out = float(np.max(np.abs(self._cmd[CMD_ARMS] - arm_hang_cmd()))) > 0.45
         if self.walk is not None:
-            self.data.ctrl[:12] = self.walk.torque(self.data, self.qadr, self.vadr)
-            self.ctrl_source = "g1-walk"
-        mujoco.mj_step(self.model, self.data)
-        if self.walk is not None and (self._tick + 1) % DECIMATION == 0:
-            self.walk.update(
+            leg = self.walk.leg_torque(
                 self.data,
                 self.qadr,
                 self.vadr,
-                np.array([self._cmd[CMD_VX], self._cmd[CMD_VY], self._cmd[CMD_WZ]], dtype=np.float32),
+                cmd_v,
+                self.kp,
+                self.kd,
+                float(self.model.opt.timestep),
+                dynamic=arms_out,
             )
+            if leg is not None:
+                self.data.ctrl[:12] = leg
+                self.ctrl_source = "g1-walk"
+            else:
+                self.ctrl_source = "g1-stand"
+        mujoco.mj_step(self.model, self.data)
+        if self.walk is not None and (self._tick + 1) % DECIMATION == 0 and not self.walk.holding:
+            self.walk.update(self.data, self.qadr, self.vadr, cmd_v, dynamic=arms_out)
+        elif self.walk is not None and self.walk.holding:
+            self.walk.reset()
         if self._fell():
             self.outcome = "fall"
         elif (
