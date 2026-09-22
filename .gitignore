@@ -4,5 +4,6 @@ __pycache__/
 .pytest_cache/
 flywheel_data/
 *.pt
+!models/unitree_g1/motion.pt
 *.engine
 .DS_Store
