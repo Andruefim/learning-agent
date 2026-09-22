@@ -46,39 +46,50 @@ def _soft(params: dict, key: str, default: str = "") -> str:
     return str(val).strip().lower()
 
 
+def _apply_arms(t: TeacherIntent, skill: str, p: dict) -> None:
+    """Arm pose is a channel of the same command as velocity and height."""
+    pose = _soft(p, "pose")
+    hand = _soft(p, "hand")
+    hands = _soft(p, "hands")
+    if hands == "down":
+        t.r_arm = t.l_arm = t.wave = 0.0
+        return
+    raised = hands in {"up", "raise", "forward", "вперед", "вперёд", "вверх"}
+    if skill not in {"wave", "reach"} and not hand and not raised and not pose:
+        return
+    if not hand:
+        hand = "right" if skill == "wave" and not pose and not raised else "both"
+    pitch = 1.0 if skill == "wave" and not pose else 0.85
+    if hand in {"right", "both", "правой", "правая"}:
+        t.r_arm = pitch
+    if hand in {"left", "both", "левой", "левая"}:
+        t.l_arm = pitch
+    if skill == "wave":
+        t.wave = 1.0
+    if pose in {"t", "out", "sides"}:
+        t.r_out, t.l_out, t.r_arm, t.l_arm, t.wave = 1.0, 1.0, 0.35, 0.35, 0.0
+    if pose == "clap":
+        t.r_arm, t.l_arm, t.r_out, t.l_out, t.wave = 0.55, 0.55, -0.7, -0.7, 1.0
+
+
 def decode_teacher(skill: str, params: dict | None) -> TeacherIntent:
     skill = (skill or "hold").strip().lower()
     p = params or {}
     t = TeacherIntent()
-    if skill == "squat":
+    if skill == "squat" or _soft(p, "depth"):
         t.height = {"low": 0.45, "deep": 0.38, "medium": 0.62, "high": 0.78}.get(_soft(p, "depth", "low"), 0.45)
-    if skill == "locomote":
+    if skill == "locomote" or _soft(p, "direction") in {"forward", "back", "backward", "назад", "вперед", "вперёд"}:
         speed = {"slow": 0.30, "medium": 0.50, "fast": 0.80}.get(_soft(p, "speed", "medium"), 0.50)
         direction = _soft(p, "direction", "forward")
-        t.vx = -speed if direction in {"back", "backward", "назад"} else speed
-        hint = _soft(p, "distance_hint") or str(p.get("steps", ""))
-        found = re.findall(r"\d+", hint)
-        t.steps = int(found[0]) if found else 0
+        if direction or skill == "locomote":
+            t.vx = -speed if direction in {"back", "backward", "назад"} else speed
+            hint = _soft(p, "distance_hint") or str(p.get("steps", ""))
+            found = re.findall(r"\d+", hint)
+            t.steps = int(found[0]) if found else 0
     if skill == "turn":
         direction = _soft(p, "direction", "left")
         t.yaw = -1.0 if direction in {"right", "направо", "cw"} else 1.0
-    if skill in {"wave", "reach"}:
-        hand = _soft(p, "hand", "right" if skill == "wave" else "both")
-        pose = _soft(p, "pose")
-        if hand in {"right", "both", "правой", "правая"}:
-            t.r_arm = 1.0 if skill == "wave" else 0.85
-        if hand in {"left", "both", "левой", "левая"}:
-            t.l_arm = 1.0 if skill == "wave" else 0.85
-        if skill == "wave":
-            t.wave = 1.0
-        if pose in {"t", "out", "sides"}:
-            t.r_out, t.l_out, t.r_arm, t.l_arm, t.wave = 1.0, 1.0, 0.35, 0.35, 0.0
-        if pose == "clap":
-            t.r_arm, t.l_arm, t.r_out, t.l_out, t.wave = 0.55, 0.55, -0.7, -0.7, 1.0
-        if skill == "reach" and _soft(p, "hands") == "down":
-            t.r_arm = t.l_arm = t.wave = 0.0
-    if skill == "hold" and _soft(p, "hands") == "down":
-        t.r_arm = t.l_arm = t.wave = 0.0
+    _apply_arms(t, skill, p)
     if skill == "kick":
         foot = _soft(p, "foot", "right")
         t.kick = -1.0 if foot in {"left", "левой"} else 1.0

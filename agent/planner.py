@@ -102,6 +102,11 @@ class Level1Planner:
             '  "повернись налево" → {"skill":"turn","params":{"direction":"left"},"done":false}\n'
             '  "повернись направо" → {"skill":"turn","params":{"direction":"right"},"done":false}\n'
             '  "повернись на 90" → {"skill":"turn","params":{"direction":"left","angle":"90"},"done":false}\n'
+            "One skill is the primary motion. Extra parts stay in params and run together "
+            "(walk and arms, squat and arms). Do not drop the second part.\n"
+            '  "иди вперед и руки в стороны" → {"skill":"locomote","params":{"direction":"forward","speed":"medium","pose":"t"}}\n'
+            '  "присядь и подними руки" → {"skill":"squat","params":{"depth":"low","hand":"both"}}\n'
+            '  "иди назад и подними правую руку" → {"skill":"locomote","params":{"direction":"backward","speed":"medium","hand":"right"}}\n'
             "If the scene has requested_yaw and achieved_yaw: keep skill=turn and done=false until "
             "|achieved_yaw-requested_yaw| is small; then done=true, skill=hold.\n"
             f"Now: pelvis_z={scene.get('pelvis_z')} tilt={scene.get('tilt')} "

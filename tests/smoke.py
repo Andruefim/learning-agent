@@ -137,6 +137,16 @@ def smoke() -> None:
         "сделай 5 шагов вперед",
     )
     assert walk is not None and walk.skill == "locomote" and walk.teacher().vx > 0.2 and walk.teacher().steps == 5, walk
+    both = bot.planner._parse(
+        '{"instruction":"иди вперед и руки в стороны","skill":"locomote","params":{"direction":"forward","speed":"medium","pose":"t"},"done":false}',
+        "иди вперед и руки в стороны",
+    )
+    assert both is not None and both.teacher().vx > 0.2 and both.teacher().r_out == 1.0 and both.teacher().l_out == 1.0, both
+    squat_arms = bot.planner._parse(
+        '{"instruction":"присядь и подними руки","skill":"squat","params":{"depth":"low","hand":"both"},"done":false}',
+        "присядь и подними руки",
+    )
+    assert squat_arms is not None and squat_arms.teacher().height < 0.5 and squat_arms.teacher().r_arm > 0.5, squat_arms
     down = bot.planner._parse(
         '{"instruction":"опусти руки","skill":"hold","params":{"hands":"down"},"done":false}',
         "опусти руки",
