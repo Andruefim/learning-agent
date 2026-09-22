@@ -47,6 +47,7 @@ from agent.l3_env import (
 from agent.l3_foundation import (
     ACT_DIM,
     BALANCE_PRIOR_SCALE,
+    LEGACY_OBS_DIM,
     OBS_DIM,
     PUSH_FORCE,
     REACH_FRAC,
@@ -89,8 +90,8 @@ class ActorCritic(nn.Module):
 CURRICULUM_HORIZON = 200
 RESUME_EVERY = 25  # .latest snapshot; not the production gate
 EVAL_EVERY = 50
-CHECKPOINT_VERSION = 2
-ENTROPY_COEF = 0.01
+CHECKPOINT_VERSION = 4
+ENTROPY_COEF = 0.002
 PPO_EPOCHS = 4
 PPO_LR = 3e-4
 PPO_CLIP = 0.2
@@ -99,6 +100,21 @@ PPO_GAMMA = 0.99
 PPO_LAM = 0.95
 JAX_MINIBATCH = 4096
 JAX_DEFAULT_ENVS = 2048
+
+
+def walk_log_std() -> np.ndarray:
+    """Safe exploration around the gait: legs > torso > arms/head.
+
+    Legacy std≈0.31 caused 16/16 CPU rollouts to fall. These values correspond
+    to residual target noise of roughly 0.04, 0.025 and 0.015 rad.
+    """
+    out = np.full((ACT_DIM,), -3.5, dtype=np.float32)
+    out[:12] = -2.5
+    out[12:15] = -3.0
+    return out
+
+
+PPO_LOG_STD_MAX = -2.3 if WALK_ONLY else 0.0
 
 
 def curriculum_stage(global_it: int, horizon: int = CURRICULUM_HORIZON) -> int:
@@ -146,8 +162,13 @@ def load_training_checkpoint(path: Path, device: torch.device) -> dict | None:
     if not isinstance(blob, dict):
         return None
     ver = blob.get("version")
-    if ver in (1, 2, CHECKPOINT_VERSION):
-        out: dict = {"actor": blob["actor"], "backend": blob.get("backend"), "global_iter": int(blob.get("global_iter", 0))}
+    if ver in (1, 2, 3, CHECKPOINT_VERSION):
+        out: dict = {
+            "actor": blob["actor"],
+            "backend": blob.get("backend"),
+            "global_iter": int(blob.get("global_iter", 0)),
+            "version": int(ver),
+        }
         if "critic" in blob:
             out["critic"] = blob["critic"]
         if "critic_jax" in blob:
@@ -162,16 +183,37 @@ def load_training_checkpoint(path: Path, device: torch.device) -> dict | None:
 
 
 def apply_critic_jax_to_torch(critic_jax, critic: nn.Sequential) -> None:
-    for layer_idx, (w, b) in zip((0, 2, 4), critic_jax):
-        critic[layer_idx].weight.data.copy_(torch.as_tensor(np.asarray(w).T, dtype=torch.float32))
+    for jax_i, (layer_idx, (w, b)) in enumerate(zip((0, 2, 4), critic_jax)):
+        w_np = np.asarray(w)
+        if jax_i == 0 and w_np.shape == (LEGACY_OBS_DIM, 256):
+            w_new = np.zeros((OBS_DIM, 256), dtype=w_np.dtype)
+            w_new[:LEGACY_OBS_DIM] = w_np
+            w_np = w_new
+        critic[layer_idx].weight.data.copy_(torch.as_tensor(w_np.T, dtype=torch.float32))
         critic[layer_idx].bias.data.copy_(torch.as_tensor(np.asarray(b), dtype=torch.float32))
+
+
+def upgrade_critic_state_dict(sd: dict) -> dict:
+    """Pad a legacy Torch critic's phase inputs with zero weights."""
+    key = "0.weight"
+    w = sd.get(key)
+    if not torch.is_tensor(w) or tuple(w.shape) != (256, LEGACY_OBS_DIM):
+        return sd
+    out = dict(sd)
+    padded = torch.zeros((256, OBS_DIM), dtype=w.dtype, device=w.device)
+    padded[:, :LEGACY_OBS_DIM] = w
+    out[key] = padded
+    return out
 
 
 def apply_resume_to_net(net: ActorCritic, resume: dict) -> str:
     net.actor.load_state_dict(resume["actor"])
     parts = ["actor"]
-    if "critic" in resume:
-        net.critic.load_state_dict(resume["critic"])
+    fresh_walk_critic = WALK_ONLY and int(resume.get("version", 0)) < CHECKPOINT_VERSION
+    if fresh_walk_critic:
+        parts.append("fresh_walk_critic")
+    elif "critic" in resume:
+        net.critic.load_state_dict(upgrade_critic_state_dict(resume["critic"]))
         parts.append("critic")
     elif "critic_jax" in resume:
         apply_critic_jax_to_torch(resume["critic_jax"], net.critic)
@@ -345,6 +387,8 @@ def ppo_torch(
                 loss.backward()
                 nn.utils.clip_grad_norm_(net.parameters(), 1.0)
                 opt.step()
+                if WALK_ONLY:
+                    net.log_std.data.clamp_(-5.0, PPO_LOG_STD_MAX)
             if stop:
                 break
         mean_ret = float(r.sum(0).mean().cpu())
@@ -353,7 +397,8 @@ def ppo_torch(
         if local == 1 or local % 5 == 0 or local == iters:
             print(
                 f"iter {global_it} (+{local}/{iters}) stage={envs.stage} ret={mean_ret:.2f} "
-                f"fall_rate={fall_rate:.3f} env-steps/s={sps:.0f} elapsed={time.time() - t0:.0f}s",
+                f"fall_rate={fall_rate:.3f} std={float(net.log_std.exp().mean()):.3f} "
+                f"env-steps/s={sps:.0f} elapsed={time.time() - t0:.0f}s",
                 flush=True,
             )
         t0 = time.time()
@@ -405,12 +450,24 @@ def ppo_jax(
             (jp.zeros((256, 1)), jp.zeros((1,))),
         ]
 
-    if resume is not None and "critic_jax" in resume:
-        critic = [(jp.asarray(np.asarray(w)), jp.asarray(np.asarray(b))) for w, b in resume["critic_jax"]]
-    elif resume is not None and "critic" in resume:
+    fresh_walk_critic = (
+        resume is not None
+        and WALK_ONLY
+        and int(resume.get("version", 0)) < CHECKPOINT_VERSION
+    )
+    if resume is not None and "critic_jax" in resume and not fresh_walk_critic:
+        critic = []
+        for i, (w, b) in enumerate(resume["critic_jax"]):
+            w_np = np.asarray(w)
+            if i == 0 and w_np.shape == (LEGACY_OBS_DIM, 256):
+                w_new = np.zeros((OBS_DIM, 256), dtype=w_np.dtype)
+                w_new[:LEGACY_OBS_DIM] = w_np
+                w_np = w_new
+            critic.append((jp.asarray(w_np), jp.asarray(np.asarray(b))))
+    elif resume is not None and "critic" in resume and not fresh_walk_critic:
         critic = init_critic(k_c)
         net_tmp = ActorCritic().to(torch_device)
-        net_tmp.critic.load_state_dict(resume["critic"])
+        net_tmp.critic.load_state_dict(upgrade_critic_state_dict(resume["critic"]))
         for layer_idx, jax_i in zip((0, 2, 4), range(3)):
             w = net_tmp.critic[layer_idx].weight.detach().cpu().numpy().T
             b = net_tmp.critic[layer_idx].bias.detach().cpu().numpy()
@@ -418,7 +475,10 @@ def ppo_jax(
     else:
         critic = init_critic(k_c)
 
-    if resume is not None and "log_std" in resume:
+    if WALK_ONLY:
+        # Do not inherit destructive stand-training exploration (std≈0.31).
+        log_std = jp.asarray(walk_log_std())
+    elif resume is not None and "log_std" in resume:
         log_std = jp.asarray(np.asarray(resume["log_std"].detach().cpu().numpy()), dtype=jp.float32)
     else:
         log_std = jp.full((ACT_DIM,), -1.2)
@@ -520,7 +580,7 @@ def ppo_jax(
                     grads = (_clip_grads(grads[0]), _clip_grads(grads[1]), _clip_grads(grads[2]))
                     na = jax.tree_util.tree_map(lambda p, g: p - PPO_LR * g, actor, grads[0])
                     nc = jax.tree_util.tree_map(lambda p, g: p - PPO_LR * g, critic, grads[1])
-                    ns = jp.clip(log_std - PPO_LR * grads[2], -5.0, 0.0)
+                    ns = jp.clip(log_std - PPO_LR * grads[2], -5.0, PPO_LOG_STD_MAX)
                     return na, nc, ns
 
                 def skip(_):
@@ -577,7 +637,8 @@ def ppo_jax(
         if local == 1 or local % 5 == 0 or local == iters:
             print(
                 f"iter {global_it} (+{local}/{iters}) stage={env.stage} ret={mean_ret:.2f} "
-                f"fall_rate={fall_rate:.3f} env-steps/s={sps:.0f} elapsed={time.time() - t0:.0f}s jax",
+                f"fall_rate={fall_rate:.3f} std={float(np.asarray(jp.exp(log_std).mean())):.3f} "
+                f"env-steps/s={sps:.0f} elapsed={time.time() - t0:.0f}s jax",
                 flush=True,
             )
             print(f"  ppo updates={updates} mb={mb} epochs<={epochs}", flush=True)
@@ -626,7 +687,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--iters", type=int, default=None, help="PPO iterations. Default 200 on JAX GPU, 0 otherwise.")
     p.add_argument("--envs", type=int, default=JAX_DEFAULT_ENVS)
-    p.add_argument("--unroll", type=int, default=64)
+    p.add_argument("--unroll", type=int, default=128, help="PPO rollout length. 128 steps = 2.56 s.")
     p.add_argument("--device", default=os.getenv("L2_DEVICE", "cpu"))
     p.add_argument("--out", default=str(AGENT_ROOT / "flywheel_data" / "l3_foundation.pt"))
     p.add_argument("--seed", type=int, default=0)
@@ -679,6 +740,9 @@ def main() -> None:
         start_iter = int(resume.get("global_iter", 0))
         if args.start_iter is not None:
             start_iter = int(args.start_iter)
+        if WALK_ONLY:
+            net.log_std.data.copy_(torch.as_tensor(walk_log_std(), device=device))
+            loaded += "+walk_std_reset"
         print(
             f"resumed {loaded} from {resume_path} global_iter={start_iter} "
             f"next_stage={curriculum_stage(start_iter + 1)}",

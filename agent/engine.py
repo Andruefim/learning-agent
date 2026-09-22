@@ -46,6 +46,7 @@ from agent.h2 import (
 from agent.joint_pd import compute_torques
 from agent.l3_cmd import CMD_H, CMD_VX, clip_command, command_from_plan, stand_command
 from agent.l3_foundation import (
+    ACTION_FILTER_ALPHA,
     DECIMATION,
     FALL_Z,
     TILT_LIM,
@@ -269,7 +270,14 @@ class RobotEngine(FlywheelMixin):
 
     def _balance_err(self) -> np.ndarray:
         vx = self._active_vx()
-        off = com_err_xy(self.data, self.pelvis_id, self.r_fg, self.l_fg, vx)
+        off = com_err_xy(
+            self.data,
+            self.pelvis_id,
+            self.r_fg,
+            self.l_fg,
+            vx,
+            self._gait_phi,
+        )
         h = float(self._pelvis()[2]) - float(self._cmd[CMD_H])
         return np.array([off[0], off[1], h], dtype=np.float32)
 
@@ -437,13 +445,29 @@ class RobotEngine(FlywheelMixin):
         self._last_teacher = teacher
         self._cmd = chosen
         if self.outcome != "fall" and self._tick % DECIMATION == 0:
-            obs = build_obs(self.data, self.torso_id, self._hinges(), self._qd(), self._last_a, self._cmd)
+            obs = build_obs(
+                self.data,
+                self.torso_id,
+                self._hinges(),
+                self._qd(),
+                self._last_a,
+                self._cmd,
+                self._gait_phi,
+            )
             x = torch.as_tensor(obs, device=self.device, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
-                self._last_a = self.l3.act(x)[0].detach().cpu().numpy().astype(np.float32)
+                raw_a = self.l3.act(x)[0].detach().cpu().numpy().astype(np.float32)
+                self._last_a += np.float32(ACTION_FILTER_ALPHA) * (raw_a - self._last_a)
         vx = float(self._cmd[CMD_VX])
         self._gait_phi = advance_gait_phi(self._gait_phi, vx, float(self.model.opt.timestep))
-        off = com_err_xy(self.data, self.pelvis_id, self.r_fg, self.l_fg, vx)
+        off = com_err_xy(
+            self.data,
+            self.pelvis_id,
+            self.r_fg,
+            self.l_fg,
+            vx,
+            self._gait_phi,
+        )
         d_off = off - self._off_prev
         self._off_prev = off.copy()
         yaw = self._heading()

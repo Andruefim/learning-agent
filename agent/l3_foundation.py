@@ -1,6 +1,6 @@
 """Command-conditioned whole-body foundation policy (Level 3).
 
-Obs (117): grav(3)+gyro(3)+qerr(31)+qvel(31)+last_a(31)+cmd(18).
+Obs (119): grav(3)+gyro(3)+qerr(31)+qvel(31)+last_a(31)+cmd(18)+unused phase slots(2).
 last_a is a_{t-1} (31-DoF previous motor command) so ankles can damp phase lag.
 Act (31): residual around a command-conditioned default pose.
 Policy rate 50 Hz; Joint-PD at 200 Hz (decimation=4).
@@ -17,12 +17,10 @@ from agent.h2 import (
     L_AP,
     L_HP,
     L_HR,
-    L_KN,
     N_ACT,
     R_AP,
     R_HP,
     R_HR,
-    R_KN,
     STAND_COM_X,
     STAND_Q,
     SQUAT_Q,
@@ -31,20 +29,27 @@ from agent.l3_cmd import CMD_ARMS, CMD_H, CMD_VX, L2_CMD_DIM, UPPER_IDX
 
 DECIMATION = 4
 ACTION_SCALE = 0.5
-OBS_DIM = 3 + 3 + N_ACT + N_ACT + N_ACT + L2_CMD_DIM  # 117
+# Low-pass stochastic PPO targets. Independent 50 Hz noise was exciting every
+# H2 joint and causing falls unrelated to useful exploration.
+ACTION_FILTER_ALPHA = 0.10
+LEGACY_OBS_DIM = 3 + 3 + N_ACT + N_ACT + N_ACT + L2_CMD_DIM  # 117
+OBS_DIM = LEGACY_OBS_DIM + 2  # sin(phi), cos(phi)
 ACT_DIM = N_ACT
 TILT_LIM = 0.65  # app / engine
 FALL_Z = 0.40
 # Stage A: ~21°. Walk: ~29°. 0.83 (~34°) let a falling log collect vx reward for ~2s.
 TRAIN_TILT = 0.87
 TRAIN_FALL_Z = 0.40
-# No r_vel credit below this tilt — kills the tree-topple (match vx by leaning).
+# Forward speed counts only while the torso is still upright. Idle stand sits at
+# tilt≈0.996; the falling log is below 0.97 by the time it is actually fast.
 VEL_TILT = 0.92
+VEL_UPRIGHT = 0.97
+VEL_UPRIGHT_SPAN = 0.026
 # Body-frame z floors. Deep squat at h=0.65 still has knee≈0.21; kneeling is ~0.08.
 CONTACT_Z_KNEE = 0.14
 CONTACT_Z_HAND = 0.12
 CONTACT_Z_ELBOW = 0.15
-TERMINAL_PENALTY = 50.0
+TERMINAL_PENALTY = 150.0
 REWARD_CLIP = 12.0
 EPISODE_SEC = (15.0, 20.0)
 HEIGHT_RANGE = (0.65, 1.02)
@@ -72,16 +77,22 @@ RATE_COEF = 0.04
 QVEL_COEF = 0.002
 QVEL_CLIP = 2.0
 AIR_COEF = 0.80
-# Stance push-off has some xy; 4.0 made standing-still the only cheap action.
-SLIP_COEF = 1.5
-GAIT_HZ = 1.25
-GAIT_VX_ON = 0.08
+# Landing bonus after a real swing. No phase clock: either foot may step.
+AIR_TIME_MIN = 0.12
+AIR_TIME_SCALE = 2.0
+AIR_TIME_CAP = 0.8
+# A crawl may slide the feet. 1.5 cost more than the first centimeters of speed.
+SLIP_COEF = 0.4
+# +2 per step at the commanded speed. The old exp kernel paid ~0.3 there and ~0
+# at a stand, so polishing the stand beat walking.
+VEL_REWARD_SCALE = 2.0
 # Scale of the hardcoded IPM prior. 1.0 was a limit-cycle; policy must learn the rest.
 BALANCE_PRIOR_SCALE = 0.25
 STAND_ONLY = False
 WALK_ONLY = True
-# Crawl first (~1.3 km/h). 4 km/h = 1.11 m/s is a later cap, not the start.
-VX_RANGE = (0.0, 0.35)
+# Phase-aware crawl first. Idle stand actor survives <=0.16 m/s for 10 s,
+# while >=0.20 m/s falls before learning; raise this only after crawl eval passes.
+VX_RANGE = (0.09, 0.11)
 VX_ZERO_FRAC = 0.35
 HIDDEN = (256, 256, 128)
 
@@ -102,6 +113,11 @@ class HumanoidFoundationPolicy(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return self.net(obs)
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        """Accept legacy 117-D actors; phase columns start at zero influence."""
+        state_dict = upgrade_actor_state_dict(state_dict)
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def act(self, obs: torch.Tensor) -> torch.Tensor:
         """Action in [-1, 1]. q_from_action applies ACTION_SCALE."""
@@ -124,6 +140,19 @@ def linear_indices() -> tuple[int, ...]:
     return (0, 2, 4, 6)
 
 
+def upgrade_actor_state_dict(sd: dict) -> dict:
+    """Pad a legacy actor's first layer from obs 117 to 119 without changing outputs."""
+    key = "net.0.weight"
+    w = sd.get(key)
+    if not torch.is_tensor(w) or tuple(w.shape) != (HIDDEN[0], LEGACY_OBS_DIM):
+        return sd
+    out = dict(sd)
+    padded = torch.zeros((HIDDEN[0], OBS_DIM), dtype=w.dtype, device=w.device)
+    padded[:, :LEGACY_OBS_DIM] = w
+    out[key] = padded
+    return out
+
+
 def jax_params_to_state_dict(params) -> dict:
     """JAX kernels are (in, out); PyTorch Linear is (out, in)."""
     sd: dict[str, torch.Tensor] = {}
@@ -137,6 +166,7 @@ def jax_params_to_state_dict(params) -> dict:
 def state_dict_to_jax(sd: dict):
     import jax.numpy as jp
 
+    sd = upgrade_actor_state_dict(sd)
     params = []
     for layer in linear_indices():
         w = np.asarray(sd[f"net.{layer}.weight"].detach().cpu().numpy(), dtype=np.float32).T
@@ -170,46 +200,33 @@ def height_01(h_m: float) -> float:
     return float(np.clip((float(h_m) - 0.62) / max(STAND_Z - 0.62, 1e-3), 0.0, 1.0))
 
 
-def gait_amp(vx: float) -> float:
-    a = abs(float(vx))
-    if a < GAIT_VX_ON:
-        return 0.0
-    return float(np.clip((a - GAIT_VX_ON) / 0.22, 0.0, 1.0))
-
-
 def apply_walk_gait(q: np.ndarray, vx: float, phi: float) -> np.ndarray:
-    """Open-loop biped offset on top of STAND_Q. Amplitude 0 when |vx| is stand."""
-    amp = gait_amp(vx)
-    if amp <= 1e-6:
-        return q
-    q = np.asarray(q, dtype=np.float32).copy()
-    s = float(np.sin(phi))
-    c = float(np.cos(phi))
-    hip = 0.18 * amp
-    knee = 0.32 * amp
-    ankle = 0.16 * amp
-    roll = 0.045 * amp
-    swing_l = max(s, 0.0)
-    swing_r = max(-s, 0.0)
-    q[L_HP] += np.float32(-hip * s)
-    q[R_HP] += np.float32(hip * s)
-    q[L_KN] += np.float32(knee * swing_l)
-    q[R_KN] += np.float32(knee * swing_r)
-    q[L_AP] += np.float32(-ankle * swing_l)
-    q[R_AP] += np.float32(-ankle * swing_r)
-    q[L_HR] += np.float32(roll * c)
-    q[R_HR] += np.float32(-roll * c)
+    """Stand pose only. The step has to come from the policy, not a joint clock."""
+    del vx, phi
     return q
 
 
 def advance_gait_phi(phi: float, vx: float, dt: float) -> float:
-    if abs(float(vx)) < GAIT_VX_ON:
-        return 0.0
-    return float((float(phi) + 2.0 * np.pi * GAIT_HZ * float(dt)) % (2.0 * np.pi))
+    """No gait phase. Obs keeps the two phase slots so older actors still load."""
+    del phi, vx, dt
+    return 0.0
+
+
+def foot_air_bonus(air_t_l: float, air_t_r: float, air_l: bool, air_r: bool, moving: bool) -> tuple[float, float, float]:
+    """Reward a foot for having been up, paid once when it lands. Returns new timers."""
+    bonus = 0.0
+    if moving:
+        if air_t_l > 0.0 and not air_l:
+            bonus += AIR_TIME_SCALE * min(AIR_TIME_CAP, max(0.0, float(air_t_l) - AIR_TIME_MIN))
+        if air_t_r > 0.0 and not air_r:
+            bonus += AIR_TIME_SCALE * min(AIR_TIME_CAP, max(0.0, float(air_t_r) - AIR_TIME_MIN))
+    t_l = float(air_t_l) + POLICY_DT if air_l else 0.0
+    t_r = float(air_t_r) + POLICY_DT if air_r else 0.0
+    return float(bonus), t_l, t_r
 
 
 def default_q(cmd: np.ndarray, phi: float = 0.0) -> np.ndarray:
-    """Stand/squat lerp + arms + walk gait when |vx| > 0. Residual policy adds the rest."""
+    """Stand/squat lerp + arms. Residual policy supplies locomotion."""
     cmd = np.asarray(cmd, dtype=np.float32).reshape(-1)
     h = height_01(float(cmd[CMD_H]) if cmd.shape[0] > CMD_H else STAND_Z)
     q = ((1.0 - h) * SQUAT_Q + h * STAND_Q).astype(np.float32)
@@ -229,14 +246,21 @@ def heading_z(qpos: np.ndarray) -> float:
     return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
 
 
-def com_err_xy(data, pelvis_id: int, r_fg: int, l_fg: int, vx: float = 0.0) -> np.ndarray:
-    """World-frame COM minus feet, with the stand CoM bias."""
+def com_err_xy(
+    data,
+    pelvis_id: int,
+    r_fg: int,
+    l_fg: int,
+    vx: float = 0.0,
+    gait_phi: float = 0.0,
+) -> np.ndarray:
+    """World-frame COM error relative to the midpoint of the feet."""
+    del vx, gait_phi
     com = np.asarray(data.subtree_com[pelvis_id, :2], dtype=np.float32)
-    feet = 0.5 * (
-        np.asarray(data.geom_xpos[r_fg, :2], dtype=np.float32)
-        + np.asarray(data.geom_xpos[l_fg, :2], dtype=np.float32)
-    )
-    return com - feet - np.array([STAND_COM_X, 0.0], dtype=np.float32)
+    right = np.asarray(data.geom_xpos[r_fg, :2], dtype=np.float32)
+    left = np.asarray(data.geom_xpos[l_fg, :2], dtype=np.float32)
+    support = 0.5 * (right + left)
+    return com - support - np.array([STAND_COM_X, 0.0], dtype=np.float32)
 
 
 def body_xy(world_xy: np.ndarray, yaw: float) -> np.ndarray:
@@ -266,6 +290,18 @@ def balance_delta(err_xy: np.ndarray, d_xy: np.ndarray, *, height_01: float = 1.
     return dlt * float(BALANCE_PRIOR_SCALE)
 
 
+def moving_velocity_reward(v_b, v_cmd, tilt: float) -> float:
+    """0 while standing, +VEL_REWARD_SCALE at the command, nothing extra for falling faster."""
+    vel = np.asarray(v_b[:2], dtype=np.float64)
+    cmd = np.asarray(v_cmd, dtype=np.float64)
+    speed = float(np.linalg.norm(cmd))
+    along = float(np.dot(vel, cmd) / max(speed, 1e-6))
+    progress = float(np.clip(along, 0.0, speed) / max(speed, 1e-6))
+    upright = float(np.clip((float(tilt) - VEL_UPRIGHT) / VEL_UPRIGHT_SPAN, 0.0, 1.0))
+    over = float(np.clip(along - speed - 0.15, 0.0, 2.0))
+    return float(np.clip(VEL_REWARD_SCALE * progress * upright - over, -2.0, 2.0))
+
+
 def shaped_reward(
     *,
     z: float,
@@ -283,6 +319,7 @@ def shaped_reward(
     air_l: bool = False,
     air_r: bool = False,
     slip_foot: float = 0.0,
+    air_bonus: float = 0.0,
 ) -> float:
     """Dense stand-first reward. Terminal fall penalty is applied by the env."""
     r_alive = float(ALIVE_BONUS)
@@ -291,9 +328,10 @@ def shaped_reward(
     dv = np.asarray(v_b[:2], dtype=np.float64) - np.asarray(v_cmd, dtype=np.float64)
     vnorm = float(np.linalg.norm(v_cmd))
     vel_k = 8.0 if vnorm >= 0.08 else 2.0
-    r_vel = float(np.exp(-vel_k * float(np.sum(dv ** 2))))
     if vnorm >= 0.08:
-        r_vel *= float(np.clip((float(tilt) - VEL_TILT) / 0.06, 0.0, 1.0))
+        r_vel = moving_velocity_reward(v_b, v_cmd, tilt)
+    else:
+        r_vel = float(np.exp(-vel_k * float(np.sum(dv ** 2))))
     r_rate = float(np.clip(-RATE_COEF * float(np.sum(np.asarray(da, dtype=np.float64) ** 2)), -1.0, 0.0))
     r_acc = float(np.clip(-0.005 * float(np.sum(np.asarray(dda, dtype=np.float64) ** 2)), -1.0, 0.0))
     gx, gy = float(gyro[0]), float(gyro[1])
@@ -306,16 +344,15 @@ def shaped_reward(
     r_qvel = 0.0
     if qvel is not None and vnorm < 0.08:
         r_qvel = float(np.clip(-QVEL_COEF * float(np.sum(np.asarray(qvel, dtype=np.float64) ** 2)), -QVEL_CLIP, 0.0))
-    r_air = 0.0
+    r_air = float(air_bonus)
     r_slip = 0.0
     if vnorm >= 0.08:
-        n_air = int(bool(air_l)) + int(bool(air_r))
-        if n_air == 1:
-            r_air = float(AIR_COEF)
-        elif n_air == 2:
-            r_air = -float(AIR_COEF)
+        if air_l and air_r:
+            r_air -= float(AIR_COEF)
         r_slip = float(np.clip(-SLIP_COEF * float(slip_foot), -2.0, 0.0))
-    return float(r_alive + r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm + r_qvel + r_air + r_slip)
+    return float(
+        r_alive + r_h + r_up + r_vel + r_rate + r_acc + r_ang + r_lin + r_foot + r_arm + r_qvel + r_air + r_slip
+    )
 
 
 def foot_pitch_from_xmat(xmat) -> float:
@@ -330,10 +367,19 @@ def foot_world_xy_speed_sq(xmat, cvel) -> float:
     return float(v[0] * v[0] + v[1] * v[1])
 
 
-def build_obs(data, torso_id: int, q: np.ndarray, qd: np.ndarray, last_a: np.ndarray, cmd: np.ndarray) -> np.ndarray:
+def build_obs(
+    data,
+    torso_id: int,
+    q: np.ndarray,
+    qd: np.ndarray,
+    last_a: np.ndarray,
+    cmd: np.ndarray,
+    gait_phi: float = 0.0,
+) -> np.ndarray:
     grav, gyro = torso_imu(data, torso_id)
     q = np.asarray(q, dtype=np.float32).reshape(N_ACT)
     qd = np.asarray(qd, dtype=np.float32).reshape(N_ACT)
     last_a = np.asarray(last_a, dtype=np.float32).reshape(N_ACT)
     cmd = np.asarray(cmd, dtype=np.float32).reshape(L2_CMD_DIM)
-    return np.concatenate([grav, gyro, q - STAND_Q, qd, last_a, cmd]).astype(np.float32)
+    phase = np.array([np.sin(gait_phi), np.cos(gait_phi)], dtype=np.float32)
+    return np.concatenate([grav, gyro, q - STAND_Q, qd, last_a, cmd, phase]).astype(np.float32)

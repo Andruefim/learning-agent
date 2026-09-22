@@ -135,7 +135,7 @@ def eval_push_recovery(policy, *, device, model) -> dict:
 
 def eval_locomotion(policy, *, device, model, seconds: float = 10.0) -> dict:
     if WALK_ONLY:
-        cases = (("fwd", {CMD_VX: 0.30}),)
+        cases = (("fwd", {CMD_VX: 0.10}),)
     else:
         cases = (("fwd", {CMD_VX: 0.5}), ("back", {CMD_VX: -0.3}), ("yaw", {CMD_WZ: 0.5}))
     reports = []
@@ -155,7 +155,9 @@ def eval_locomotion(policy, *, device, model, seconds: float = 10.0) -> dict:
         raw = _rollout(policy, env, obs, ticks=ticks, device=device)
         progressed = True
         if name == "fwd":
-            progressed = float(raw.get("x_delta", 0.0)) > 0.4
+            # At the crawl curriculum target, require meaningful translation
+            # rather than the idle actor's ~0.07 m settling drift.
+            progressed = float(raw.get("x_delta", 0.0)) > (0.20 if WALK_ONLY else 0.4)
         elif name == "back":
             progressed = float(raw.get("x_delta", 0.0)) < -0.2
         ok = (not raw["fell"]) and raw["full"] and (not raw["nonfoot"]) and progressed

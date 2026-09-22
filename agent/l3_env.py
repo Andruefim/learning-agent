@@ -40,6 +40,7 @@ from agent.l3_cmd import (
 )
 from agent.l3_foundation import (
     ACT_DIM,
+    ACTION_FILTER_ALPHA,
     ARM_LEFT_FRAC,
     ARM_RIGHT_FRAC,
     CONTACT_Z_ELBOW,
@@ -68,6 +69,7 @@ from agent.l3_foundation import (
     body_xy,
     build_obs,
     com_err_xy,
+    foot_air_bonus,
     foot_pitch_from_xmat,
     foot_world_xy_speed_sq,
     heading_z,
@@ -243,7 +245,15 @@ class FoundationEnv:
         self._push_left = max(1, int(round(float(duration_sec) / self._policy_dt())))
 
     def _obs(self) -> np.ndarray:
-        return build_obs(self.data, self.torso_id, self._hinges(), self._qd(), self.last_a, self.cmd)
+        return build_obs(
+            self.data,
+            self.torso_id,
+            self._hinges(),
+            self._qd(),
+            self.last_a,
+            self.cmd,
+            self._gait_phi,
+        )
 
     def reset(self, cmd: np.ndarray | None = None) -> np.ndarray:
         mujoco.mj_resetData(self.model, self.data)
@@ -265,7 +275,8 @@ class FoundationEnv:
         self.prev_a = np.zeros(ACT_DIM, dtype=np.float32)
         self.cmd = stand_command() if cmd is None else np.asarray(cmd, dtype=np.float32).reshape(L2_CMD_DIM)
         self._cmd_frozen = cmd is not None
-        self._pushes = cmd is None
+        # First learn periodic support transfer. Random pushes are a later curriculum.
+        self._pushes = cmd is None and not WALK_ONLY
         self._horizon = cmd is None
         if cmd is None:
             self.cmd, self._squat_on, self._cmd_left = _sample_command(self._rng, self.stage)
@@ -316,7 +327,8 @@ class FoundationEnv:
             self.cmd = self.cmd.copy()
             self.cmd[CMD_H] = squat_cmd_height(self._squat_tick * self._policy_dt())
             self._squat_tick += 1
-        a = np.clip(np.asarray(action, dtype=np.float32).reshape(ACT_DIM), -1.0, 1.0)
+        raw_a = np.clip(np.asarray(action, dtype=np.float32).reshape(ACT_DIM), -1.0, 1.0)
+        a = self.last_a + np.float32(ACTION_FILTER_ALPHA) * (raw_a - self.last_a)
         self._gait_phi = advance_gait_phi(self._gait_phi, float(self.cmd[CMD_VX]), self._policy_dt())
         base = q_from_action(self.cmd, a, self._gait_phi)
         da = a - self.last_a
@@ -325,7 +337,14 @@ class FoundationEnv:
         vx = float(self.cmd[CMD_VX])
         self._maybe_push()
         for _ in range(DECIMATION):
-            off = com_err_xy(self.data, self.pelvis_id, self.r_fg, self.l_fg, vx)
+            off = com_err_xy(
+                self.data,
+                self.pelvis_id,
+                self.r_fg,
+                self.l_fg,
+                vx,
+                self._gait_phi,
+            )
             d_off = off - self._off_prev
             self._off_prev = off.copy()
             yaw = heading_z(self.data.qpos)
@@ -350,11 +369,15 @@ class FoundationEnv:
         gyro = self._omega()
         v_xy = np.asarray(self.data.qvel[0:2], dtype=np.float64)
         v_cmd = np.array([float(self.cmd[CMD_VX]), float(self.cmd[CMD_VY])], dtype=np.float64)
+        vnorm = float(np.linalg.norm(v_cmd))
         p_r = foot_pitch_from_xmat(self.data.xmat[self.r_foot_id])
         p_l = foot_pitch_from_xmat(self.data.xmat[self.l_foot_id])
         q = self._hinges()
         air_l = self._foot_air(self.l_geoms)
         air_r = self._foot_air(self.r_geoms)
+        air_bonus, self._air_l, self._air_r = foot_air_bonus(
+            self._air_l, self._air_r, air_l, air_r, vnorm >= 0.08
+        )
         slip_l = 0.0 if air_l else foot_world_xy_speed_sq(self.data.xmat[self.l_foot_id], self.data.cvel[self.l_foot_id])
         slip_r = 0.0 if air_r else foot_world_xy_speed_sq(self.data.xmat[self.r_foot_id], self.data.cvel[self.r_foot_id])
         reward = shaped_reward(
@@ -373,6 +396,7 @@ class FoundationEnv:
             air_l=air_l,
             air_r=air_r,
             slip_foot=slip_l + slip_r,
+            air_bonus=air_bonus,
         )
         fall = self._terminated()
         timeout = False
