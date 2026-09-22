@@ -137,6 +137,17 @@ def smoke() -> None:
         "сделай 5 шагов вперед",
     )
     assert walk is not None and walk.skill == "locomote" and walk.teacher().vx > 0.2 and walk.teacher().steps == 5, walk
+    queued = bot.planner._parse(
+        '{"instruction":"вперед потом руки","queue":[{"direction":"forward","speed":"medium","hold_s":3},{"pose":"t","vx":0,"hold_s":2}],"done":false}',
+        "вперед потом руки",
+    )
+    assert queued is not None and len(queued.queue) == 2, queued
+    from agent.l3_cmd import command_from_step
+
+    q0 = command_from_step(queued.queue[0])
+    q1 = command_from_step(queued.queue[1])
+    assert float(q0[0]) > 0.2 and abs(float(q1[0])) < 1e-6, (q0[0], q1[0])
+    assert abs(float(q1[5])) > 0.2, q1[4:8]
     both = bot.planner._parse(
         '{"instruction":"иди вперед и руки в стороны","skill":"locomote","params":{"direction":"forward","speed":"medium","pose":"t"},"done":false}',
         "иди вперед и руки в стороны",

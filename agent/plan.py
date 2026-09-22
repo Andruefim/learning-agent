@@ -118,12 +118,29 @@ def parse_requested_yaw(skill: str, params: dict | None) -> float | None:
     return sign * abs(val)
 
 
+_DROP_KEYS = {"cube", "reach_cube", "xyz", "object_xyz"}
+QUEUE_MAX = 6
+
+
+def _clean_dict(raw) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    clean = {}
+    for key, val in raw.items():
+        k = str(key).strip().lower()
+        if k in _DROP_KEYS:
+            continue
+        clean[k] = val
+    return clean
+
+
 @dataclass
 class Plan:
     instruction: str = "stand"
     skill: str = "hold"
     params: dict = field(default_factory=dict)
     done: bool = False
+    queue: list = field(default_factory=list)
 
     def __post_init__(self):
         self.instruction = str(self.instruction).strip() or "stand"
@@ -131,15 +148,15 @@ class Plan:
         if skill not in SKILL_TO_I:
             skill = "hold"
         self.skill = skill
-        raw = self.params if isinstance(self.params, dict) else {}
-        clean = {}
-        for key, val in raw.items():
-            k = str(key).strip().lower()
-            if k in {"cube", "reach_cube", "xyz", "object_xyz"}:
-                continue
-            clean[k] = val
-        self.params = clean
+        self.params = _clean_dict(self.params)
         self.done = bool(self.done)
+        steps = []
+        for item in self.queue if isinstance(self.queue, list) else []:
+            if isinstance(item, dict):
+                steps.append(_clean_dict(item))
+        if not steps:
+            steps = [{"skill": self.skill, "params": dict(self.params)}]
+        self.queue = steps[:QUEUE_MAX]
         self._teacher = decode_teacher(self.skill, self.params)
 
     def requested_yaw(self) -> float | None:
@@ -192,6 +209,21 @@ def skill_from_params(params: dict) -> str:
     if float(params.get("h", 1.0)) < 0.72:
         return "squat"
     if float(params.get("r_arm", 0.0)) > 0.2 or float(params.get("l_arm", 0.0)) > 0.2:
+        return "reach"
+    direction = str(params.get("direction", "")).strip().lower()
+    if direction in {"forward", "back", "backward", "назад", "вперед", "вперёд"}:
+        return "locomote"
+    if direction in {"left", "right", "налево", "направо", "cw"}:
+        return "turn"
+    if str(params.get("depth", "")).strip():
+        return "squat"
+    pose = str(params.get("pose", "")).strip().lower()
+    hands = str(params.get("hands") or params.get("hand") or "").strip().lower()
+    if hands == "down":
+        return "hold"
+    if pose == "clap":
+        return "wave"
+    if pose in {"t", "out", "sides"} or hands:
         return "reach"
     return "hold"
 

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from agent.config import STAND_Z
+from agent.config import SKILL_TO_I, STAND_Z
 from agent.h2 import ACTION_DIM, ARM_RAISE, arm_hang_cmd
-from agent.plan import Plan, TeacherIntent, parse_requested_yaw
+from agent.plan import Plan, TeacherIntent, parse_requested_yaw, skill_from_params
 
 # vx, vy, wz, h_m, 14 arm joints (actuator order, both arms)
 L2_CMD_DIM = ACTION_DIM
@@ -69,6 +69,35 @@ def command_from_intent(t: TeacherIntent, *, requested_yaw: float | None = None)
     cmd[CMD_H] = height_m(t.height)
     cmd[CMD_ARMS] = arm_targets(t)
     return cmd
+
+
+def command_from_step(step: dict, *, exec_bias: dict | None = None) -> np.ndarray:
+    """One queue frame. Numbers override the soft pose; arms may be 14 targets."""
+    step = step if isinstance(step, dict) else {}
+    nested = step.get("params") if isinstance(step.get("params"), dict) else {}
+    params = dict(nested)
+    for key in ("direction", "speed", "depth", "pose", "hand", "hands", "distance_hint", "foot", "angle", "steps"):
+        if key in step and key not in params:
+            params[key] = step[key]
+    skill = str(step.get("skill") or "").strip().lower()
+    if skill not in SKILL_TO_I:
+        hinted = dict(params)
+        if "vx" in step:
+            hinted["vx"] = float(step["vx"])
+        skill = skill_from_params(hinted)
+    cmd = command_from_plan(Plan(skill=skill, params=params), exec_bias=exec_bias)
+    if step.get("vx") is not None and "vx" in step:
+        cmd[CMD_VX] = float(step["vx"])
+    if step.get("vy") is not None and "vy" in step:
+        cmd[CMD_VY] = float(step["vy"])
+    if step.get("wz") is not None and "wz" in step:
+        cmd[CMD_WZ] = float(step["wz"])
+    if step.get("h_m") is not None:
+        cmd[CMD_H] = float(step["h_m"])
+    arms = step.get("arms")
+    if isinstance(arms, (list, tuple)) and len(arms) == ARM_DOF:
+        cmd[CMD_ARMS] = np.asarray(arms, dtype=np.float32)
+    return clip_command(cmd)
 
 
 def command_from_plan(plan: Plan, *, exec_bias: dict | None = None) -> np.ndarray:

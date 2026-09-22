@@ -23,6 +23,7 @@ from agent.config import (
     ROOT,
     SLEW,
     STAND_Z,
+    SKILL_TO_I,
     TRIAL_MAX,
     VISION_H,
     VISION_STRIDE,
@@ -45,7 +46,7 @@ from agent.h2 import (
     joint_limits,
 )
 from agent.joint_pd import compute_torques
-from agent.l3_cmd import CMD_ARMS, CMD_H, CMD_VX, CMD_VY, CMD_WZ, clip_command, command_from_plan, stand_command
+from agent.l3_cmd import CMD_ARMS, CMD_H, CMD_VX, CMD_VY, CMD_WZ, clip_command, command_from_step, stand_command
 from agent.l3_foundation import (
     ACTION_FILTER_ALPHA,
     DECIMATION,
@@ -60,9 +61,10 @@ from agent.l3_foundation import (
     q_from_action,
     advance_gait_phi,
 )
-from agent.plan import Plan, parse_requested_yaw, wrap_angle
+from agent.plan import Plan, parse_requested_yaw, skill_from_params, wrap_angle
 from agent.planner import Level1Planner
-from agent.policy import FlowPolicy, encode_instr, load_state, resolve_device
+from agent.policy import encode_instr, load_state, resolve_device
+from agent.s1 import CTX, HIST_DIM, N_RAYS, CommandTransformer
 from agent.trials import MultiTrialBuffer
 
 STEP_PERIOD = 0.55
@@ -94,7 +96,7 @@ class RobotEngine(FlywheelMixin):
         self.tau_hi = self.model.actuator_ctrlrange[:, 1].astype(np.float32)
         self.kp = KP.copy()
         self.kd = KD.copy()
-        self.policy = FlowPolicy().to(self.device)
+        self.policy = CommandTransformer().to(self.device)
         self.l3 = HumanoidFoundationPolicy(zero_out=True).to(self.device)
         self.l3.eval()
         self.planner = Level1Planner()
@@ -224,6 +226,9 @@ class RobotEngine(FlywheelMixin):
         self._last_a = np.zeros(N_ACT, dtype=np.float32)
         self._measure = None
         self._exec_bias = {}
+        self._reset_hist()
+        self._rays = np.ones(N_RAYS, dtype=np.float32)
+        self._load_queue(self.waypoint)
         self.status = "stand"
         self._kick_render = True
         if not keep_trials:
@@ -259,8 +264,97 @@ class RobotEngine(FlywheelMixin):
     def _feet_xy(self) -> np.ndarray:
         return 0.5 * (self.data.geom_xpos[self.r_fg, :2] + self.data.geom_xpos[self.l_fg, :2])
 
+    def _reset_hist(self) -> None:
+        self._hist = np.zeros((CTX, HIST_DIM), dtype=np.float32)
+        self._hist_n = 0
+
+    def _push_hist(self, cmd: np.ndarray, err: np.ndarray, rays: np.ndarray) -> None:
+        tok = np.zeros(HIST_DIM, dtype=np.float32)
+        tok[:ACTION_DIM] = np.asarray(cmd, dtype=np.float32).reshape(ACTION_DIM)
+        tok[ACTION_DIM : ACTION_DIM + 3] = np.asarray(err, dtype=np.float32).reshape(3)
+        tok[ACTION_DIM + 3 :] = np.asarray(rays, dtype=np.float32).reshape(N_RAYS)
+        if self._hist_n < CTX:
+            self._hist[self._hist_n] = tok
+            self._hist_n += 1
+        else:
+            self._hist[:-1] = self._hist[1:]
+            self._hist[-1] = tok
+
+    def _frame(self, step: dict) -> dict:
+        step = step if isinstance(step, dict) else {}
+        params = dict(step.get("params") or {})
+        for key in ("direction", "speed", "depth", "pose", "hand", "hands", "distance_hint", "foot", "angle", "steps"):
+            if key in step and key not in params:
+                params[key] = step[key]
+        skill = str(step.get("skill") or "").strip().lower()
+        if skill not in SKILL_TO_I:
+            hinted = dict(params)
+            if "vx" in step:
+                hinted["vx"] = float(step["vx"])
+            skill = skill_from_params(hinted)
+        mini = Plan(skill=skill, params=params)
+        cmd = command_from_step(step, exec_bias=self._exec_bias)
+        teacher = mini.teacher()
+        yaw = parse_requested_yaw(mini.skill, mini.params)
+        steps = int(teacher.steps)
+        if "hold_s" in step:
+            hold = float(step["hold_s"])
+        elif steps > 0 or yaw is not None:
+            hold = 30.0
+        else:
+            hold = 4.0
+        return {
+            "cmd": cmd,
+            "hold_s": hold,
+            "steps": steps,
+            "yaw": yaw,
+            "skill": mini.skill,
+            "r_arm": float(teacher.r_arm),
+            "l_arm": float(teacher.l_arm),
+            "wave": float(teacher.wave),
+            "kick": float(teacher.kick),
+            "height": float(teacher.height),
+            "intent_yaw": float(teacher.yaw),
+        }
+
+    def _load_queue(self, plan: Plan) -> None:
+        frames = [self._frame(step) for step in (plan.queue or [{"skill": "stand"}])]
+        self._queue = frames or [self._frame({"skill": "stand"})]
+        self._queue_i = 0
+        self._arm_queue_step(0)
+
+    def _arm_queue_step(self, index: int) -> None:
+        frame = self._queue[index]
+        self._steps_goal = int(frame["steps"])
+        self._step_count = 0
+        self._steps_done = 0
+        self._walk_ticks = 0
+        self._queue_tick0 = int(self._tick)
+        if frame["yaw"] is not None:
+            self._yaw_applied = 0.0
+            self._turn_heading0 = self._heading()
+            self._requested_yaw = float(frame["yaw"])
+        else:
+            self._turn_heading0 = None
+            self._requested_yaw = None
+
+    def _advance_queue(self) -> None:
+        if not getattr(self, "_queue", None) or self._queue_i >= len(self._queue) - 1:
+            return
+        frame = self._queue[self._queue_i]
+        elapsed = (int(self._tick) - int(self._queue_tick0)) * float(self.model.opt.timestep)
+        done = elapsed >= float(frame["hold_s"])
+        if int(frame["steps"]) > 0 and self._step_count >= int(frame["steps"]):
+            done = True
+        if frame["yaw"] is not None and self._turn_done():
+            done = True
+        if done:
+            self._queue_i += 1
+            self._arm_queue_step(self._queue_i)
+
     def _plan_command(self) -> np.ndarray:
-        cmd = command_from_plan(self.waypoint, exec_bias=self._exec_bias)
+        self._advance_queue()
+        cmd = np.array(self._queue[self._queue_i]["cmd"], dtype=np.float32, copy=True)
         if self._steps_goal > 0 and self._step_count >= self._steps_goal:
             cmd[CMD_VX] = 0.0
         if self.outcome == "fall":
@@ -287,22 +381,27 @@ class RobotEngine(FlywheelMixin):
     def scene_brief(self) -> dict:
         with self.lock:
             err = self._balance_err()
+            frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
+            cmd = frame["cmd"] if frame is not None else self._cmd
             return {
                 "pelvis_z": round(float(self._pelvis()[2]), 3),
                 "tilt": round(self._tilt_up(), 3),
                 "err": round(float(np.linalg.norm(err)), 3),
                 "outcome": self.outcome,
-                "skill": self.waypoint.skill,
-                "vx": round(self._active_vx(), 2),
-                "r_arm": round(self.waypoint.teacher().r_arm, 2),
-                "l_arm": round(self.waypoint.teacher().l_arm, 2),
-                "yaw": round(self.waypoint.teacher().yaw, 2),
+                "skill": frame["skill"] if frame is not None else self.waypoint.skill,
+                "vx": round(float(cmd[CMD_VX]), 2),
+                "r_arm": round(float(frame["r_arm"]) if frame is not None else self.waypoint.teacher().r_arm, 2),
+                "l_arm": round(float(frame["l_arm"]) if frame is not None else self.waypoint.teacher().l_arm, 2),
+                "yaw": round(float(frame["intent_yaw"]) if frame is not None else self.waypoint.teacher().yaw, 2),
                 "requested_yaw": None if self._requested_yaw is None else round(float(self._requested_yaw), 3),
                 "achieved_yaw": round(self._achieved_yaw(), 3),
                 "done": bool(self.waypoint.done or self._turn_done()),
-                "wave": round(self.waypoint.teacher().wave, 2),
-                "kick": round(self.waypoint.teacher().kick, 2),
+                "wave": round(float(frame["wave"]) if frame is not None else self.waypoint.teacher().wave, 2),
+                "kick": round(float(frame["kick"]) if frame is not None else self.waypoint.teacher().kick, 2),
                 "steps_left": max(0, self._steps_goal - self._step_count),
+                "queue_i": int(getattr(self, "_queue_i", 0)),
+                "queue_len": len(getattr(self, "_queue", []) or []),
+                "ahead_m": round(float(self._rays[0]) * 8.0, 2),
             }
 
     def _needs_home(self) -> bool:
@@ -341,6 +440,7 @@ class RobotEngine(FlywheelMixin):
                 self.intent = ""
                 self.status = "done"
                 self.waypoint = Plan.stand("hold")
+                self._load_queue(self.waypoint)
                 return
             jumped = (
                 abs(plan.teacher().height - self.waypoint.teacher().height) > 0.08
@@ -365,6 +465,22 @@ class RobotEngine(FlywheelMixin):
                     self._requested_yaw = req
                 self.goal = plan
             self.waypoint = plan
+            if fresh or not getattr(self, "_queue", None):
+                self._load_queue(plan)
+            elif len(plan.queue) == 1 and len(self._queue) == 1:
+                frame = self._frame(plan.queue[0])
+                had_yaw = self._queue[0]["yaw"] is not None
+                self._queue[0] = frame
+                self._steps_goal = int(frame["steps"])
+                if frame["yaw"] is not None and not had_yaw:
+                    self._yaw_applied = 0.0
+                    self._turn_heading0 = self._heading()
+                    self._requested_yaw = float(frame["yaw"])
+                elif frame["yaw"] is not None:
+                    self._requested_yaw = float(frame["yaw"])
+                else:
+                    self._turn_heading0 = None
+                    self._requested_yaw = None
             self.status = plan.instruction[:80]
             if fresh or jumped:
                 self._clear_errors()
@@ -374,6 +490,8 @@ class RobotEngine(FlywheelMixin):
             if self.l1_busy or not self.user_cmd:
                 return False
             if self._steps_goal > 0 and self._step_count < self._steps_goal:
+                return False
+            if getattr(self, "_queue", None) and self._queue_i < len(self._queue) - 1:
                 return False
             return (time.monotonic() - self.last_l1) >= L1_PERIOD
 
@@ -416,9 +534,11 @@ class RobotEngine(FlywheelMixin):
         self.ctrl_source = "l3"
         if self._tick % VISION_STRIDE == 0:
             self._eye_rgb = self._render_eye()
+            self._rays = self._head_rays()
         student = self._last_student
         if self.outcome != "fall" and self._tick % VISION_STRIDE == 0:
-            student = self._student(self._eye_rgb, proprio, language, z, errors)
+            hist = self._hist[: max(self._hist_n, 0)]
+            student = self._student(self._eye_rgb, proprio, language, z, errors, history=hist if self._hist_n else None)
             self._last_student = student
             mse = float(np.mean((student - teacher) ** 2))
             self.shadow_mse = mse
@@ -437,6 +557,7 @@ class RobotEngine(FlywheelMixin):
                     "stage": self.stage,
                     "skill": self.waypoint.skill,
                     "outcome": self.outcome,
+                    "rays": self._rays.tolist(),
                 }
             )
             if len(self.logs) > 4_000:
@@ -447,6 +568,9 @@ class RobotEngine(FlywheelMixin):
                 self.ctrl_source = f"l3+l2-{self.stage}"
         self._last_teacher = teacher
         self._cmd = chosen
+        if self._tick % VISION_STRIDE == 0:
+            err_now = self.errors[-1] if self.errors else np.zeros(3, dtype=np.float32)
+            self._push_hist(chosen, err_now, self._rays)
         if self.outcome != "fall" and self._tick % DECIMATION == 0:
             obs = build_obs(
                 self.data,
@@ -533,8 +657,48 @@ class RobotEngine(FlywheelMixin):
     def _render_eye(self) -> np.ndarray:
         if self.eye is None:
             self.eye = mujoco.Renderer(self.model, VISION_H, VISION_W)
-        self.eye.update_scene(self.data, camera="demo")
+        self.eye.update_scene(self.data, camera="head")
         return np.ascontiguousarray(self.eye.render())
+
+    def eye_jpeg(self) -> bytes:
+        with self.lock:
+            rgb = self._eye_rgb if self.eye is not None and int(self._eye_rgb.sum()) > 0 else self._render_eye()
+            buf = io.BytesIO()
+            Image.fromarray(rgb).save(buf, format="JPEG", quality=78)
+            return buf.getvalue()
+
+    def _head_rays(self) -> np.ndarray:
+        """Five distances in front of the head camera, scaled to 0..1 over 8 m."""
+        cam = int(self.model.camera("head").id)
+        origin = np.asarray(self.data.cam_xpos[cam], dtype=np.float64)
+        rot = np.asarray(self.data.cam_xmat[cam], dtype=np.float64).reshape(3, 3)
+        forward = -rot[:, 2]
+        right = rot[:, 0]
+        up = rot[:, 1]
+        dirs = (
+            forward,
+            forward + 0.45 * right,
+            forward - 0.45 * right,
+            forward + 0.30 * up,
+            forward - 0.30 * up,
+        )
+        out = np.ones(N_RAYS, dtype=np.float32)
+        geomid = np.zeros(1, dtype=np.int32)
+        for i, direction in enumerate(dirs):
+            vec = direction / max(float(np.linalg.norm(direction)), 1e-8)
+            dist = mujoco.mj_ray(
+                self.model,
+                self.data,
+                origin,
+                vec,
+                None,
+                1,
+                int(self.pelvis_id),
+                geomid,
+            )
+            if dist >= 0.0:
+                out[i] = float(np.clip(dist / 8.0, 0.0, 1.0))
+        return out
 
     def jpeg(self) -> bytes:
         with self.lock:
@@ -588,11 +752,11 @@ class RobotEngine(FlywheelMixin):
                 "shadow_mse_ema": None if self.shadow_mse_ema is None else round(float(self.shadow_mse_ema), 4),
                 "fall_rate": round(self._fall_rate(), 3),
                 "replay": int(self._replay_count()),
-                "height": round(self.waypoint.teacher().height, 2),
+                "height": round(float(self._queue[self._queue_i]["height"]) if getattr(self, "_queue", None) else self.waypoint.teacher().height, 2),
                 "vx": round(self._active_vx(), 2),
-                "r_arm": round(self.waypoint.teacher().r_arm, 2),
-                "l_arm": round(self.waypoint.teacher().l_arm, 2),
-                "yaw": round(self.waypoint.teacher().yaw, 2),
+                "r_arm": round(float(self._queue[self._queue_i]["r_arm"]) if getattr(self, "_queue", None) else self.waypoint.teacher().r_arm, 2),
+                "l_arm": round(float(self._queue[self._queue_i]["l_arm"]) if getattr(self, "_queue", None) else self.waypoint.teacher().l_arm, 2),
+                "yaw": round(float(self._queue[self._queue_i]["intent_yaw"]) if getattr(self, "_queue", None) else self.waypoint.teacher().yaw, 2),
                 "yaw_applied": round(float(self._yaw_applied), 3),
                 "requested_yaw": None if self._requested_yaw is None else round(float(self._requested_yaw), 3),
                 "achieved_yaw": round(self._achieved_yaw(), 3),
@@ -606,8 +770,10 @@ class RobotEngine(FlywheelMixin):
                 "l1_url": self.planner.base_url,
                 "l1_err": self.planner.last_err,
                 "status": self.status,
-                "skill": self.waypoint.skill,
+                "skill": self._queue[self._queue_i]["skill"] if getattr(self, "_queue", None) else self.waypoint.skill,
                 "params": self.waypoint.params,
+                "queue_i": int(getattr(self, "_queue_i", 0)),
+                "queue_len": len(getattr(self, "_queue", []) or []),
                 "trials": [t.as_public(i + 1) for i, t in enumerate(self.trials.items())],
             }
 

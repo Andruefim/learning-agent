@@ -85,7 +85,7 @@ async def _run_l1(bot: RobotEngine, text: str, *, fresh: bool) -> Plan:
     cmd = text.strip()
     try:
         scene = bot.scene_brief()
-        plan, ok = await bot.planner.plan(cmd, scene, bot.jpeg())
+        plan, ok = await bot.planner.plan(cmd, scene, bot.eye_jpeg())
         if bot.intent == cmd:
             bot.apply_plan(plan, fresh=fresh, l1_ok=ok)
         return plan
@@ -111,7 +111,7 @@ async def ws(sock: WebSocket):
                     plan = await _run_l1(bot, text, fresh=True)
                     tel = bot.telemetry()
                     if tel["l1_ok"]:
-                        note = f"skill={plan.skill} params={plan.params}"
+                        note = f"queue={len(plan.queue)} skill={plan.skill} params={plan.params}"
                     else:
                         note = "stand (L1 " + (tel.get("l1_err") or "offline") + ")"
                     await sock.send_json(

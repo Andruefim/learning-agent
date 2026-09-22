@@ -70,11 +70,13 @@ class Level1Planner:
             return None
         try:
             params = data.get("params") if isinstance(data.get("params"), dict) else {}
+            queue = data.get("queue") if isinstance(data.get("queue"), list) else []
             return Plan(
                 instruction=str(data.get("instruction") or user_command),
                 skill=str(data.get("skill") or "hold"),
                 params=params,
                 done=bool(data.get("done", False)),
+                queue=queue,
             )
         except (TypeError, ValueError):
             return None
@@ -84,10 +86,12 @@ class Level1Planner:
             "You are the slow planner for a standing humanoid. The image is the camera.\n"
             "The foundation controller balances at control rate. If outcome is fall or failed: "
             'done=true, skill="hold", params={}. Do not invent a recovery gait.\n'
-            "Reply JSON with keys instruction, skill, params, done.\n"
-            "skill is one of: hold, stand, squat, locomote, turn, wave, kick, reach.\n"
-            "params is a SOFT dictionary of words, not motor ticks. No absolute coordinates, "
-            "no object names, no cube. L2 turns skill+params into motion.\n"
+            "Reply JSON with keys instruction, queue, done. skill and params are optional.\n"
+            "queue is an ordered list of command frames, at most 6. Each frame may set "
+            "vx (m/s), wz, h_m (pelvis height in meters), hold_s (seconds), pose, hand, hands, "
+            "direction, speed, depth. Do not pick a single skill name when the sentence has "
+            "several parts: write them as successive frames. The body already balances.\n"
+            "A frame without a skill is valid. vx, height and arms are one command.\n"
             "Examples:\n"
             '  "сделай 5 шагов вперед" → {"skill":"locomote","params":{"direction":"forward","speed":"medium","distance_hint":"5"}}\n'
             '  "иди вперёд" → {"skill":"locomote","params":{"direction":"forward","speed":"medium"}}\n'
@@ -107,12 +111,22 @@ class Level1Planner:
             '  "иди вперед и руки в стороны" → {"skill":"locomote","params":{"direction":"forward","speed":"medium","pose":"t"}}\n'
             '  "присядь и подними руки" → {"skill":"squat","params":{"depth":"low","hand":"both"}}\n'
             '  "иди назад и подними правую руку" → {"skill":"locomote","params":{"direction":"backward","speed":"medium","hand":"right"}}\n'
+            "Prefer queue when the command is a sequence:\n"
+            '  "иди вперед, потом руки в стороны, потом стой" → {"instruction":"вперед, руки, стой","queue":['
+            '{"direction":"forward","speed":"medium","hold_s":3},'
+            '{"pose":"t","vx":0,"hold_s":2},'
+            '{"vx":0,"hands":"down","hold_s":2}],"done":false}\n'
+            '  "подними руки и иди вперед" → {"instruction":"руки и вперед","queue":['
+            '{"hand":"both","vx":0.4,"hold_s":4}],"done":false}\n'
             "If the scene has requested_yaw and achieved_yaw: keep skill=turn and done=false until "
             "|achieved_yaw-requested_yaw| is small; then done=true, skill=hold.\n"
             f"Now: pelvis_z={scene.get('pelvis_z')} tilt={scene.get('tilt')} "
             f"outcome={scene.get('outcome')} skill={scene.get('skill')} "
+            f"queue={scene.get('queue_i')}/{scene.get('queue_len')} ahead_m={scene.get('ahead_m')} "
             f"requested_yaw={scene.get('requested_yaw')} achieved_yaw={scene.get('achieved_yaw')} "
             f"done={scene.get('done')}\n"
+            "ahead_m is clear space in front of the head camera. "
+            "If queue is not yet on its last frame, keep the same queue and done=false.\n"
             f"User command: {user_command}\n"
             "JSON only. instruction is a short paraphrase of THIS command."
         )
@@ -125,7 +139,7 @@ class Level1Planner:
             "stream": False,
             "format": "json",
             "think": False,
-            "options": {"temperature": 0, "num_ctx": 2048, "num_predict": 256, "think": False},
+            "options": {"temperature": 0, "num_ctx": 2048, "num_predict": 512, "think": False},
         }
         try:
             import httpx

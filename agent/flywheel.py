@@ -35,7 +35,8 @@ from agent.config import (
 from agent.h2 import ACTION_DIM, ARM_RAISE, L_HY, L_KN, L_SH, N_ACT, R_HY, R_KN, R_SH, STAND_Q, SQUAT_Q, TRIAL_FEAT
 from agent.l3_cmd import clip_command
 from agent.plan import Plan, evaluate_trial, plan_to_params
-from agent.policy import FlowPolicy, encode_instr
+from agent.policy import encode_instr
+from agent.s1 import N_RAYS, CommandTransformer
 from agent.trials import Trial
 
 
@@ -57,9 +58,14 @@ class FlywheelMixin:
             feat,
         )
 
-    def _student(self, image, proprio, language, z, errors) -> np.ndarray:
+    def _student(self, image, proprio, language, z, errors, history=None) -> np.ndarray:
+        hist = None
+        if history is not None and len(history):
+            hist = torch.as_tensor(history, device=self.device, dtype=torch.float32).reshape(1, -1, history.shape[-1])
         with torch.no_grad():
-            chunk = self.policy.sample(*self._obs_tensors(image, proprio, language, z, errors))
+            chunk = self.policy.sample(
+                *self._obs_tensors(image, proprio, language, z, errors), history=hist, steps=1
+            )
         act = chunk[0, 0].cpu().numpy().astype(np.float32)
         return clip_command(act)
 
@@ -389,11 +395,18 @@ class FlywheelMixin:
             "z": np.array([r["z"] for r in rows], dtype=np.float32),
             "errors": np.array([r["errors"] for r in rows], dtype=np.float32),
             "action": np.array([r["action"] for r in rows], dtype=np.float32),
+            "rays": np.array(
+                [r.get("rays", np.ones(N_RAYS, dtype=np.float32)) for r in rows],
+                dtype=np.float32,
+            ),
         }
         if self.replay_path.exists():
             old = np.load(self.replay_path)
             if self._replay_compatible(old):
-                pack = {k: np.concatenate([old[k], pack[k]], axis=0)[-8_000:] for k in pack}
+                merged = {k: np.concatenate([old[k], pack[k]], axis=0)[-8_000:] for k in pack if k in old and k != "rays"}
+                old_rays = old["rays"] if "rays" in old else np.ones((len(old["action"]), N_RAYS), dtype=np.float32)
+                merged["rays"] = np.concatenate([old_rays, pack["rays"]], axis=0)[-8_000:]
+                pack = merged
         np.savez_compressed(self.replay_path, **pack)
         self._replay_n = int(pack["action"].shape[0])
 
@@ -405,7 +418,7 @@ class FlywheelMixin:
             return None
         return blob
 
-    def _fit_cfm(self, policy, optimizer, images, proprio, language, z, errors, actions, steps: int = 100) -> float:
+    def _fit_cfm(self, policy, optimizer, images, proprio, language, z, errors, actions, rays=None, steps: int = 100) -> float:
         policy.train()
         last = 0.0
         n = len(actions)
@@ -413,8 +426,15 @@ class FlywheelMixin:
         for _ in range(steps):
             starts = torch.randint(0, n - CHUNK + 1, (bs,), device=self.device)
             idx = starts[:, None] + torch.arange(CHUNK, device=self.device)
+            ray_b = None if rays is None else rays[idx]
             loss = policy.cfm_loss(
-                images[starts], proprio[starts], language[starts], z[starts], errors[starts], actions[idx]
+                images[starts],
+                proprio[starts],
+                language[starts],
+                z[starts],
+                errors[starts],
+                actions[idx],
+                rays=ray_b,
             )
             optimizer.zero_grad()
             loss.backward()
@@ -431,7 +451,11 @@ class FlywheelMixin:
         z = torch.as_tensor(blob["z"][-cap:], device=self.device, dtype=torch.float32)
         errors = torch.as_tensor(blob["errors"][-cap:], device=self.device, dtype=torch.float32)
         actions = torch.as_tensor(blob["action"][-cap:], device=self.device, dtype=torch.float32)
-        return images, proprio, language, z, errors, actions
+        if "rays" in blob:
+            rays = torch.as_tensor(blob["rays"][-cap:], device=self.device, dtype=torch.float32)
+        else:
+            rays = torch.ones(actions.shape[0], N_RAYS, device=self.device, dtype=torch.float32)
+        return images, proprio, language, z, errors, actions, rays
 
     def evaluate_h1(self) -> dict:
         blob = self._load_replay()
@@ -440,7 +464,7 @@ class FlywheelMixin:
             self.student_drive = False
             self.h1_report = {"h1": False, "reason": "need replay", **H1_SPEC}
             return self.h1_report
-        images, proprio, language, z, errors, actions = self._replay_tensors(blob)
+        images, proprio, language, z, errors, actions, rays = self._replay_tensors(blob)
         n = len(actions)
         split = max(CHUNK + 8, int(n * 0.8))
         ev = slice(split, n)
@@ -448,8 +472,18 @@ class FlywheelMixin:
             ev = slice(max(0, n - 32), n)
         zeros = torch.zeros_like(errors)
         shuffled = errors[torch.randperm(n, device=self.device)]
-        abl = FlowPolicy().to(self.device)
-        self._fit_cfm(abl, torch.optim.AdamW(abl.parameters(), lr=1e-3), images, proprio, language, z, shuffled, actions)
+        abl = CommandTransformer().to(self.device)
+        self._fit_cfm(
+            abl,
+            torch.optim.AdamW(abl.parameters(), lr=1e-3),
+            images,
+            proprio,
+            language,
+            z,
+            shuffled,
+            actions,
+            rays,
+        )
 
         def first_action(policy, err):
             with torch.no_grad():
