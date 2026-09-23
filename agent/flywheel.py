@@ -25,6 +25,7 @@ from agent.config import (
     SHADOW_MSE_MAX,
     SKILL_IDS,
     SKILL_TO_I,
+    STAND_Z,
     TRIAL_MAX,
     TURN_IN_CONTEXT_OK,
     VISION_H,
@@ -32,8 +33,28 @@ from agent.config import (
     VISION_W,
     Z_DIM,
 )
-from agent.h2 import ACTION_DIM, ARM_RAISE, L_HY, L_KN, L_SH, N_ACT, R_HY, R_KN, R_SH, STAND_Q, SQUAT_Q, TRIAL_FEAT
+from agent.h2 import (
+    ACTION_DIM,
+    ARM_RAISE,
+    L_HY,
+    L_KN,
+    L_SH,
+    N_ACT,
+    R_HY,
+    R_KN,
+    R_SH,
+    STAND_Q,
+    SQUAT_Q,
+    TRIAL_FEAT,
+    arm_hang_cmd,
+)
 from agent.l3_cmd import clip_command
+
+# Quiet time after a finished command before one sleep. The idle tail is not the lesson.
+SLEEP_QUIET_S = 5.0
+SLEEP_MIN_FRAMES = 32
+SLEEP_FIT_STEPS = 40
+SLEEP_TAIL = 40
 from agent.plan import Plan, evaluate_trial, plan_to_params
 from agent.policy import encode_instr
 from agent.s1 import N_RAYS, CommandTransformer
@@ -517,6 +538,127 @@ class FlywheelMixin:
             "fall_rate": round(self._fall_rate(), 3),
         }
         return self.h1_report
+
+    def _trim_idle_tail(self, rows: list[dict]) -> list[dict]:
+        """Keep the command, plus a short stand after it. A pure stand is not a lesson."""
+        if not rows:
+            return []
+        hang = arm_hang_cmd()
+        last_motion = -1
+        for i, row in enumerate(rows):
+            if row.get("outcome") == "fall":
+                return []
+            action = np.asarray(row["action"], dtype=np.float32).reshape(-1)
+            idle = (
+                max(abs(float(action[0])), abs(float(action[1])), abs(float(action[2]))) < 0.05
+                and abs(float(action[3]) - float(STAND_Z)) < 0.04
+                and float(np.max(np.abs(action[4:18] - hang))) < 0.45
+            )
+            if not idle:
+                last_motion = i
+        if last_motion < 0:
+            return []
+        return rows[: min(len(rows), last_motion + 1 + SLEEP_TAIL)]
+
+    def _train_rows(self, rows: list[dict]) -> str:
+        """Fit the command transformer on one successful episode. Physics is paused by the caller."""
+        self._save_replay(rows)
+        blob = self._load_replay()
+        if blob is None or len(blob["action"]) < CHUNK:
+            return "Сон: повтор слишком короткий."
+        n = len(blob["action"])
+        tensors = self._replay_tensors(blob)
+        last = self._fit_cfm(self.policy, self.optimizer, *tensors, steps=SLEEP_FIT_STEPS)
+        torch.save(self.policy.state_dict(), self.ckpt)
+        self.baked = True
+        self.student_drive = False
+        self._sleeps = int(getattr(self, "_sleeps", 0)) + 1
+        h1 = ""
+        if n >= 64 and self._sleeps % 4 == 0:
+            report = self.evaluate_h1()
+            h1 = f" · H1={'pass' if report.get('h1') else 'fail'}"
+        return f"Сон: {len(rows)} кадров попытки, повтор {n}, loss {last:.4f}{h1}"
+
+    def _note(self, text: str) -> None:
+        notes = getattr(self, "_notes", None)
+        if notes is None:
+            self._notes = []
+            notes = self._notes
+        notes.append(text)
+        del notes[:-20]
+
+    def pop_notes(self) -> list[str]:
+        with self.lock:
+            notes = list(getattr(self, "_notes", ()))
+            self._notes = []
+            return notes
+
+    def _drop_failed_episode(self) -> None:
+        if self._ep_failed:
+            return
+        self._ep_failed = True
+        self._quiet_tick = None
+        self.logs = self.logs[: self._ep_i]
+        if self._ep_armed:
+            self._note("Сон пропущен: падение, попытка не записана.")
+
+    def _enqueue_episode(self) -> None:
+        if self._ep_slept or self._ep_failed or not self._ep_armed:
+            return
+        rows = self._trim_idle_tail(self.logs[self._ep_i :])
+        self.logs = self.logs[: self._ep_i]
+        self._ep_i = len(self.logs)
+        self._ep_slept = True
+        self._quiet_tick = None
+        if len(rows) >= SLEEP_MIN_FRAMES:
+            self._sleep_jobs.append(rows)
+        else:
+            self._note("Сон пропущен: в попытке мало движения.")
+
+    def _finish_episode(self, *, train: bool) -> None:
+        """Close the current command. A fall or an already-slept episode is discarded."""
+        if train and self._ep_armed and not self._ep_failed and not self._ep_slept:
+            self._enqueue_episode()
+            return
+        self.logs = self.logs[: self._ep_i]
+        self._ep_i = len(self.logs)
+
+    def _attempt_done(self) -> bool:
+        """The queue has reached a frame that is no longer asking the robot to travel."""
+        if not self._ep_armed or self._ep_slept or self._ep_failed or self._trial_busy:
+            return False
+        if self.outcome == "fall" or not getattr(self, "_queue", None):
+            return False
+        if self._queue_i < len(self._queue) - 1:
+            return False
+        if int(self._queue_tick0) < int(self._ep_tick0):
+            return False
+        frame = self._queue[self._queue_i]
+        elapsed = (int(self._tick) - int(self._queue_tick0)) * float(self.model.opt.timestep)
+        held = elapsed >= float(frame["hold_s"])
+        if int(frame["steps"]) > 0 and self._step_count >= int(frame["steps"]):
+            held = True
+        if frame["yaw"] is not None and self._turn_done():
+            held = True
+        cmd = np.asarray(frame["cmd"], dtype=np.float64)
+        traveling = max(abs(float(cmd[0])), abs(float(cmd[1])), abs(float(cmd[2]))) > 0.05
+        if traveling:
+            return False
+        return bool(held)
+
+    def _consider_sleep(self) -> None:
+        if self._trial_busy or self._ep_failed or not self._ep_armed or self._ep_slept:
+            self._quiet_tick = None
+            return
+        if not self._attempt_done() or self._fell():
+            self._quiet_tick = None
+            return
+        if self._quiet_tick is None:
+            self._quiet_tick = int(self._tick)
+            return
+        quiet = (int(self._tick) - int(self._quiet_tick)) * float(self.model.opt.timestep)
+        if quiet >= SLEEP_QUIET_S:
+            self._enqueue_episode()
 
     def consolidate(self) -> str:
         with self.lock:

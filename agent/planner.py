@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 from agent.plan import Plan
+from agent.reach import attach_reach
 
 
 def _wsl_windows_host() -> str | None:
@@ -71,13 +72,15 @@ class Level1Planner:
         try:
             params = data.get("params") if isinstance(data.get("params"), dict) else {}
             queue = data.get("queue") if isinstance(data.get("queue"), list) else []
-            return Plan(
+            plan = Plan(
                 instruction=str(data.get("instruction") or user_command),
                 skill=str(data.get("skill") or "hold"),
                 params=params,
                 done=bool(data.get("done", False)),
                 queue=queue,
             )
+            attach_reach(plan, user_command)
+            return plan
         except (TypeError, ValueError):
             return None
 
@@ -92,6 +95,10 @@ class Level1Planner:
             "direction, speed, depth. Do not pick a single skill name when the sentence has "
             "several parts: write them as successive frames. The body already balances.\n"
             "A frame without a skill is valid. vx, height and arms are one command.\n"
+            "Putting a hand on a body part is not a skill name. Write hand_goal "
+            '{hand: left|right|both, target: head} on that frame. Do not answer hold.\n'
+            '  "положи левую руку на голову" → {"instruction":"левая рука на голову","queue":['
+            '{"hand_goal":{"hand":"left","target":"head"},"vx":0,"hold_s":4}],"done":false}\n'
             "Examples:\n"
             '  "сделай 5 шагов вперед" → {"skill":"locomote","params":{"direction":"forward","speed":"medium","distance_hint":"5"}}\n'
             '  "иди вперёд" → {"skill":"locomote","params":{"direction":"forward","speed":"medium"}}\n'

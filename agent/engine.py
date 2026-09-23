@@ -62,6 +62,7 @@ from agent.l3_foundation import (
     advance_gait_phi,
 )
 from agent.plan import Plan, parse_requested_yaw, skill_from_params, wrap_angle
+from agent.reach import attach_reach, reach_goal_from_step, servo_reach, solve_arm
 from agent.planner import Level1Planner
 from agent.policy import encode_instr, load_state, resolve_device
 from agent.s1 import CTX, HIST_DIM, N_RAYS, CommandTransformer
@@ -145,6 +146,17 @@ class RobotEngine(FlywheelMixin):
         self.l1_ok = True
         self.l1_busy = False
         self.logs: list[dict] = []
+        self._notes: list[str] = []
+        self._sleep_jobs: list[list] = []
+        self._sleeps = 0
+        self._ep_i = 0
+        self._ep_tick0 = 0
+        self._ep_armed = False
+        self._ep_slept = False
+        self._ep_failed = False
+        self._quiet_tick: int | None = None
+        self._reach_sol: np.ndarray | None = None
+        self._reach_tick = -10**9
         self.ctrl_source = "l3"
         self._jpeg = b""
         self._eye_rgb = np.zeros((VISION_H, VISION_W, 3), dtype=np.uint8)
@@ -243,6 +255,11 @@ class RobotEngine(FlywheelMixin):
     def reset_sim(self):
         with self.lock:
             self._trial_busy = False
+            self._finish_episode(train=False)
+            self._ep_armed = False
+            self._ep_slept = False
+            self._ep_failed = False
+            self._quiet_tick = None
             self._home()
             self.status = "reset"
 
@@ -315,9 +332,24 @@ class RobotEngine(FlywheelMixin):
             "kick": float(teacher.kick),
             "height": float(teacher.height),
             "intent_yaw": float(teacher.yaw),
+            "reach": reach_goal_from_step(step),
         }
 
+    def _servo_reach(self, cmd: np.ndarray) -> np.ndarray:
+        frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
+        goal = frame.get("reach") if frame else None
+        if not goal or self.outcome == "fall":
+            self._reach_sol = None
+            return cmd
+        if self._reach_sol is None or int(self._tick) - int(self._reach_tick) >= 300:
+            self._reach_sol = solve_arm(self.model, self.data, goal, self.qadr, self.vadr)
+            self._reach_tick = int(self._tick)
+        return servo_reach(self.model, self.data, cmd, goal, self.qadr, self._reach_sol)
+
     def _load_queue(self, plan: Plan) -> None:
+        attach_reach(plan, self.user_cmd or plan.instruction)
+        self._reach_sol = None
+        self._reach_tick = -10**9
         frames = [self._frame(step) for step in (plan.queue or [{"skill": "stand"}])]
         self._queue = frames or [self._frame({"skill": "stand"})]
         self._queue_i = 0
@@ -411,7 +443,16 @@ class RobotEngine(FlywheelMixin):
         with self.lock:
             text = text.strip()
             if self._needs_home():
+                self._ep_failed = True
+                self._finish_episode(train=False)
                 self._home()
+            else:
+                self._finish_episode(train=True)
+            self._ep_armed = True
+            self._ep_slept = False
+            self._ep_failed = False
+            self._quiet_tick = None
+            self._ep_tick0 = int(self._tick)
             self.intent = text
             self.user_cmd = text
             self.l1_ok = True
@@ -467,6 +508,7 @@ class RobotEngine(FlywheelMixin):
             self.waypoint = plan
             if fresh or not getattr(self, "_queue", None):
                 self._load_queue(plan)
+                self._quiet_tick = None
             elif len(plan.queue) == 1 and len(self._queue) == 1:
                 frame = self._frame(plan.queue[0])
                 had_yaw = self._queue[0]["yaw"] is not None
@@ -529,7 +571,7 @@ class RobotEngine(FlywheelMixin):
         language = encode_instr(self.waypoint.param_text())
         z = self.waypoint.z()
         errors = np.stack(self.errors)
-        teacher = self._plan_command()
+        teacher = self._servo_reach(self._plan_command())
         chosen = teacher
         self.ctrl_source = "l3"
         if self._tick % VISION_STRIDE == 0:
@@ -561,13 +603,15 @@ class RobotEngine(FlywheelMixin):
                 }
             )
             if len(self.logs) > 4_000:
-                self.logs = self.logs[-3_000:]
+                drop = len(self.logs) - 3_000
+                self.logs = self.logs[drop:]
+                self._ep_i = max(0, int(self._ep_i) - drop)
         if self.outcome != "fall":
             chosen = self._mix(teacher, student)
             if self.alpha > 1e-8:
                 self.ctrl_source = f"l3+l2-{self.stage}"
         self._last_teacher = teacher
-        self._cmd = chosen
+        self._cmd = self._servo_reach(chosen)
         if self._tick % VISION_STRIDE == 0:
             err_now = self.errors[-1] if self.errors else np.zeros(3, dtype=np.float32)
             self._push_hist(chosen, err_now, self._rays)
@@ -610,7 +654,8 @@ class RobotEngine(FlywheelMixin):
         cmd_v = np.array([self._cmd[CMD_VX], self._cmd[CMD_VY], self._cmd[CMD_WZ]], dtype=np.float32)
         # Arms forward move the mass past the toes. The stiff stand cannot
         # catch that; the walk net can, by stepping, so it stays in the loop.
-        arms_out = float(np.max(np.abs(self._cmd[CMD_ARMS] - arm_hang_cmd()))) > 0.45
+        reaching = bool(getattr(self, "_queue", None) and self._queue[self._queue_i].get("reach"))
+        arms_out = reaching or float(np.max(np.abs(self._cmd[CMD_ARMS] - arm_hang_cmd()))) > 0.45
         if self.walk is not None:
             leg = self.walk.leg_torque(
                 self.data,
@@ -633,6 +678,8 @@ class RobotEngine(FlywheelMixin):
         elif self.walk is not None and self.walk.holding:
             self.walk.reset()
         if self._fell():
+            if self.outcome != "fall":
+                self._drop_failed_episode()
             self.outcome = "fall"
         elif (
             self.outcome == "fall"
@@ -645,6 +692,7 @@ class RobotEngine(FlywheelMixin):
             self._poll_measure()
         self._update_steps()
         self._tick += 1
+        self._consider_sleep()
 
     def _render(self):
         if self.renderer is None:
@@ -781,6 +829,7 @@ class RobotEngine(FlywheelMixin):
         self._render()
         n = 0
         while not stop.is_set():
+            job = None
             with self.lock:
                 if not self._trial_busy:
                     self.step()
@@ -791,6 +840,17 @@ class RobotEngine(FlywheelMixin):
                             self._render()
                         except Exception:
                             pass
+                if self._sleep_jobs:
+                    job = self._sleep_jobs.pop(0)
+            if job is not None:
+                try:
+                    msg = self._train_rows(job)
+                except Exception as exc:
+                    msg = f"Сон прерван: {exc}"
+                    self.policy.eval()
+                with self.lock:
+                    self.policy.eval()
+                    self._note(msg)
             stop.wait(self.model.opt.timestep)
 
     def close(self):

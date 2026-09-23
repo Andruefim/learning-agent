@@ -118,5 +118,5 @@ H1_SPEC = {
         "Future Safety-Shield only: alpha->1 with takeover on fall trend (tilt/z). "
         "Static tilt<0.8 / e>4*TRACK_OK are too late."
     ),
-    "weights": "Updated only on Save/Consolidate (offline CFM). Runtime eval(), 0 backprop.",
+    "weights": "Updated in automatic sleep after a successful command. Runtime eval(), 0 backprop.",
 }

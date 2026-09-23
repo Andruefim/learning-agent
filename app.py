@@ -111,16 +111,15 @@ async def ws(sock: WebSocket):
                     plan = await _run_l1(bot, text, fresh=True)
                     tel = bot.telemetry()
                     if tel["l1_ok"]:
+                        goal = plan.params.get("hand_goal")
                         note = f"queue={len(plan.queue)} skill={plan.skill} params={plan.params}"
+                        if goal:
+                            note += f" goal={goal}"
                     else:
                         note = "stand (L1 " + (tel.get("l1_err") or "offline") + ")"
                     await sock.send_json(
                         {"type": "log", "text": f"«{text}» → {plan.instruction} · {note}"}
                     )
-                elif kind == "consolidate":
-                    await sock.send_json({"type": "log", "text": "Save: training flow on replay…"})
-                    msg = await asyncio.to_thread(bot.consolidate)
-                    await sock.send_json({"type": "log", "text": msg})
                 elif kind == "reset":
                     await asyncio.to_thread(bot.reset_sim)
                     await sock.send_json({"type": "log", "text": "Reset · spawn."})
@@ -144,6 +143,8 @@ async def ws(sock: WebSocket):
                 plan = await _run_l1(bot, bot.user_cmd, fresh=False)
                 if plan.done:
                     await sock.send_json({"type": "log", "text": "L1: done"})
+            for note in bot.pop_notes():
+                await sock.send_json({"type": "log", "text": note})
             await sock.send_json(bot.telemetry())
     except WebSocketDisconnect:
         return
