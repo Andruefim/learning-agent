@@ -193,6 +193,78 @@ def plan_to_params(plan: Plan) -> dict[str, float]:
     }
 
 
+def _frame_has_arms(step: dict) -> bool:
+    params = step.get("params") if isinstance(step.get("params"), dict) else {}
+    for key in ("hand", "hands", "pose", "hand_goal"):
+        if step.get(key) or params.get(key):
+            return True
+    return False
+
+
+def arm_channel_from_text(text: str) -> dict | None:
+    """Which arm channel the sentence named. Joint angles stay in the arm controller."""
+    raw = str(text or "").lower().replace("ё", "е")
+    from agent.reach import reach_goal_from_text
+
+    if reach_goal_from_text(raw):
+        return None
+    up = any(v in raw for v in ("подними", "поднять", "поднимите", "raise"))
+    down = any(v in raw for v in ("опусти", "опустить", "опустите"))
+    if not up and not down:
+        return None
+    if not any(w in raw for w in ("рук", "hand", "arm")):
+        return None
+    if down and not up:
+        return {"hands": "down"}
+    if any(w in raw for w in ("правую", "правая", "правой", "right")):
+        return {"hand": "right"}
+    if any(w in raw for w in ("левую", "левая", "левой", "left")):
+        return {"hand": "left"}
+    return {"hand": "both"}
+
+
+def _mirror_arm_fields(plan, step: dict) -> None:
+    params = step.get("params") if isinstance(step.get("params"), dict) else {}
+    found = {}
+    for key in ("hand", "hands", "pose", "hand_goal"):
+        val = step.get(key, params.get(key))
+        if val:
+            found[key] = val
+    if not found:
+        return
+    plan.params = dict(plan.params or {})
+    for key, val in found.items():
+        plan.params.setdefault(key, val)
+    if plan.params.get("hand") and plan.skill in {"hold", "stand"}:
+        plan.skill = "reach"
+        if str(step.get("skill") or "") in {"", "hold", "stand"}:
+            step["skill"] = "reach"
+    plan._teacher = decode_teacher(plan.skill, plan.params)
+
+
+def attach_arm_channel(plan, text: str) -> None:
+    """Keep a raise or lower when the planner reply dropped the arm field."""
+    for step in plan.queue or []:
+        if _frame_has_arms(step):
+            _mirror_arm_fields(plan, step)
+            return
+    spec = arm_channel_from_text(text) or arm_channel_from_text(getattr(plan, "instruction", ""))
+    if not spec or not plan.queue:
+        return
+    step = plan.queue[0]
+    params = dict(step.get("params") or {})
+    params.update(spec)
+    step["params"] = params
+    step.update(spec)
+    plan.params = dict(plan.params or {})
+    plan.params.update(spec)
+    if "hand" in spec and plan.skill in {"hold", "stand"}:
+        plan.skill = "reach"
+        if str(step.get("skill") or "") in {"", "hold", "stand"}:
+            step["skill"] = "reach"
+    plan._teacher = decode_teacher(plan.skill, plan.params)
+
+
 def skill_from_params(params: dict) -> str:
     if isinstance(params, dict) and "skill" in params:
         s = str(params.get("skill", "hold")).lower()

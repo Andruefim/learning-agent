@@ -132,6 +132,12 @@ def smoke() -> None:
         "подними правую руку",
     )
     assert parsed is not None and parsed.skill == "reach" and parsed.params.get("hand") == "right", parsed
+    dropped = bot.planner._parse(
+        '{"instruction":"подними руки","skill":"hold","params":{},"done":false}',
+        "подними руки",
+    )
+    assert dropped is not None and dropped.params.get("hand") == "both", dropped
+    assert dropped.teacher().r_arm > 0.5 and dropped.teacher().l_arm > 0.5, dropped.teacher()
     walk = bot.planner._parse(
         '{"instruction":"сделай 5 шагов вперед","skill":"locomote","params":{"direction":"forward","speed":"medium","distance_hint":"5"},"done":false}',
         "сделай 5 шагов вперед",

@@ -66,11 +66,15 @@ def health():
 @app.get("/video_feed")
 def video_feed():
     def frames():
+        last = None
         while True:
             jpeg = _bot().jpeg()
-            if jpeg:
+            if jpeg and jpeg is not last:
+                last = jpeg
                 yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
-            time.sleep(0.04)
+            else:
+                # A fixed sleep after every frame rounded up to ~15 ms on Windows.
+                time.sleep(0.004)
 
     return StreamingResponse(
         frames(),
@@ -85,7 +89,7 @@ async def _run_l1(bot: RobotEngine, text: str, *, fresh: bool) -> Plan:
     cmd = text.strip()
     try:
         scene = bot.scene_brief()
-        plan, ok = await bot.planner.plan(cmd, scene, bot.eye_jpeg())
+        plan, ok = await bot.planner.plan(cmd, scene, bot.planner_jpeg())
         if bot.intent == cmd:
             bot.apply_plan(plan, fresh=fresh, l1_ok=ok)
         return plan

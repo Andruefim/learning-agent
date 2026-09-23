@@ -606,10 +606,14 @@ class FlywheelMixin:
         if self._ep_slept or self._ep_failed or not self._ep_armed:
             return
         rows = self._trim_idle_tail(self.logs[self._ep_i :])
+        block = self._lesson_block()
         self.logs = self.logs[: self._ep_i]
         self._ep_i = len(self.logs)
         self._ep_slept = True
         self._quiet_tick = None
+        if block:
+            self._note(block)
+            return
         if len(rows) >= SLEEP_MIN_FRAMES:
             self._sleep_jobs.append(rows)
         else:
@@ -640,6 +644,8 @@ class FlywheelMixin:
             held = True
         if frame["yaw"] is not None and self._turn_done():
             held = True
+        if frame.get("approaching"):
+            return False
         cmd = np.asarray(frame["cmd"], dtype=np.float64)
         traveling = max(abs(float(cmd[0])), abs(float(cmd[1])), abs(float(cmd[2]))) > 0.05
         if traveling:

@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 
-from agent.plan import Plan
+from agent.plan import Plan, attach_arm_channel
 from agent.reach import attach_reach
 
 
@@ -80,6 +80,7 @@ class Level1Planner:
                 queue=queue,
             )
             attach_reach(plan, user_command)
+            attach_arm_channel(plan, user_command)
             return plan
         except (TypeError, ValueError):
             return None
@@ -95,15 +96,25 @@ class Level1Planner:
             "direction, speed, depth. Do not pick a single skill name when the sentence has "
             "several parts: write them as successive frames. The body already balances.\n"
             "A frame without a skill is valid. vx, height and arms are one command.\n"
-            "Putting a hand on a body part is not a skill name. Write hand_goal "
-            '{hand: left|right|both, target: head} on that frame. Do not answer hold.\n'
+            "Putting a hand on the robot's own head is not a skill name. Write hand_goal "
+            '{hand: left|right|both, target: head}. Do not answer hold.\n'
             '  "положи левую руку на голову" → {"instruction":"левая рука на голову","queue":['
             '{"hand_goal":{"hand":"left","target":"head"},"vx":0,"hold_s":4}],"done":false}\n'
+            "Touching something visible is the same channel, for any object. "
+            "Name a hand and the place on the attached head image: u=0 is the left edge, "
+            "u=1 the right edge, v=0 the top, v=1 the bottom. "
+            "Write hand_goal {hand: left|right|both, u, v} on that object in this image. "
+            "Measure u and v on this image. If the object is not in the image, do not "
+            "put a point on the wall or in the middle of the frame: write a turn and no hand_goal. "
+            "Do not copy numbers, and do not emit xyz, joint angles, or an object name.\n"
+            '  shape → {"instruction":"...","queue":['
+            '{"hand_goal":{"hand":"right","u":0.62,"v":0.41},"vx":0,"hold_s":8}],"done":false}\n'
             "Examples:\n"
             '  "сделай 5 шагов вперед" → {"skill":"locomote","params":{"direction":"forward","speed":"medium","distance_hint":"5"}}\n'
             '  "иди вперёд" → {"skill":"locomote","params":{"direction":"forward","speed":"medium"}}\n'
             '  "стой" / "замри" → {"skill":"stand","params":{}}\n'
             '  "опусти руки" → {"skill":"hold","params":{"hands":"down"}}\n'
+            '  "подними руки" → {"skill":"reach","params":{"hand":"both"}}\n'
             '  "подними правую руку" → {"skill":"reach","params":{"hand":"right"}}\n'
             '  "махни правой" → {"skill":"wave","params":{"hand":"right"}}\n'
             '  "руки в стороны" → {"skill":"reach","params":{"pose":"t"}}\n'
@@ -146,7 +157,7 @@ class Level1Planner:
             "stream": False,
             "format": "json",
             "think": False,
-            "options": {"temperature": 0, "num_ctx": 2048, "num_predict": 512, "think": False},
+            "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 512, "think": False},
         }
         try:
             import httpx

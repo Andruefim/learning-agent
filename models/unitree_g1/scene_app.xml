@@ -4,7 +4,7 @@
   <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast"/>
   <size nconmax="2000" njmax="4000"/>
   <visual>
-    <global offwidth="640" offheight="480"/>
+    <global offwidth="1920" offheight="1080"/>
   </visual>
   <worldbody>
     <camera name="demo" pos="-1.15 -1.7 1.55" mode="targetbody" target="pelvis" fovy="50"/>

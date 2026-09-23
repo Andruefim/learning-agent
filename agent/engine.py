@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import ctypes
 import io
 import os
 import threading
@@ -61,14 +62,35 @@ from agent.l3_foundation import (
     q_from_action,
     advance_gait_phi,
 )
-from agent.plan import Plan, parse_requested_yaw, skill_from_params, wrap_angle
-from agent.reach import attach_reach, reach_goal_from_step, servo_reach, solve_arm
+from agent.plan import Plan, attach_arm_channel, parse_requested_yaw, skill_from_params, wrap_angle
+from agent.reach import (
+    LOOK_H,
+    LOOK_W,
+    ARRIVE_S,
+    TOUCH_M,
+    attach_reach,
+    camera_basis,
+    goal_distance,
+    ray_direction,
+    ray_hit,
+    reach_goal_from_step,
+    servo_reach,
+    solve_arm,
+    touch_lesson,
+    velocity_toward,
+    walk_is_blocked,
+)
 from agent.planner import Level1Planner
 from agent.policy import encode_instr, load_state, resolve_device
 from agent.s1 import CTX, HIST_DIM, N_RAYS, CommandTransformer
 from agent.trials import MultiTrialBuffer
 
 STEP_PERIOD = 0.55
+
+
+# Operator preview. The head camera stays at VISION_H x VISION_W.
+PREVIEW_W, PREVIEW_H = 1920, 1080
+PREVIEW_INTERVAL = 1.0 / 40.0
 
 
 class RobotEngine(FlywheelMixin):
@@ -157,6 +179,12 @@ class RobotEngine(FlywheelMixin):
         self._quiet_tick: int | None = None
         self._reach_sol: np.ndarray | None = None
         self._reach_tick = -10**9
+        self._touch_goal = False
+        self._touch_d0: float | None = None
+        self._touch_best: float | None = None
+        self._blocked_tick0: int | None = None
+        self._approach_arrived = False
+        self.look = None
         # Demo camera orbits the pelvis. Offset is the current XML camera
         # relative to a standing pelvis. Group 0 is collision (solid red).
         self._cam_offset = np.array([-1.15, -1.70, 0.767], dtype=np.float64)
@@ -178,6 +206,10 @@ class RobotEngine(FlywheelMixin):
         self.turn_mechanism = "foundation"
         self.status = "ready"
         self._kick_render = True
+        self._preview_at = 0.0
+        self._preview_rgb: np.ndarray | None = None
+        self._preview_seq = 0
+        self._jpeg_seq = -1
         self._home()
         blob = self._load_replay()
         if blob is not None:
@@ -340,19 +372,87 @@ class RobotEngine(FlywheelMixin):
             "reach": reach_goal_from_step(step),
         }
 
+    def _note_touch(self, goal: dict) -> None:
+        dist = goal_distance(self.model, self.data, goal)
+        if dist is None:
+            return
+        self._touch_goal = True
+        if self._touch_d0 is None:
+            self._touch_d0 = float(dist)
+        self._touch_best = float(dist) if self._touch_best is None else min(float(self._touch_best), float(dist))
+
+    def _cast_look(self, goal: dict) -> None:
+        if goal.get("point") is not None or "u" not in goal:
+            return
+        origin, rot, fovy = camera_basis(self.model, self.data)
+        direction = ray_direction(rot, fovy, LOOK_W / LOOK_H, float(goal["u"]), float(goal["v"]))
+        point = ray_hit(self.model, self.data, origin, direction, int(self.pelvis_id))
+        if point is not None:
+            goal["point"] = point
+
     def _servo_reach(self, cmd: np.ndarray) -> np.ndarray:
         frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
         goal = frame.get("reach") if frame else None
         if not goal or self.outcome == "fall":
             self._reach_sol = None
+            if frame is not None:
+                frame["approaching"] = False
             return cmd
+        self._cast_look(goal)
+        if goal.get("unresolved") or ("u" in goal and goal.get("point") is None):
+            self._touch_goal = True
+            frame["approaching"] = False
+            return cmd
+        self._note_touch(goal)
+        out = np.array(cmd, dtype=np.float32, copy=True)
+        world = goal.get("point") is not None and goal.get("target") != "head"
         if self._reach_sol is None or int(self._tick) - int(self._reach_tick) >= 300:
-            self._reach_sol = solve_arm(self.model, self.data, goal, self.qadr, self.vadr)
+            self._reach_sol, gap = solve_arm(self.model, self.data, goal, self.qadr, self.vadr)
+            self._reach_gap = float(gap)
             self._reach_tick = int(self._tick)
-        return servo_reach(self.model, self.data, cmd, goal, self.qadr, self._reach_sol)
+        was_approaching = bool(frame.get("approaching"))
+        gap = float(getattr(self, "_reach_gap", 0.0))
+        point = np.asarray(goal["point"], dtype=np.float64) if goal.get("point") is not None else None
+        approaching = bool(
+            world and point is not None and gap > TOUCH_M and not self._approach_arrived
+        )
+        if approaching:
+            if walk_is_blocked(self._heading(), self._pelvis(), self.data.qvel[:2], point):
+                if self._blocked_tick0 is None:
+                    self._blocked_tick0 = int(self._tick)
+            else:
+                self._blocked_tick0 = None
+            held = 0.0
+            if self._blocked_tick0 is not None:
+                held = (int(self._tick) - int(self._blocked_tick0)) * float(self.model.opt.timestep)
+            if held >= ARRIVE_S:
+                self._approach_arrived = True
+                approaching = False
+        elif world and gap <= TOUCH_M:
+            self._approach_arrived = True
+            self._blocked_tick0 = None
+        else:
+            self._blocked_tick0 = None
+        frame["approaching"] = approaching
+        if approaching:
+            vx, wz = velocity_toward(self._heading(), self._pelvis(), point)
+            out[0] = np.float32(vx)
+            out[2] = np.float32(wz)
+            return out
+        if world:
+            out[0] = np.float32(0.0)
+            out[1] = np.float32(0.0)
+            out[2] = np.float32(0.0)
+            if was_approaching:
+                self._queue_tick0 = int(self._tick)
+        return servo_reach(self.model, self.data, out, goal, self.qadr, self._reach_sol)
+
+    def _lesson_block(self) -> str | None:
+        return touch_lesson(bool(self._touch_goal), self._touch_d0, self._touch_best)
 
     def _load_queue(self, plan: Plan) -> None:
         attach_reach(plan, self.user_cmd or plan.instruction)
+        attach_arm_channel(plan, self.user_cmd or plan.instruction)
         self._reach_sol = None
         self._reach_tick = -10**9
         frames = [self._frame(step) for step in (plan.queue or [{"skill": "stand"}])]
@@ -457,6 +557,11 @@ class RobotEngine(FlywheelMixin):
             self._ep_slept = False
             self._ep_failed = False
             self._quiet_tick = None
+            self._touch_goal = False
+            self._touch_d0 = None
+            self._touch_best = None
+            self._blocked_tick0 = None
+            self._approach_arrived = False
             self._ep_tick0 = int(self._tick)
             self.intent = text
             self.user_cmd = text
@@ -515,8 +620,13 @@ class RobotEngine(FlywheelMixin):
                 self._load_queue(plan)
                 self._quiet_tick = None
             elif len(plan.queue) == 1 and len(self._queue) == 1:
+                old = self._queue[0]
                 frame = self._frame(plan.queue[0])
-                had_yaw = self._queue[0]["yaw"] is not None
+                kept = old.get("reach") or {}
+                if kept.get("point") is not None:
+                    frame["reach"] = kept
+                    frame["approaching"] = bool(old.get("approaching"))
+                had_yaw = old["yaw"] is not None
                 self._queue[0] = frame
                 self._steps_goal = int(frame["steps"])
                 if frame["yaw"] is not None and not had_yaw:
@@ -759,18 +869,46 @@ class RobotEngine(FlywheelMixin):
 
     def _render(self):
         if self.renderer is None:
-            self.renderer = mujoco.Renderer(self.model, 480, 640)
+            self.renderer = mujoco.Renderer(self.model, PREVIEW_H, PREVIEW_W)
         self._place_demo_camera()
         self.renderer.update_scene(self.data, camera="demo", scene_option=self._view_opt)
+        # JPEG runs on the stream thread. Copy now: the renderer reuses this buffer.
+        self._preview_rgb = np.array(self.renderer.render(), copy=True)
+        self._preview_seq += 1
+
+    def jpeg(self) -> bytes:
+        with self.lock:
+            rgb = self._preview_rgb
+            seq = self._preview_seq
+            if seq == self._jpeg_seq:
+                return self._jpeg
+        if rgb is None:
+            return b""
         buf = io.BytesIO()
-        Image.fromarray(self.renderer.render()).save(buf, format="JPEG", quality=78)
-        self._jpeg = buf.getvalue()
+        Image.fromarray(rgb).save(buf, format="JPEG", quality=85)
+        data = buf.getvalue()
+        with self.lock:
+            if seq >= self._jpeg_seq:
+                self._jpeg = data
+                self._jpeg_seq = seq
+        return data
 
     def _render_eye(self) -> np.ndarray:
         if self.eye is None:
             self.eye = mujoco.Renderer(self.model, VISION_H, VISION_W)
         self.eye.update_scene(self.data, camera="head", scene_option=self._view_opt)
         return np.ascontiguousarray(self.eye.render())
+
+    def planner_jpeg(self) -> bytes:
+        """Head camera at the size the planner points into. The log image stays 48×64."""
+        with self.lock:
+            if self.look is None:
+                self.look = mujoco.Renderer(self.model, LOOK_H, LOOK_W)
+            self.look.update_scene(self.data, camera="head", scene_option=self._view_opt)
+            rgb = np.ascontiguousarray(self.look.render())
+        buf = io.BytesIO()
+        Image.fromarray(rgb).save(buf, format="JPEG", quality=80)
+        return buf.getvalue()
 
     def eye_jpeg(self) -> bytes:
         with self.lock:
@@ -811,10 +949,6 @@ class RobotEngine(FlywheelMixin):
             if dist >= 0.0:
                 out[i] = float(np.clip(dist / 8.0, 0.0, 1.0))
         return out
-
-    def jpeg(self) -> bytes:
-        with self.lock:
-            return self._jpeg
 
     def _heading(self) -> float:
         w, x, y, z = self.data.qpos[3:7]
@@ -889,17 +1023,36 @@ class RobotEngine(FlywheelMixin):
                 "trials": [t.as_public(i + 1) for i, t in enumerate(self.trials.items())],
             }
 
+    def _timer_period(self, ms: int) -> None:
+        """Windows sleeps round 2 ms up to ~15 ms unless the timer is 1 ms."""
+        if os.name != "nt":
+            return
+        if ms:
+            ctypes.windll.winmm.timeBeginPeriod(ms)
+            self._timer_ms = ms
+        elif getattr(self, "_timer_ms", 0):
+            ctypes.windll.winmm.timeEndPeriod(self._timer_ms)
+            self._timer_ms = 0
+
     def loop(self, stop: threading.Event):
+        self._timer_period(1)
         self._render()
-        n = 0
+        try:
+            self._loop(stop)
+        finally:
+            self._timer_period(0)
+
+    def _loop(self, stop: threading.Event):
         while not stop.is_set():
             job = None
+            started = time.perf_counter()
             with self.lock:
                 if not self._trial_busy:
                     self.step()
-                    n += 1
-                    if n % 8 == 0 or self._kick_render:
+                    now = time.perf_counter()
+                    if self._kick_render or now >= self._preview_at:
                         self._kick_render = False
+                        self._preview_at = now + PREVIEW_INTERVAL
                         try:
                             self._render()
                         except Exception:
@@ -915,10 +1068,15 @@ class RobotEngine(FlywheelMixin):
                 with self.lock:
                     self.policy.eval()
                     self._note(msg)
-            stop.wait(self.model.opt.timestep)
+            remain = float(self.model.opt.timestep) - (time.perf_counter() - started)
+            # Event.wait(1 ms) sleeps ~15 ms on Windows. Spin the short remainder.
+            if remain > 0.0002:
+                deadline = time.perf_counter() + remain
+                while time.perf_counter() < deadline and not stop.is_set():
+                    pass
 
     def close(self):
-        for attr in ("renderer", "eye"):
+        for attr in ("renderer", "eye", "look"):
             r = getattr(self, attr)
             if r is None:
                 continue
