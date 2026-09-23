@@ -157,6 +157,11 @@ class RobotEngine(FlywheelMixin):
         self._quiet_tick: int | None = None
         self._reach_sol: np.ndarray | None = None
         self._reach_tick = -10**9
+        # Demo camera orbits the pelvis. Offset is the current XML camera
+        # relative to a standing pelvis. Group 0 is collision (solid red).
+        self._cam_offset = np.array([-1.15, -1.70, 0.767], dtype=np.float64)
+        self._view_opt = mujoco.MjvOption()
+        self._view_opt.geomgroup[:] = (0, 1, 1, 0, 0, 0)
         self.ctrl_source = "l3"
         self._jpeg = b""
         self._eye_rgb = np.zeros((VISION_H, VISION_W, 3), dtype=np.uint8)
@@ -694,10 +699,69 @@ class RobotEngine(FlywheelMixin):
         self._tick += 1
         self._consider_sleep()
 
+    def orbit_camera(self, dx: float = 0.0, dy: float = 0.0, zoom: float = 0.0) -> None:
+        """Orbit the operator camera. dx/dy are pixels, zoom is wheel deltaY."""
+        with self.lock:
+            off = self._cam_offset
+            if dx:
+                yaw = -float(dx) * 0.006
+                c, s = float(np.cos(yaw)), float(np.sin(yaw))
+                x, y = float(off[0]), float(off[1])
+                off[0] = c * x - s * y
+                off[1] = s * x + c * y
+            if dy:
+                horiz = float(np.hypot(off[0], off[1]))
+                elev = float(np.arctan2(off[2], max(horiz, 1e-6)))
+                elev = float(np.clip(elev - float(dy) * 0.006, -1.15, 1.15))
+                length = float(np.linalg.norm(off))
+                new_h = length * float(np.cos(elev))
+                if horiz < 1e-6:
+                    off[0], off[1] = new_h, 0.0
+                else:
+                    scale = new_h / horiz
+                    off[0] *= scale
+                    off[1] *= scale
+                off[2] = length * float(np.sin(elev))
+            if zoom:
+                length = float(np.linalg.norm(off))
+                length = float(np.clip(length * float(np.exp(float(zoom) * 0.0012)), 0.7, 9.0))
+                norm = float(np.linalg.norm(off))
+                if norm > 1e-6:
+                    off *= length / norm
+            self._kick_render = True
+
+    def _place_demo_camera(self) -> None:
+        origin = np.asarray(self._pelvis(), dtype=np.float64)
+        off = np.asarray(self._cam_offset, dtype=np.float64)
+        dist = float(np.linalg.norm(off))
+        # Start past the torso. A ray from the pelvis hits the body itself.
+        margin = 0.45
+        if dist > margin + 0.2:
+            vec = off / dist
+            geomid = np.zeros(1, dtype=np.int32)
+            groups = np.array([1, 0, 0, 0, 0, 0], dtype=np.uint8)
+            hit = mujoco.mj_ray(
+                self.model,
+                self.data,
+                origin + vec * margin,
+                vec,
+                groups,
+                1,
+                -1,
+                geomid,
+            )
+            if hit >= 0.0 and margin + float(hit) < dist:
+                dist = max(margin + 0.15, (margin + float(hit)) * 0.9)
+                off = vec * dist
+        cid = int(self.model.camera("demo").id)
+        self.model.cam_pos[cid] = origin + off
+        mujoco.mj_camlight(self.model, self.data)
+
     def _render(self):
         if self.renderer is None:
             self.renderer = mujoco.Renderer(self.model, 480, 640)
-        self.renderer.update_scene(self.data, camera="demo")
+        self._place_demo_camera()
+        self.renderer.update_scene(self.data, camera="demo", scene_option=self._view_opt)
         buf = io.BytesIO()
         Image.fromarray(self.renderer.render()).save(buf, format="JPEG", quality=78)
         self._jpeg = buf.getvalue()
@@ -705,7 +769,7 @@ class RobotEngine(FlywheelMixin):
     def _render_eye(self) -> np.ndarray:
         if self.eye is None:
             self.eye = mujoco.Renderer(self.model, VISION_H, VISION_W)
-        self.eye.update_scene(self.data, camera="head")
+        self.eye.update_scene(self.data, camera="head", scene_option=self._view_opt)
         return np.ascontiguousarray(self.eye.render())
 
     def eye_jpeg(self) -> bytes:

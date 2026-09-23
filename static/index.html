@@ -16,8 +16,8 @@
           <span id="hold" class="bg-zinc-800 text-zinc-500 px-2 py-1 rounded">stand</span>
         </div>
       </header>
-      <div class="flex-1 bg-black rounded-xl overflow-hidden border border-zinc-800 flex items-center justify-center">
-        <img src="/video_feed" alt="MuJoCo" class="w-full h-full object-contain">
+      <div id="view" class="flex-1 bg-black rounded-xl overflow-hidden border border-zinc-800 flex items-center justify-center cursor-grab">
+        <img src="/video_feed" alt="MuJoCo" draggable="false" class="w-full h-full object-contain pointer-events-none select-none">
       </div>
       <dl id="stats" class="grid grid-cols-4 gap-2 mt-3 text-[11px] text-zinc-500 font-mono">
         <div class="bg-zinc-900 rounded px-2 py-1">err <span id="s-err" class="text-zinc-200">—</span></div>
@@ -117,6 +117,38 @@
       el.value = "";
     }
     document.getElementById("cmd").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+
+    const view = document.getElementById("view");
+    let dragging = false;
+    let lastX = 0;
+    let lastY = 0;
+    view.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      dragging = true;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      view.classList.add("cursor-grabbing");
+      view.setPointerCapture(e.pointerId);
+    });
+    view.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - lastX;
+      const dy = e.clientY - lastY;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      if (dx || dy) wsSend({ type: "camera", dx, dy });
+    });
+    function endDrag() {
+      dragging = false;
+      view.classList.remove("cursor-grabbing");
+    }
+    view.addEventListener("pointerup", endDrag);
+    view.addEventListener("pointercancel", endDrag);
+    view.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      wsSend({ type: "camera", zoom: e.deltaY });
+    }, { passive: false });
+
     connect();
   </script>
 </body>

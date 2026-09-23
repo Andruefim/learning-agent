@@ -120,6 +120,12 @@ async def ws(sock: WebSocket):
                     await sock.send_json(
                         {"type": "log", "text": f"«{text}» → {plan.instruction} · {note}"}
                     )
+                elif kind == "camera":
+                    bot.orbit_camera(
+                        float(raw.get("dx") or 0),
+                        float(raw.get("dy") or 0),
+                        float(raw.get("zoom") or 0),
+                    )
                 elif kind == "reset":
                     await asyncio.to_thread(bot.reset_sim)
                     await sock.send_json({"type": "log", "text": "Reset · spawn."})

@@ -1,10 +1,12 @@
 <mujoco model="Unitree G1 app">
-  <include file="scene.xml"/>
+  <include file="g1_29dof.xml"/>
+  <include file="../kitchen/kitchen.xml"/>
   <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast"/>
+  <size nconmax="2000" njmax="4000"/>
   <visual>
     <global offwidth="640" offheight="480"/>
   </visual>
   <worldbody>
-    <camera name="demo" pos="2.2 -2.6 1.2" mode="targetbody" target="pelvis" fovy="46"/>
+    <camera name="demo" pos="-1.15 -1.7 1.55" mode="targetbody" target="pelvis" fovy="50"/>
   </worldbody>
 </mujoco>
