@@ -8,6 +8,7 @@ from agent.reach import (
     LOOK_H,
     LOOK_W,
     TOUCH_M,
+    body_can_move,
     camera_basis,
     goal_distance,
     ray_direction,
@@ -18,6 +19,7 @@ from agent.reach import (
     velocity_toward,
     walk_is_blocked,
 )
+from agent.reach import _arm_penetration
 
 
 def _stand():
@@ -25,7 +27,9 @@ def _stand():
     data = mujoco.MjData(model)
     data.qpos[2] = SPAWN_Z
     data.qpos[3] = 1.0
-    data.qpos[7 : 7 + len(STAND_Q)] = STAND_Q
+    for i in range(len(STAND_Q)):
+        jid = int(model.actuator_trnid[i, 0])
+        data.qpos[int(model.jnt_qposadr[jid])] = STAND_Q[i]
     mujoco.mj_forward(model, data)
     return model, data
 
@@ -58,7 +62,9 @@ def test_pixel_hits_the_body_in_frame():
     direction = ray_direction(rot, fovy, aspect, u, v)
     hit = ray_hit(model, data, origin, direction, int(model.body("pelvis").id))
     assert hit is not None
-    assert float(np.linalg.norm(hit - center)) < 0.25, np.linalg.norm(hit - center)
+    point, body = hit
+    assert body == int(model.body("toaster_main_group_main").id)
+    assert float(np.linalg.norm(point - center)) < 0.25, np.linalg.norm(point - center)
 
 
 def test_velocity_faces_the_point():
@@ -112,6 +118,65 @@ def test_sleep_wants_a_closer_palm():
     assert touch_lesson(True, 1.0, 0.7) is None
 
 
+def test_the_arm_does_not_enter_the_counter():
+    model, data = _stand()
+    qadr, vadr = _addrs(model)
+    toaster = int(model.body("toaster_main_group_main").id)
+    target = np.asarray(data.xpos[toaster], dtype=np.float64).copy()
+    spawn = np.asarray(data.qpos[:2], dtype=np.float64).copy()
+    direction = target[:2] - spawn
+    direction = direction / max(float(np.linalg.norm(direction)), 1e-6)
+
+    def place(distance: float) -> None:
+        data.qpos[0] = float(target[0] - direction[0] * distance)
+        data.qpos[1] = float(target[1] - direction[1] * distance)
+        yaw = float(np.arctan2(direction[1], direction[0]))
+        data.qpos[3] = float(np.cos(yaw / 2.0))
+        data.qpos[6] = float(np.sin(yaw / 2.0))
+        mujoco.mj_forward(model, data)
+
+    def solve(distance: float):
+        place(distance)
+        goal = {"hand": "both", "u": 0.5, "v": 0.5, "point": target, "body": toaster}
+        sol, gap = solve_arm(model, data, goal, qadr, vadr)
+        scratch = mujoco.MjData(model)
+        scratch.qpos[:] = data.qpos
+        scratch.qpos[qadr[15:29]] = sol[15:29]
+        mujoco.mj_forward(model, scratch)
+        pen = _arm_penetration(model, scratch, ("left", "right"), toaster)
+        return goal, gap, pen
+
+    goal, _gap, pen = solve(0.42)
+    assert pen < 1e-3, pen
+    near = goal.get("shift")
+    if isinstance(near, np.ndarray):
+        assert float(np.dot(np.asarray(near)[:2], direction)) <= 0.0, near
+
+    goal, _gap, pen = solve(1.2)
+    assert pen < 1e-3, pen
+    far = goal.get("shift")
+    assert isinstance(far, np.ndarray), far
+    assert float(np.dot(np.asarray(far)[:2], direction)) > 0.0, far
+    here = np.asarray(data.qpos[:2], dtype=np.float64)
+    left = float(np.linalg.norm(target[:2] - (here + np.asarray(far)[:2])))
+    assert left > TOUCH_M, left
+
+
+def test_a_free_toaster_stays_on_the_counter():
+    model, data = _stand()
+    body = int(model.body("toaster_main_group_main").id)
+    assert body_can_move(model, body)
+    assert not body_can_move(model, int(model.body("stack_4_main_group_2_main").id))
+    z0 = float(data.xpos[body][2])
+    hold = data.qpos[:7].copy()
+    for _ in range(500):
+        data.qpos[:7] = hold
+        data.qvel[:6] = 0.0
+        mujoco.mj_step(model, data)
+    z1 = float(data.xpos[body][2])
+    assert abs(z1 - z0) < 0.05, (z0, z1)
+
+
 if __name__ == "__main__":
     test_name_is_not_a_point()
     test_pixel_hits_the_body_in_frame()
@@ -120,4 +185,6 @@ if __name__ == "__main__":
     test_velocity_faces_the_point()
     test_a_stopped_pelvis_ends_the_walk()
     test_sleep_wants_a_closer_palm()
+    test_the_arm_does_not_enter_the_counter()
+    test_a_free_toaster_stays_on_the_counter()
     print("ok")

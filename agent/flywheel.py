@@ -646,6 +646,9 @@ class FlywheelMixin:
             held = True
         if frame.get("approaching"):
             return False
+        reach = frame.get("reach") or {}
+        if "u" in reach and not reach.get("done"):
+            return False
         cmd = np.asarray(frame["cmd"], dtype=np.float64)
         traveling = max(abs(float(cmd[0])), abs(float(cmd[1])), abs(float(cmd[2]))) > 0.05
         if traveling:

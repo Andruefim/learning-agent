@@ -6,8 +6,10 @@ import numpy as np
 import mujoco
 
 # Palm point in the wrist-yaw frame. +X runs out through the rubber hand.
-_PALM = np.array([0.10, 0.0, 0.0], dtype=np.float64)
+# Knuckle of the Dex3 palm, in the wrist-yaw frame. +X runs out through the fingers.
+_PALM = np.array([0.14, 0.0, 0.0], dtype=np.float64)
 _HAND_BODY = {"left": "left_wrist_yaw_link", "right": "right_wrist_yaw_link"}
+_ARM_ROOT = {"left": "left_shoulder_pitch_link", "right": "right_shoulder_pitch_link"}
 _ARM0 = {"left": 15, "right": 22}
 _CMD0 = {"left": 4, "right": 11}
 
@@ -40,6 +42,18 @@ LOOK_W, LOOK_H = 320, 240
 TOUCH_M = 0.08
 # A lesson is a palm that actually moved toward the point.
 CLOSER_M = 0.05
+# After the body has arrived, this long without contact means the grasp missed.
+GRASP_S = 1.5
+# A free body counts as lifted once contact has raised it by this much.
+LIFT_M = 0.04
+# How fast the aim climbs while the named hands stay on a free body.
+LIFT_MPS = 0.02
+# Contact has to last this long before a fixed body counts as held.
+CONTACT_S = 0.4
+# Give the next look this many misses, then stop the attempt.
+GRASP_TRIES = 6
+# Aim this far in front of the surface so the curl meets the object.
+STANDOFF_M = 0.03
 # Forward / yaw channel limits while the point is outside the arm.
 _VX_CAP = 0.4
 _WZ_CAP = 0.8
@@ -147,7 +161,7 @@ def ray_direction(rot: np.ndarray, fovy_deg: float, aspect: float, u: float, v: 
     return direction / max(float(np.linalg.norm(direction)), 1e-8)
 
 
-def ray_hit(model, data, origin: np.ndarray, direction: np.ndarray, bodyexclude: int) -> np.ndarray | None:
+def ray_hit(model, data, origin: np.ndarray, direction: np.ndarray, bodyexclude: int) -> tuple[np.ndarray, int] | None:
     geomid = np.zeros(1, dtype=np.int32)
     dist = mujoco.mj_ray(
         model,
@@ -161,7 +175,52 @@ def ray_hit(model, data, origin: np.ndarray, direction: np.ndarray, bodyexclude:
     )
     if dist < 0.0:
         return None
-    return np.asarray(origin, dtype=np.float64) + np.asarray(direction, dtype=np.float64) * float(dist)
+    point = np.asarray(origin, dtype=np.float64) + np.asarray(direction, dtype=np.float64) * float(dist)
+    return point, int(model.geom_bodyid[int(geomid[0])])
+
+
+def _under(model, body: int, root: int) -> bool:
+    for _ in range(64):
+        if int(body) == int(root):
+            return True
+        if int(body) <= 0:
+            return False
+        body = int(model.body_parentid[int(body)])
+    return False
+
+
+def hand_touching(model, data, hand: str, body_id: int) -> bool:
+    """Geoms of one hand are in contact with the body the ray hit."""
+    name = {"left": "left_wrist_yaw_link", "right": "right_wrist_yaw_link"}.get(hand)
+    if name is None or int(body_id) < 0:
+        return False
+    root = int(model.body(name).id)
+    target = int(body_id)
+    for i in range(int(data.ncon)):
+        b1 = int(model.geom_bodyid[int(data.contact[i].geom1)])
+        b2 = int(model.geom_bodyid[int(data.contact[i].geom2)])
+        if (_under(model, b1, root) and _under(model, b2, target)) or (
+            _under(model, b2, root) and _under(model, b1, target)
+        ):
+            return True
+    return False
+
+
+def hands_holding(model, data, hand: str, body_id: int) -> bool:
+    """Every hand named in the plan is on the body the ray hit."""
+    sides = ("left", "right") if hand == "both" else (hand,)
+    sides = [side for side in sides if side in ("left", "right")]
+    return bool(sides) and all(hand_touching(model, data, side, int(body_id)) for side in sides)
+
+
+def body_can_move(model, body_id: int) -> bool:
+    """A free joint on the hit body means the hands can pick it up."""
+    adr = int(model.body_jntadr[int(body_id)])
+    n = int(model.body_jntnum[int(body_id)])
+    if adr < 0 or n <= 0:
+        return False
+    free = int(mujoco.mjtJoint.mjJNT_FREE)
+    return any(int(model.jnt_type[j]) == free for j in range(adr, adr + n))
 
 
 def velocity_toward(yaw: float, origin: np.ndarray, point: np.ndarray) -> tuple[float, float]:
@@ -276,40 +335,243 @@ def _refine(model, scratch, goal: dict, side: str, qadr, vadr, lo: np.ndarray, h
         _sync(model, scratch)
 
 
+def _contacts(model, scratch) -> None:
+    mujoco.mj_kinematics(model, scratch)
+    mujoco.mj_comPos(model, scratch)
+    mujoco.mj_collision(model, scratch)
+
+
+def _arm_penetration(model, scratch, sides, allow_body: int | None) -> float:
+    """How far these arms enter a body that is not the robot and not the one being grasped."""
+    pelvis = int(model.body("pelvis").id)
+    roots = [int(model.body(_ARM_ROOT[side]).id) for side in sides if side in _ARM_ROOT]
+    if not roots:
+        return 0.0
+    pen = 0.0
+    allow = None if allow_body is None or int(allow_body) < 0 else int(allow_body)
+    for i in range(int(scratch.ncon)):
+        contact = scratch.contact[i]
+        b1 = int(model.geom_bodyid[int(contact.geom1)])
+        b2 = int(model.geom_bodyid[int(contact.geom2)])
+        arm1 = any(_under(model, b1, root) for root in roots)
+        arm2 = any(_under(model, b2, root) for root in roots)
+        if arm1 == arm2:
+            continue
+        other = b2 if arm1 else b1
+        if _under(model, other, pelvis):
+            continue
+        if allow is not None and _under(model, other, allow):
+            continue
+        pen += max(0.0, -float(contact.dist))
+    return float(pen)
+
+
+def _set_arms(scratch, qadr, arms: dict) -> None:
+    for side, q in arms.items():
+        act0 = _ARM0[side]
+        scratch.qpos[qadr[act0 : act0 + 7]] = q
+
+
+def _path_penetration(model, scratch, data, qadr, goal, current: dict, target: dict, sides, allow_body) -> float:
+    worst = 0.0
+    for t in (0.25, 0.5, 0.75, 1.0):
+        arms = {side: (1.0 - t) * current[side] + t * target[side] for side in sides}
+        scratch.qpos[:] = data.qpos
+        _set_arms(scratch, qadr, arms)
+        _contacts(model, scratch)
+        worst = max(worst, _arm_penetration(model, scratch, sides, allow_body))
+        if worst > 1e-3:
+            return float(worst)
+    return float(worst)
+
+
+def _posed(model, scratch, data, qadr, goal, arms, sides, allow_body, pelvis_xy) -> tuple[float, float]:
+    scratch.qpos[:] = data.qpos
+    scratch.qpos[0] = float(pelvis_xy[0])
+    scratch.qpos[1] = float(pelvis_xy[1])
+    _set_arms(scratch, qadr, arms)
+    _contacts(model, scratch)
+    pen = _arm_penetration(model, scratch, sides, allow_body)
+    dists = []
+    for side in sides:
+        dists.append(_distance(model, scratch, goal, side))
+    dist = float(max(dists)) if dists else float("inf")
+    return float(pen), dist
+
+
+def _arm_span(model, side: str) -> float:
+    """Longest the palm can be from the shoulder: the sum of the arm's own link lengths."""
+    span = float(np.linalg.norm(_PALM))
+    body = int(model.body(_HAND_BODY[side]).id)
+    root = int(model.body(_ARM_ROOT[side]).id)
+    for _ in range(16):
+        if int(body) == int(root) or int(body) <= 0:
+            break
+        span += float(np.linalg.norm(np.asarray(model.body_pos[int(body)], dtype=np.float64)))
+        body = int(model.body_parentid[int(body)])
+    return float(span)
+
+
+def _raised_clear(model, scratch, data, qadr, goal, arms, sides, allow_body, pelvis_xy) -> bool:
+    pen, _dist = _posed(model, scratch, data, qadr, goal, arms, sides, allow_body, pelvis_xy)
+    return pen <= 1e-3
+
+
+def _stance_for_raise(
+    model, scratch, data, qadr, goal, current: dict, raised: dict, sides, allow_body
+) -> np.ndarray | None:
+    """Pelvis offset along the line to the point where raising the hand still stays clear.
+
+    The window is the arm's own length. The place is the last step at which the wrist
+    can come up to the point without entering another body.
+    """
+    point = goal.get("point")
+    if point is None or not raised:
+        return None
+    here = np.asarray(data.qpos[:2], dtype=np.float64).copy()
+    delta = np.asarray(point[:2], dtype=np.float64) - here
+    dist = float(np.linalg.norm(delta))
+    if dist < 1e-4:
+        return None
+    forward = delta / dist
+    span = max(_arm_span(model, side) for side in sides)
+
+    def clear(step: float) -> bool:
+        pelvis = here + forward * float(step)
+        for t in (0.5, 1.0):
+            arms = {side: (1.0 - t) * current[side] + t * raised[side] for side in sides}
+            if not _raised_clear(model, scratch, data, qadr, goal, arms, sides, allow_body, pelvis):
+                return False
+        return True
+
+    if clear(0.0):
+        lo, hi = 0.0, dist
+        if not clear(dist):
+            while hi - lo > TOUCH_M:
+                mid = 0.5 * (lo + hi)
+                if clear(mid):
+                    lo = mid
+                else:
+                    hi = mid
+        best = dist if clear(dist) else lo
+    else:
+        lo, hi = -span, 0.0
+        if not clear(-span):
+            return None
+        while hi - lo > TOUCH_M:
+            mid = 0.5 * (lo + hi)
+            if clear(mid):
+                lo = mid
+            else:
+                hi = mid
+        best = lo
+    if abs(float(best)) < TOUCH_M:
+        return None
+    return forward * float(best)
+
+
+def velocity_shift(yaw: float, shift: np.ndarray) -> tuple[float, float]:
+    """Body-frame walk that carries the pelvis along a world shift. Backward and sideways included."""
+    heading = np.array([np.cos(yaw), np.sin(yaw)], dtype=np.float64)
+    left = np.array([-np.sin(yaw), np.cos(yaw)], dtype=np.float64)
+    delta = np.asarray(shift[:2], dtype=np.float64)
+    fwd = float(np.dot(delta, heading))
+    lat = float(np.dot(delta, left))
+    return float(np.clip(fwd * 1.5, -0.25, 0.25)), float(np.clip(lat * 1.5, -0.25, 0.25))
+
+
 def solve_arm(model, data, goal: dict, qadr, vadr) -> tuple[np.ndarray, float]:
-    """Grid the shoulder and elbow, keep the pose whose palm is closest to the target."""
+    """Grid the shoulder and elbow. Keep a pose only when the arm does not enter another body."""
     sol = np.asarray(data.qpos[qadr], dtype=np.float64).copy()
     scratch = mujoco.MjData(model)
     sides = ("left", "right") if goal.get("hand") == "both" else (str(goal.get("hand")),)
-    gaps = []
+    sides = tuple(side for side in sides if side in _HAND_BODY)
+    allow = goal.get("body")
+    current = {}
+    by_roll = {}
+    kinematic = {}
     for side in sides:
-        if side not in _HAND_BODY:
-            continue
         act0 = _ARM0[side]
         lo, hi = _limits(model, act0)
-        current = np.asarray(data.qpos[qadr[act0 : act0 + 7]], dtype=np.float64).copy()
-        best_q = current.copy()
+        q_now = np.asarray(data.qpos[qadr[act0 : act0 + 7]], dtype=np.float64).copy()
+        current[side] = q_now
+        best_q = q_now.copy()
         best_cost = _distance(model, data, goal, side)
+        rolls = np.linspace(lo[1], hi[1], 5)
+        per_roll = {}
         for pitch in np.linspace(lo[0], hi[0], 7):
-            for roll in np.linspace(lo[1], hi[1], 5):
+            for ri, roll in enumerate(rolls):
                 for elbow in np.linspace(lo[3], hi[3], 5):
-                    trial = current.copy()
+                    trial = q_now.copy()
                     trial[0], trial[1], trial[3] = pitch, roll, elbow
                     scratch.qpos[:] = data.qpos
                     scratch.qpos[qadr[act0 : act0 + 7]] = trial
                     _sync(model, scratch)
                     dist = _distance(model, scratch, goal, side)
-                    cost = dist + 0.03 * float(np.linalg.norm(trial - current))
+                    cost = dist + 0.03 * float(np.linalg.norm(trial - q_now))
                     if cost < best_cost:
                         best_cost = cost
                         best_q = trial.copy()
-        scratch.qpos[:] = data.qpos
-        scratch.qpos[qadr[act0 : act0 + 7]] = best_q
-        _sync(model, scratch)
-        _refine(model, scratch, goal, side, qadr, vadr, lo, hi)
-        sol[act0 : act0 + 7] = scratch.qpos[qadr[act0 : act0 + 7]]
-        gaps.append(_distance(model, scratch, goal, side))
-    gap = float(min(gaps)) if gaps else float("inf")
+                    prev = per_roll.get(ri)
+                    if prev is None or dist < prev[0]:
+                        per_roll[ri] = (dist, trial.copy())
+        kinematic[side] = best_q
+        by_roll[side] = per_roll
+        sol[act0 : act0 + 7] = q_now
+    if not sides:
+        goal["shift"] = None
+        return sol, float("inf")
+
+    # One candidate per shoulder roll, so a swept-back shoulder is scored even if a straight arm is closer.
+    candidates = []
+    roll_ids = range(5)
+    for ri in roll_ids:
+        arms = {}
+        dist = 0.0
+        ok = True
+        for side in sides:
+            picked = by_roll[side].get(ri)
+            if picked is None:
+                ok = False
+                break
+            dist = max(dist, float(picked[0]))
+            arms[side] = picked[1]
+        if ok:
+            candidates.append((dist, arms))
+    clear = None
+    clear_dist = float("inf")
+    for dist, arms in candidates:
+        pen = _path_penetration(model, scratch, data, qadr, goal, current, arms, sides, allow)
+        if pen <= 1e-3 and dist < clear_dist:
+            clear = {side: q.copy() for side, q in arms.items()}
+            clear_dist = dist
+    kin_arms = {side: kinematic[side] for side in sides}
+    kin_pen, kin_dist = _posed(model, scratch, data, qadr, goal, kin_arms, sides, allow, data.qpos[:2])
+    chosen = {side: q.copy() for side, q in clear.items()} if clear is not None else current
+    if clear is not None:
+        for side in sides:
+            act0 = _ARM0[side]
+            lo, hi = _limits(model, act0)
+            scratch.qpos[:] = data.qpos
+            _set_arms(scratch, qadr, chosen)
+            _sync(model, scratch)
+            _refine(model, scratch, goal, side, qadr, vadr, lo, hi)
+            chosen[side] = np.asarray(scratch.qpos[qadr[act0 : act0 + 7]], dtype=np.float64).copy()
+        refined_pen = _path_penetration(model, scratch, data, qadr, goal, current, chosen, sides, allow)
+        if refined_pen > 1e-3:
+            chosen = {side: q.copy() for side, q in clear.items()}
+        else:
+            _posed(model, scratch, data, qadr, goal, chosen, sides, allow, data.qpos[:2])
+            clear_dist = max(_distance(model, scratch, goal, side) for side in sides)
+    for side in sides:
+        sol[_ARM0[side] : _ARM0[side] + 7] = chosen[side]
+    goal["shift"] = None
+    reachable = clear is not None and clear_dist <= TOUCH_M and kin_pen <= 1e-3
+    if not reachable:
+        goal["shift"] = _stance_for_raise(
+            model, scratch, data, qadr, goal, current, kin_arms, sides, allow
+        )
+    gap = float(clear_dist) if clear is not None else float(max(kin_dist, TOUCH_M + 1.0))
     return sol, gap
 
 

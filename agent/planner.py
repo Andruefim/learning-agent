@@ -104,6 +104,7 @@ class Level1Planner:
             "Name a hand and the place on the attached head image: u=0 is the left edge, "
             "u=1 the right edge, v=0 the top, v=1 the bottom. "
             "Write hand_goal {hand: left|right|both, u, v} on that object in this image. "
+            "hand both means both arms go to that pixel and both hands close on it. "
             "Measure u and v on this image. If the object is not in the image, do not "
             "put a point on the wall or in the middle of the frame: write a turn and no hand_goal. "
             "Do not copy numbers, and do not emit xyz, joint angles, or an object name.\n"

@@ -106,7 +106,8 @@ def _policy_tracks_vx(bot: RobotEngine) -> bool:
 
 def smoke() -> None:
     bot = RobotEngine()
-    assert int(bot.model.nu) == N_ACT and int(bot.model.nq) == 7 + N_ACT
+    assert bot.model.actuator(N_ACT - 1).name == "right_wrist_yaw"
+    assert int(bot.model.nu) >= N_ACT
     assert bot.model.joint("left_hip_yaw_joint").id >= 0
     assert isinstance(bot.l3, HumanoidFoundationPolicy)
     import torch as _torch

@@ -89,6 +89,8 @@ def compute_torques(model, data, q_target: np.ndarray, kp_vec: np.ndarray, kd_ve
     tgt = np.asarray(q_target, dtype=np.float32)
     tau = kp_vec * (tgt - q) - kd_vec * qd
     tau = tau + np.asarray(data.qfrc_bias[vadr], dtype=np.float32)
-    lo = np.asarray(model.actuator_ctrlrange[:, 0], dtype=np.float32)
-    hi = np.asarray(model.actuator_ctrlrange[:, 1], dtype=np.float32)
+    # Targets are the leading actuators. Finger motors, when present, sit after them.
+    n = int(tau.shape[0])
+    lo = np.asarray(model.actuator_ctrlrange[:n, 0], dtype=np.float32)
+    hi = np.asarray(model.actuator_ctrlrange[:n, 1], dtype=np.float32)
     return np.clip(tau, lo, hi)

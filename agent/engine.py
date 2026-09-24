@@ -62,15 +62,23 @@ from agent.l3_foundation import (
     q_from_action,
     advance_gait_phi,
 )
+from agent.dex3 import FINGER_KD, FINGER_KP, finger_target
 from agent.plan import Plan, attach_arm_channel, parse_requested_yaw, skill_from_params, wrap_angle
 from agent.reach import (
     LOOK_H,
     LOOK_W,
-    ARRIVE_S,
+    CONTACT_S,
+    GRASP_S,
+    GRASP_TRIES,
+    LIFT_M,
+    LIFT_MPS,
+    STANDOFF_M,
     TOUCH_M,
     attach_reach,
+    body_can_move,
     camera_basis,
     goal_distance,
+    hands_holding,
     ray_direction,
     ray_hit,
     reach_goal_from_step,
@@ -78,7 +86,6 @@ from agent.reach import (
     solve_arm,
     touch_lesson,
     velocity_toward,
-    walk_is_blocked,
 )
 from agent.planner import Level1Planner
 from agent.policy import encode_instr, load_state, resolve_device
@@ -100,8 +107,10 @@ class RobotEngine(FlywheelMixin):
         self.device = resolve_device()
         self.model = mujoco.MjModel.from_xml_path(str(MODEL_XML))
         self.data = mujoco.MjData(self.model)
-        if int(self.model.nu) != N_ACT:
-            raise RuntimeError(f"G1 nu={self.model.nu}, expected {N_ACT}")
+        if int(self.model.nu) < N_ACT:
+            raise RuntimeError(f"G1 nu={self.model.nu}, expected at least {N_ACT}")
+        if self.model.actuator(N_ACT - 1).name != "right_wrist_yaw":
+            raise RuntimeError("body actuators must stay the first 29, fingers after them")
         self.renderer: mujoco.Renderer | None = None
         self.eye: mujoco.Renderer | None = None
         self.pelvis_id = self.model.body("pelvis").id
@@ -113,10 +122,16 @@ class RobotEngine(FlywheelMixin):
         self.r_fg = box_geom(self.model, self.r_foot_geoms, self.r_foot_geoms[0] if self.r_foot_geoms else 0)
         self.l_fg = box_geom(self.model, self.l_foot_geoms, self.l_foot_geoms[0] if self.l_foot_geoms else 0)
         self._off_prev = np.zeros(2, dtype=np.float32)
-        self.qadr, self.vadr = actuator_addrs(self.model)
-        self.lo, self.hi = joint_limits(self.model)
-        self.tau_lo = self.model.actuator_ctrlrange[:, 0].astype(np.float32)
-        self.tau_hi = self.model.actuator_ctrlrange[:, 1].astype(np.float32)
+        qadr, vadr = actuator_addrs(self.model)
+        lo, hi = joint_limits(self.model)
+        self.qadr, self.vadr = qadr[:N_ACT], vadr[:N_ACT]
+        self.lo, self.hi = lo[:N_ACT], hi[:N_ACT]
+        self.finger_qadr, self.finger_vadr = qadr[N_ACT:], vadr[N_ACT:]
+        self.finger_tau_lo = self.model.actuator_ctrlrange[N_ACT:, 0].astype(np.float32)
+        self.finger_tau_hi = self.model.actuator_ctrlrange[N_ACT:, 1].astype(np.float32)
+        self._finger_q = np.zeros(int(self.finger_qadr.size), dtype=np.float32)
+        self.tau_lo = self.model.actuator_ctrlrange[:N_ACT, 0].astype(np.float32)
+        self.tau_hi = self.model.actuator_ctrlrange[:N_ACT, 1].astype(np.float32)
         self.kp = KP.copy()
         self.kd = KD.copy()
         self.policy = CommandTransformer().to(self.device)
@@ -184,6 +199,13 @@ class RobotEngine(FlywheelMixin):
         self._touch_best: float | None = None
         self._blocked_tick0: int | None = None
         self._approach_arrived = False
+        self._grasp_tick0: int | None = None
+        self._slip_tick0: int | None = None
+        self._contact_tick0: int | None = None
+        self._grasp_mark = -1
+        self._grasp_tries = 0
+        self._shift_xy0 = None
+        self._shift_key = None
         self.look = None
         # Demo camera orbits the pelvis. Offset is the current XML camera
         # relative to a standing pelvis. Group 0 is collision (solid red).
@@ -238,12 +260,13 @@ class RobotEngine(FlywheelMixin):
         self.q_cmd = STAND_Q.copy()
         self._cmd = stand_command()
         self._last_a = np.zeros(N_ACT, dtype=np.float32)
+        self._finger_q = np.zeros(int(self.finger_qadr.size), dtype=np.float32)
         self.data.ctrl[:] = 0.0
         self.data.time = 0.0
         if self.walk is not None:
             self.walk.reset()
         mujoco.mj_forward(self.model, self.data)
-        self.data.ctrl[:] = self._pd_torque(self.q_cmd)
+        self._write_ctrl()
 
     def _home(self, *, keep_trials: bool = False, keep_intent: bool = False):
         self._teleport_spawn()
@@ -382,13 +405,132 @@ class RobotEngine(FlywheelMixin):
         self._touch_best = float(dist) if self._touch_best is None else min(float(self._touch_best), float(dist))
 
     def _cast_look(self, goal: dict) -> None:
-        if goal.get("point") is not None or "u" not in goal:
+        if goal.get("stale") or goal.get("point") is not None or "u" not in goal:
             return
         origin, rot, fovy = camera_basis(self.model, self.data)
         direction = ray_direction(rot, fovy, LOOK_W / LOOK_H, float(goal["u"]), float(goal["v"]))
-        point = ray_hit(self.model, self.data, origin, direction, int(self.pelvis_id))
-        if point is not None:
-            goal["point"] = point
+        hit = ray_hit(self.model, self.data, origin, direction, int(self.pelvis_id))
+        if hit is None:
+            return
+        point, body = hit
+        goal["body"] = int(body)
+        goal["point"] = np.asarray(point, dtype=np.float64) - direction * STANDOFF_M
+
+    def _drop_grasp(self, goal: dict, frame: dict, note: str) -> None:
+        self._grasp_tries += 1
+        goal["stale"] = True
+        goal.pop("point", None)
+        goal.pop("body", None)
+        goal["held"] = False
+        self._approach_arrived = False
+        self._reach_sol = None
+        self._reach_tick = -10**9
+        self._blocked_tick0 = None
+        self._grasp_tick0 = None
+        self._slip_tick0 = None
+        self._contact_tick0 = None
+        self._shift_xy0 = None
+        self._shift_key = None
+        frame["approaching"] = False
+        if self._grasp_tries >= GRASP_TRIES:
+            goal["done"] = True
+            self._note("Хват не получился.")
+        else:
+            self._note(note)
+
+    def _grasp_progress(self, goal: dict, frame: dict) -> bool:
+        """After arrival, contact is the task. A free body also has to rise."""
+        if self._grasp_mark == int(self._tick):
+            return bool(goal.get("stale"))
+        self._grasp_mark = int(self._tick)
+        if not self._approach_arrived or goal.get("done") or goal.get("target") == "head":
+            return False
+        body = goal.get("body")
+        if body is None or goal.get("point") is None:
+            return False
+        holding = hands_holding(self.model, self.data, str(goal.get("hand") or ""), int(body))
+        dt = float(self.model.opt.timestep)
+        if holding:
+            self._grasp_tick0 = None
+            self._slip_tick0 = None
+            if not goal.get("held"):
+                goal["held"] = True
+                goal["z0"] = float(self.data.xpos[int(body)][2])
+                goal["lift0"] = float(np.asarray(goal["point"])[2])
+            if body_can_move(self.model, int(body)):
+                if self._contact_tick0 is None:
+                    self._contact_tick0 = int(self._tick)
+                climbed = LIFT_MPS * (int(self._tick) - int(self._contact_tick0)) * dt
+                z = float(self.data.xpos[int(body)][2])
+                if z - float(goal["z0"]) >= LIFT_M:
+                    goal["done"] = True
+                    self._note("Предмет в руке.")
+                else:
+                    pt = np.asarray(goal["point"], dtype=np.float64).copy()
+                    pt[2] = float(goal["lift0"]) + min(climbed, LIFT_M + 0.02)
+                    goal["point"] = pt
+                    if abs(pt[2] - float(getattr(self, "_lift_sol_z", pt[2]))) > 0.01:
+                        self._lift_sol_z = float(pt[2])
+                        self._reach_tick = -10**9
+            else:
+                if self._contact_tick0 is None:
+                    self._contact_tick0 = int(self._tick)
+                if (int(self._tick) - int(self._contact_tick0)) * dt >= CONTACT_S:
+                    goal["done"] = True
+                    self._note("Рука на предмете.")
+            return False
+        if goal.get("held"):
+            if self._slip_tick0 is None:
+                self._slip_tick0 = int(self._tick)
+            if (int(self._tick) - int(self._slip_tick0)) * dt >= CONTACT_S:
+                self._drop_grasp(goal, frame, "Хват сорвался. Смотрю ещё раз.")
+                return True
+            return False
+        if self._grasp_tick0 is None:
+            self._grasp_tick0 = int(self._tick)
+        if (int(self._tick) - int(self._grasp_tick0)) * dt >= GRASP_S:
+            self._drop_grasp(goal, frame, "Хват мимо. Смотрю ещё раз.")
+            return True
+        return False
+
+    def _shift_followed(self, vx: float, vy: float) -> bool:
+        """True while the pelvis is still making progress along the clearance step."""
+        yaw = self._heading()
+        heading = np.array([np.cos(yaw), np.sin(yaw)], dtype=np.float64)
+        left = np.array([-np.sin(yaw), np.cos(yaw)], dtype=np.float64)
+        cmd = heading * float(vx) + left * float(vy)
+        n = float(np.linalg.norm(cmd))
+        if n < 0.05:
+            return True
+        key = (round(float(vx), 2), round(float(vy), 2))
+        if getattr(self, "_shift_key", None) != key:
+            self._shift_key = key
+            self._shift_xy0 = None
+            self._blocked_tick0 = int(self._tick)
+        now = np.asarray(self._pelvis()[:2], dtype=np.float64)
+        origin = getattr(self, "_shift_xy0", None)
+        if origin is None:
+            self._shift_xy0 = now.copy()
+            return True
+        moved = float(np.dot(now - origin, cmd / n))
+        if moved > 0.04:
+            self._shift_xy0 = now.copy()
+            self._blocked_tick0 = int(self._tick)
+            return True
+        held = (int(self._tick) - int(self._blocked_tick0 or self._tick)) * float(self.model.opt.timestep)
+        return held < 3.0
+
+    def _stall(self, goal: dict, frame: dict, note: str) -> bool:
+        if self._grasp_mark == int(self._tick):
+            return bool(goal.get("stale"))
+        if self._blocked_tick0 is None:
+            self._blocked_tick0 = int(self._tick)
+        held = (int(self._tick) - int(self._blocked_tick0)) * float(self.model.opt.timestep)
+        if held < GRASP_S:
+            return False
+        self._grasp_mark = int(self._tick)
+        self._drop_grasp(goal, frame, note)
+        return True
 
     def _servo_reach(self, cmd: np.ndarray) -> np.ndarray:
         frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
@@ -399,6 +541,10 @@ class RobotEngine(FlywheelMixin):
                 frame["approaching"] = False
             return cmd
         self._cast_look(goal)
+        if goal.get("stale"):
+            frame["approaching"] = False
+            self._reach_sol = None
+            return cmd
         if goal.get("unresolved") or ("u" in goal and goal.get("point") is None):
             self._touch_goal = True
             frame["approaching"] = False
@@ -413,41 +559,47 @@ class RobotEngine(FlywheelMixin):
         was_approaching = bool(frame.get("approaching"))
         gap = float(getattr(self, "_reach_gap", 0.0))
         point = np.asarray(goal["point"], dtype=np.float64) if goal.get("point") is not None else None
-        approaching = bool(
-            world and point is not None and gap > TOUCH_M and not self._approach_arrived
-        )
-        if approaching:
-            if walk_is_blocked(self._heading(), self._pelvis(), self.data.qvel[:2], point):
-                if self._blocked_tick0 is None:
-                    self._blocked_tick0 = int(self._tick)
-            else:
-                self._blocked_tick0 = None
-            held = 0.0
-            if self._blocked_tick0 is not None:
-                held = (int(self._tick) - int(self._blocked_tick0)) * float(self.model.opt.timestep)
-            if held >= ARRIVE_S:
-                self._approach_arrived = True
-                approaching = False
-        elif world and gap <= TOUCH_M:
-            self._approach_arrived = True
-            self._blocked_tick0 = None
-        else:
-            self._blocked_tick0 = None
+        approaching = bool(world and point is not None and gap > TOUCH_M and goal.get("shift") is not None)
         frame["approaching"] = approaching
         if approaching:
-            vx, wz = velocity_toward(self._heading(), self._pelvis(), point)
-            out[0] = np.float32(vx)
-            out[2] = np.float32(wz)
-            return out
-        if world:
+            shift = np.asarray(goal["shift"], dtype=np.float64)
+            yaw = self._heading()
+            if float(np.linalg.norm(shift[:2])) > TOUCH_M:
+                heading = np.array([np.cos(yaw), np.sin(yaw)], dtype=np.float64)
+                fwd = float(np.dot(np.asarray(shift[:2], dtype=np.float64), heading))
+                if fwd < -TOUCH_M:
+                    vx, vy, wz = float(np.clip(fwd * 1.5, -0.25, 0.0)), 0.0, 0.0
+                else:
+                    dest = np.asarray(self._pelvis(), dtype=np.float64).copy()
+                    dest[0] += float(shift[0])
+                    dest[1] += float(shift[1])
+                    vx, wz = velocity_toward(yaw, self._pelvis(), dest)
+                    vy = 0.0
+                out[0] = np.float32(vx)
+                out[1] = np.float32(vy)
+                out[2] = np.float32(wz)
+                if self._shift_followed(vx, vy):
+                    self._blocked_tick0 = None
+                elif self._stall(goal, frame, "Рука не проходит. Смотрю ещё раз."):
+                    return out
+            else:
+                self._blocked_tick0 = None
+        elif world:
+            self._approach_arrived = True
             out[0] = np.float32(0.0)
             out[1] = np.float32(0.0)
             out[2] = np.float32(0.0)
             if was_approaching:
                 self._queue_tick0 = int(self._tick)
+            if self._grasp_progress(goal, frame):
+                return out
         return servo_reach(self.model, self.data, out, goal, self.qadr, self._reach_sol)
 
     def _lesson_block(self) -> str | None:
+        frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
+        reach = (frame or {}).get("reach") or {}
+        if "u" in reach and not reach.get("held"):
+            return "Сон пропущен: рука не коснулась."
         return touch_lesson(bool(self._touch_goal), self._touch_d0, self._touch_best)
 
     def _load_queue(self, plan: Plan) -> None:
@@ -479,6 +631,9 @@ class RobotEngine(FlywheelMixin):
         if not getattr(self, "_queue", None) or self._queue_i >= len(self._queue) - 1:
             return
         frame = self._queue[self._queue_i]
+        reach = frame.get("reach") or {}
+        if "u" in reach and not reach.get("done"):
+            return
         elapsed = (int(self._tick) - int(self._queue_tick0)) * float(self.model.opt.timestep)
         done = elapsed >= float(frame["hold_s"])
         if int(frame["steps"]) > 0 and self._step_count >= int(frame["steps"]):
@@ -562,6 +717,13 @@ class RobotEngine(FlywheelMixin):
             self._touch_best = None
             self._blocked_tick0 = None
             self._approach_arrived = False
+            self._grasp_tick0 = None
+            self._slip_tick0 = None
+            self._contact_tick0 = None
+            self._grasp_mark = -1
+            self._grasp_tries = 0
+            self._shift_xy0 = None
+            self._shift_key = None
             self._ep_tick0 = int(self._tick)
             self.intent = text
             self.user_cmd = text
@@ -623,9 +785,22 @@ class RobotEngine(FlywheelMixin):
                 old = self._queue[0]
                 frame = self._frame(plan.queue[0])
                 kept = old.get("reach") or {}
-                if kept.get("point") is not None:
+                if kept.get("point") is not None and not kept.get("stale"):
                     frame["reach"] = kept
                     frame["approaching"] = bool(old.get("approaching"))
+                elif kept.get("stale") and not kept.get("done"):
+                    new = frame.get("reach") or {}
+                    if "u" not in new:
+                        frame["reach"] = kept
+                        frame["approaching"] = False
+                    else:
+                        self._approach_arrived = False
+                        self._reach_sol = None
+                        self._reach_tick = -10**9
+                        self._blocked_tick0 = None
+                        self._grasp_tick0 = None
+                        self._slip_tick0 = None
+                        self._contact_tick0 = None
                 had_yaw = old["yaw"] is not None
                 self._queue[0] = frame
                 self._steps_goal = int(frame["steps"])
@@ -669,6 +844,27 @@ class RobotEngine(FlywheelMixin):
 
     def _pd_torque(self, q_cmd: np.ndarray) -> np.ndarray:
         return compute_torques(self.model, self.data, q_cmd, self.kp, self.kd, self.qadr, self.vadr)
+
+    def _finger_command(self) -> np.ndarray:
+        frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
+        goal = frame.get("reach") if frame else None
+        if not goal or frame.get("approaching") or goal.get("point") is None:
+            return finger_target(None)
+        return finger_target(goal)
+
+    def _finger_torque(self) -> np.ndarray:
+        target = self._finger_command()
+        self._finger_q += np.clip(target - self._finger_q, -0.012, 0.012)
+        q = np.asarray(self.data.qpos[self.finger_qadr], dtype=np.float32)
+        qd = np.asarray(self.data.qvel[self.finger_vadr], dtype=np.float32)
+        tau = FINGER_KP * (self._finger_q - q) - FINGER_KD * qd
+        tau = tau + np.asarray(self.data.qfrc_bias[self.finger_vadr], dtype=np.float32)
+        return np.clip(tau, self.finger_tau_lo, self.finger_tau_hi).astype(np.float32)
+
+    def _write_ctrl(self) -> None:
+        self.data.ctrl[:N_ACT] = self._pd_torque(self.q_cmd)
+        if self.finger_qadr.size:
+            self.data.ctrl[N_ACT:] = self._finger_torque()
 
     def _update_steps(self) -> None:
         if abs(self._active_vx()) > 0.08:
@@ -765,12 +961,17 @@ class RobotEngine(FlywheelMixin):
         )
         q_des = np.clip(q_des, self.lo, self.hi)
         self.q_cmd = self._slew(q_des)
-        self.data.ctrl[:] = self._pd_torque(self.q_cmd)
+        self._write_ctrl()
         cmd_v = np.array([self._cmd[CMD_VX], self._cmd[CMD_VY], self._cmd[CMD_WZ]], dtype=np.float32)
         # Arms forward move the mass past the toes. The stiff stand cannot
         # catch that; the walk net can, by stepping, so it stays in the loop.
-        reaching = bool(getattr(self, "_queue", None) and self._queue[self._queue_i].get("reach"))
-        arms_out = reaching or float(np.max(np.abs(self._cmd[CMD_ARMS] - arm_hang_cmd()))) > 0.45
+        reach = {}
+        if getattr(self, "_queue", None):
+            reach = self._queue[self._queue_i].get("reach") or {}
+        arm_q = np.asarray(self.data.qpos[self.qadr[15:29]], dtype=np.float64)
+        arms_clear = float(np.max(np.abs(arm_q - arm_hang_cmd()))) > 0.45
+        reaching = reach.get("point") is not None or reach.get("target") == "head"
+        arms_out = reaching or arms_clear or float(np.max(np.abs(self._cmd[CMD_ARMS] - arm_hang_cmd()))) > 0.45
         if self.walk is not None:
             leg = self.walk.leg_torque(
                 self.data,
