@@ -88,8 +88,9 @@ from agent.reach import (
     velocity_toward,
 )
 from agent.planner import Level1Planner
-from agent.policy import encode_instr, load_state, resolve_device
+from agent.policy import encode_instr, load_matching, load_state, resolve_device
 from agent.s1 import CTX, HIST_DIM, N_RAYS, CommandTransformer
+from agent.vla import VLA_H, VLA_W, arm_contact_geoms, pose_moved, subtree_bodies, System15
 from agent.trials import MultiTrialBuffer
 
 STEP_PERIOD = 0.55
@@ -148,7 +149,7 @@ class RobotEngine(FlywheelMixin):
         self.student_drive = False
         self.outcome = "ok"
         self.policy.eval()
-        load_state(self.policy, self.ckpt, self.device)
+        load_matching(self.policy, self.ckpt, self.device)
         self.walk = load_g1_walk()
         self.l3_drive = load_state(self.l3, self.l3_ckpt, self.device)
         self.lock = threading.RLock()
@@ -232,6 +233,15 @@ class RobotEngine(FlywheelMixin):
         self._preview_rgb: np.ndarray | None = None
         self._preview_seq = 0
         self._jpeg_seq = -1
+        self._robot_bodies = subtree_bodies(self.model, int(self.pelvis_id))
+        self._arm_geoms = arm_contact_geoms(self.model)
+        self.vla = System15(self.device)
+        self._ep_pi0 = False
+        self._pi0_driving = False
+        self._pi0_touched: set[int] = set()
+        self._pi0_x0 = None
+        self._pi0_m0 = None
+        self._vla_eye = None
         self._home()
         blob = self._load_replay()
         if blob is not None:
@@ -302,6 +312,7 @@ class RobotEngine(FlywheelMixin):
         self._rays = np.ones(N_RAYS, dtype=np.float32)
         self._load_queue(self.waypoint)
         self.status = "stand"
+        self._reset_pi0_episode()
         self._kick_render = True
         if not keep_trials:
             self.trials.clear()
@@ -725,6 +736,7 @@ class RobotEngine(FlywheelMixin):
             self._shift_xy0 = None
             self._shift_key = None
             self._ep_tick0 = int(self._tick)
+            self._reset_pi0_episode()
             self.intent = text
             self.user_cmd = text
             self.l1_ok = True
@@ -845,10 +857,75 @@ class RobotEngine(FlywheelMixin):
     def _pd_torque(self, q_cmd: np.ndarray) -> np.ndarray:
         return compute_torques(self.model, self.data, q_cmd, self.kp, self.kd, self.qadr, self.vadr)
 
+    def _reset_pi0_episode(self) -> None:
+        self._ep_pi0 = False
+        self._pi0_driving = False
+        self._pi0_touched = set()
+        self._pi0_x0 = None
+        self._pi0_m0 = None
+        vla = getattr(self, "vla", None)
+        if vla is not None:
+            vla.reset_chunk()
+
+    def _pi0_task(self) -> bool:
+        if self.outcome == "fall" or not (self.user_cmd or self.intent):
+            return False
+        frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
+        if not frame:
+            return False
+        reach = frame.get("reach") or {}
+        if reach.get("target") == "head":
+            return False
+        return "u" in reach
+
+    def _render_vla(self) -> np.ndarray:
+        if self._vla_eye is None:
+            self._vla_eye = mujoco.Renderer(self.model, VLA_H, VLA_W)
+        self._vla_eye.update_scene(self.data, camera="head", scene_option=self._view_opt)
+        return np.ascontiguousarray(self._vla_eye.render())
+
+    def _pi0_command(self, proprio: np.ndarray) -> np.ndarray | None:
+        if not self._pi0_task():
+            return None
+        note = self.vla.ensure_started()
+        if note:
+            self._note(note)
+        if self._tick % VISION_STRIDE == 0 and self.vla.wants_frame():
+            self.vla.submit(self._render_vla(), self.user_cmd or self.intent, proprio)
+        arm = np.asarray(proprio[15:29], dtype=np.float32)
+        return self.vla.command(arm, self.lo[15:29], self.hi[15:29])
+
+    def _mark_pi0_frame(self) -> None:
+        frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
+        if not frame:
+            return
+        frame["approaching"] = False
+        reach = frame.get("reach") or {}
+        elapsed = (int(self._tick) - int(self._queue_tick0)) * float(self.model.opt.timestep)
+        if elapsed >= float(frame["hold_s"]):
+            reach["done"] = True
+
+    def _note_pi0_contact(self) -> None:
+        if not self._pi0_driving or not self._arm_geoms:
+            return
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            g1, g2 = int(contact.geom1), int(contact.geom2)
+            other = g2 if g1 in self._arm_geoms else g1 if g2 in self._arm_geoms else -1
+            if other < 0:
+                continue
+            body = int(self.model.geom_bodyid[other])
+            if body <= 0 or body in self._robot_bodies:
+                continue
+            self._pi0_touched.add(body)
+
+    def _pi0_moved(self) -> bool:
+        return pose_moved(self._pi0_x0, self._pi0_m0, self.data.xpos, self.data.xmat, self._pi0_touched)
+
     def _finger_command(self) -> np.ndarray:
         frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
         goal = frame.get("reach") if frame else None
-        if not goal or frame.get("approaching") or goal.get("point") is None:
+        if self._pi0_driving or not goal or frame.get("approaching") or goal.get("point") is None:
             return finger_target(None)
         return finger_target(goal)
 
@@ -879,12 +956,27 @@ class RobotEngine(FlywheelMixin):
         err = self._balance_err()
         self.errors.append(err.copy())
         proprio = self._hinges()
-        language = encode_instr(self.waypoint.param_text())
         z = self.waypoint.z()
         errors = np.stack(self.errors)
-        teacher = self._servo_reach(self._plan_command())
+        plan_cmd = self._plan_command()
+        pi0 = self._pi0_command(proprio)
+        if pi0 is not None:
+            if not self._ep_pi0:
+                self._ep_pi0 = True
+                self._queue_tick0 = int(self._tick)
+                self._pi0_x0 = np.array(self.data.xpos, dtype=np.float64, copy=True)
+                self._pi0_m0 = np.array(self.data.xmat, dtype=np.float64, copy=True)
+                self._pi0_touched = set()
+            self._pi0_driving = True
+            self._mark_pi0_frame()
+            teacher = pi0
+            self.ctrl_source = "s15"
+        else:
+            self._pi0_driving = False
+            teacher = self._servo_reach(plan_cmd)
+            self.ctrl_source = "l3"
+        language = encode_instr((self.user_cmd or self.intent) if self._pi0_driving else self.waypoint.param_text())
         chosen = teacher
-        self.ctrl_source = "l3"
         if self._tick % VISION_STRIDE == 0:
             self._eye_rgb = self._render_eye()
             self._rays = self._head_rays()
@@ -911,6 +1003,7 @@ class RobotEngine(FlywheelMixin):
                     "skill": self.waypoint.skill,
                     "outcome": self.outcome,
                     "rays": self._rays.tolist(),
+                    "source": "s15" if self._pi0_driving else "l3",
                 }
             )
             if len(self.logs) > 4_000:
@@ -922,7 +1015,7 @@ class RobotEngine(FlywheelMixin):
             if self.alpha > 1e-8:
                 self.ctrl_source = f"l3+l2-{self.stage}"
         self._last_teacher = teacher
-        self._cmd = self._servo_reach(chosen)
+        self._cmd = chosen if self._pi0_driving else self._servo_reach(chosen)
         if self._tick % VISION_STRIDE == 0:
             err_now = self.errors[-1] if self.errors else np.zeros(3, dtype=np.float32)
             self._push_hist(chosen, err_now, self._rays)
@@ -989,6 +1082,8 @@ class RobotEngine(FlywheelMixin):
             else:
                 self.ctrl_source = "g1-stand"
         mujoco.mj_step(self.model, self.data)
+        if self._pi0_driving:
+            self._note_pi0_contact()
         if self.walk is not None and (self._tick + 1) % DECIMATION == 0 and not self.walk.holding:
             self.walk.update(self.data, self.qadr, self.vadr, cmd_v, dynamic=arms_out)
         elif self.walk is not None and self.walk.holding:
@@ -1213,6 +1308,8 @@ class RobotEngine(FlywheelMixin):
                 "wave": round(self.waypoint.teacher().wave, 2),
                 "kick": round(self.waypoint.teacher().kick, 2),
                 "steps_left": max(0, self._steps_goal - self._step_count),
+                "s15": self.vla.phase(),
+                "s15_err": self.vla.error,
                 "l1_ok": self.l1_ok,
                 "l1_url": self.planner.base_url,
                 "l1_err": self.planner.last_err,

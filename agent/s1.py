@@ -1,7 +1,9 @@
-"""Causal System 1. Predicts the next 18-D command from the command history.
+"""Causal System 1. Predicts the next 18-D command from history, image, and proprioception.
 
 Awake it only runs forward. Sleep fits the next command on replay. The walk
-policy and the teacher residual stay outside this module.
+policy and the teacher residual stay outside this module. The image and joint
+projections start at zero, so an old checkpoint still reproduces its command
+until a lesson moves them.
 """
 
 from __future__ import annotations
@@ -16,10 +18,11 @@ from agent.config import (
     SKILL_IDS,
     TRIAL_EMB,
     TRIAL_MAX,
+    VISION_DIM,
     Z_DIM,
 )
-from agent.h2 import ACTION_DIM, TRIAL_FEAT
-from agent.policy import LanguageEncoder
+from agent.h2 import ACTION_DIM, N_ACT, TRIAL_FEAT
+from agent.policy import LanguageEncoder, VisionEncoder
 
 N_RAYS = 5
 HIST_DIM = ACTION_DIM + 3 + N_RAYS
@@ -59,6 +62,13 @@ class CommandTransformer(nn.Module):
         )
         prefix_in = LANG_DIM + Z_DIM + ERROR_LEN * 3 + TRIAL_EMB
         self.prefix = nn.Sequential(nn.Linear(prefix_in, D_MODEL), nn.SiLU(), nn.Linear(D_MODEL, D_MODEL))
+        self.vision = VisionEncoder()
+        self.see = nn.Linear(VISION_DIM, D_MODEL)
+        self.feel = nn.Linear(N_ACT, D_MODEL)
+        nn.init.zeros_(self.see.weight)
+        nn.init.zeros_(self.see.bias)
+        nn.init.zeros_(self.feel.weight)
+        nn.init.zeros_(self.feel.bias)
         self.cmd_proj = nn.Linear(HIST_DIM, D_MODEL)
         self.pos = nn.Embedding(CTX + CHUNK + 4, D_MODEL)
         self.blocks = nn.ModuleList(_Block(D_MODEL) for _ in range(N_LAYERS))
@@ -76,12 +86,12 @@ class CommandTransformer(nn.Module):
         feat = torch.zeros(b, TRIAL_MAX, TRIAL_FEAT, device=image.device, dtype=image.dtype)
         return ids, feat
 
-    def _prefix(self, image, language, z, errors, skill_ids, trial_feat) -> torch.Tensor:
+    def _prefix(self, image, proprio, language, z, errors, skill_ids, trial_feat) -> torch.Tensor:
         if skill_ids is None or trial_feat is None:
             skill_ids, trial_feat = self._trial_pad(image)
         trials = self.encode_trials(skill_ids, trial_feat).mean(dim=1)
         flat = torch.cat([self.lang(language), z, errors.flatten(1), trials], dim=-1)
-        return self.prefix(flat)
+        return self.prefix(flat) + self.see(self.vision(image)) + self.feel(proprio)
 
     def _run(self, tokens: torch.Tensor) -> torch.Tensor:
         t = tokens.shape[1]
@@ -103,8 +113,7 @@ class CommandTransformer(nn.Module):
         history: torch.Tensor | None = None,
         steps: int = CHUNK,
     ):
-        del proprio
-        prefix = self._prefix(image, language, z, errors, skill_ids, trial_feat)
+        prefix = self._prefix(image, proprio, language, z, errors, skill_ids, trial_feat)
         b = prefix.shape[0]
         if history is None:
             err = errors[:, :, :3]
@@ -137,8 +146,7 @@ class CommandTransformer(nn.Module):
         rays: torch.Tensor | None = None,
     ):
         """Teacher-forced next command. `chunk` is (B, T, 18)."""
-        del proprio
-        prefix = self._prefix(image, language, z, errors, skill_ids, trial_feat)
+        prefix = self._prefix(image, proprio, language, z, errors, skill_ids, trial_feat)
         prev = chunk[:, :-1]
         err = errors[:, -1, :3].unsqueeze(1).expand(-1, prev.shape[1], -1)
         raw = prefix.new_zeros(prev.shape[0], prev.shape[1], HIST_DIM)

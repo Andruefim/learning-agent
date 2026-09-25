@@ -606,7 +606,14 @@ class FlywheelMixin:
         if self._ep_slept or self._ep_failed or not self._ep_armed:
             return
         rows = self._trim_idle_tail(self.logs[self._ep_i :])
-        block = self._lesson_block()
+        if getattr(self, "_ep_pi0", False):
+            if not self._pi0_moved():
+                block = "Сон пропущен: касание не сдвинуло мир."
+            else:
+                rows = [row for row in rows if row.get("source") == "s15"]
+                block = None
+        else:
+            block = self._lesson_block()
         self.logs = self.logs[: self._ep_i]
         self._ep_i = len(self.logs)
         self._ep_slept = True

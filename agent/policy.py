@@ -53,6 +53,24 @@ def load_state(module: nn.Module, path: Path, device: torch.device) -> bool:
     return True
 
 
+def load_matching(module: nn.Module, path: Path, device: torch.device) -> bool:
+    """Load the keys that still match. New layers keep their init."""
+    if not path.exists():
+        return False
+    try:
+        blob = torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        blob = torch.load(path, map_location=device)
+    if not isinstance(blob, dict):
+        return False
+    current = module.state_dict()
+    kept = {k: v for k, v in blob.items() if k in current and tuple(current[k].shape) == tuple(v.shape)}
+    if not kept:
+        return False
+    module.load_state_dict(kept, strict=False)
+    return True
+
+
 class VisionEncoder(nn.Module):
     def __init__(self, out: int = VISION_DIM):
         super().__init__()
