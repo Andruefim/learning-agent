@@ -46,9 +46,10 @@ def resolve_ollama_url(spec: str | None = None) -> str:
 
 class Level1Planner:
     def __init__(self):
-        self.model = os.getenv("L1_MODEL", "qwen3.8:latest").strip()
+        self.model = os.getenv("L1_MODEL", "qwen3.5:9b-q8_0").strip()
         self.base_url = resolve_ollama_url()
         self.last_err = ""
+        print(f"L1 planner model={self.model} url={self.base_url}", flush=True)
 
     def hold(self, user_command: str, scene: dict) -> Plan:
         return Plan.stand(user_command.strip() or "stand")
@@ -101,14 +102,22 @@ class Level1Planner:
             '  "положи левую руку на голову" → {"instruction":"левая рука на голову","queue":['
             '{"hand_goal":{"hand":"left","target":"head"},"vx":0,"hold_s":4}],"done":false}\n'
             "Touching something visible is the same channel, for any object. "
-            "Name a hand and the place on the attached head image: u=0 is the left edge, "
-            "u=1 the right edge, v=0 the top, v=1 the bottom. "
+            "Name a hand and the place on the attached head image: u=0 left, "
+            "u=1 right, v=0 top, v=1 bottom. "
             "Write hand_goal {hand: left|right|both, u, v} on that object in this image. "
             "hand both means both arms go to that pixel and both hands close on it. "
-            "Measure u and v on this image. If the object is not in the image, do not "
-            "put a point on the wall or in the middle of the frame: write a turn and no hand_goal. "
-            "Do not copy numbers, and do not emit xyz, joint angles, or an object name.\n"
-            '  shape → {"instruction":"...","queue":['
+            "For doors/cabinets/fridges/ovens: point at the metal handle bar itself, "
+            "not the glass, not the flat panel, and not the vertical door seam/edge. "
+            "Keep 0.12 < u < 0.88 — values near 0 or 1 are the image border, not a grip. "
+            "Measure u and v on this image. If the object is not clearly visible, do not "
+            "invent a hand_goal on the wall or the floor: write a short look instead — "
+            "turn left/right, or step back (vx negative), with no hand_goal. "
+            "Only put hand_goal when you can see the object in this frame.\n"
+            '  object not in frame → {"instruction":"ищу объект","queue":['
+            '{"direction":"left","hold_s":2},{"vx":0,"hold_s":1}],"done":false}\n'
+            '  too close / cut off → {"instruction":"отойти","queue":['
+            '{"direction":"backward","speed":"slow","hold_s":2},{"vx":0,"hold_s":1}],"done":false}\n'
+            '  object visible → {"instruction":"...","queue":['
             '{"hand_goal":{"hand":"right","u":0.62,"v":0.41},"vx":0,"hold_s":8}],"done":false}\n'
             "Examples:\n"
             '  "сделай 5 шагов вперед" → {"skill":"locomote","params":{"direction":"forward","speed":"medium","distance_hint":"5"}}\n'
@@ -176,3 +185,98 @@ class Level1Planner:
         except Exception as e:
             self.last_err = f"{type(e).__name__}: {e}"[:160]
             return self.hold(user_command, scene), False
+
+    async def plan_point(
+        self, user_command: str, image: bytes, prior: dict | None = None
+    ) -> tuple[Plan, bool]:
+        """Relook with memory of the approach pixel. No lean."""
+        prior_line = ""
+        if prior and prior.get("u") is not None and prior.get("v") is not None:
+            prior_line = (
+                f"Earlier, from farther away, the grasp pixel was "
+                f"u={float(prior['u']):.2f} v={float(prior['v']):.2f} "
+                f"(hand={prior.get('hand', 'right')}). "
+                "That was the intended handle/grip. "
+                "If you still see that same handle, refine u,v onto it. "
+                "If the handle is out of frame or occluded, reply {\"visible\": false} — "
+                "do NOT invent a point on the flat door, wall, or image border.\n"
+            )
+        prompt = (
+            "The image is the robot head camera, upright, often close to the object.\n"
+            f"Command: {user_command}\n"
+            f"{prior_line}"
+            "Opening a door/fridge/oven/cabinet means grasping the metal handle bar, "
+            "not the glass and not the flat panel and not the vertical seam.\n"
+            "Keep 0.12 < u < 0.88.\n"
+            "u=0 left, u=1 right, v=0 top, v=1 bottom.\n"
+            "Reply JSON with keys hand, u, v — or visible:false."
+        )
+        message: dict = {"role": "user", "content": prompt, "images": [base64.b64encode(image).decode("ascii")]}
+        payload = {
+            "model": self.model,
+            "messages": [message],
+            "stream": False,
+            "format": "json",
+            "think": False,
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 120, "think": False},
+        }
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                r = await client.post(f"{self.base_url}/api/chat", json=payload)
+                r.raise_for_status()
+                text = r.json()["message"]["content"]
+            text = text.strip()
+            if "</think>" in text:
+                text = text.split("</think>", 1)[-1]
+            start, end = text.find("{"), text.rfind("}")
+            data = json.loads(text[start : end + 1] if start >= 0 else text)
+            if data.get("visible") is False or (data.get("u") is None and data.get("v") is None):
+                # Keep gait as hold — engine restores the approach world point.
+                plan = Plan(
+                    instruction=user_command,
+                    skill="hold",
+                    params={},
+                    done=False,
+                    queue=[{"vx": 0, "hold_s": 4}],
+                )
+                print("gaze point: not visible up close → keep prior", flush=True)
+                self.last_err = ""
+                return plan, True
+            hand = str(data.get("hand") or (prior or {}).get("hand") or "right").strip().lower()
+            if hand not in {"left", "right", "both"}:
+                hand = "right"
+            u = float(np_clip(data.get("u")))
+            v = float(np_clip(data.get("v")))
+            if u < 0.10 or u > 0.90:
+                plan = Plan(
+                    instruction=user_command,
+                    skill="hold",
+                    params={},
+                    done=False,
+                    queue=[{"vx": 0, "hold_s": 4}],
+                )
+                print(f"gaze point: border u={u:.2f} → keep prior", flush=True)
+                self.last_err = ""
+                return plan, True
+            goal = {"hand": hand, "u": u, "v": v}
+            plan = Plan(
+                instruction=user_command,
+                skill="hold",
+                params={"hand_goal": goal},
+                done=False,
+                queue=[{"hand_goal": goal, "vx": 0, "hold_s": 8}],
+            )
+            attach_reach(plan, user_command)
+            print(f"gaze point hand={hand} u={u:.2f} v={v:.2f}", flush=True)
+            self.last_err = ""
+            return plan, True
+        except Exception as e:
+            self.last_err = f"{type(e).__name__}: {e}"[:160]
+            print(f"gaze point failed: {self.last_err}", flush=True)
+            return self.hold(user_command, {}), False
+
+
+def np_clip(value) -> float:
+    return max(0.0, min(1.0, float(value)))

@@ -2,7 +2,11 @@
 
 The checkpoint is lerobot/pi0_base (Gemma license). It is loaded on the first
 interaction that names a pixel, on a side thread, so physics does not wait on
-the download. Wrist cameras are not added: missing views stay masked.
+the download. The live loop asks for the next image only after the current
+chunk has finished, so the arm is not given a new gesture while it is still
+moving. While that result is late, forward and yaw speed decay; the arm
+targets stay. The chunk itself is played as π0 produced it.
+Wrist cameras are not added: missing views stay masked.
 
 Its 32-D normalized action is retargeted into the existing 18-D command.
 Dims 0:14 are arm deltas in actuator order. Dims 14 and 16 are forward and
@@ -12,9 +16,13 @@ Height stays at the stand. Fingers are not in the chunk.
 
 from __future__ import annotations
 
+import json
+import math
 import queue
+import struct
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -25,6 +33,10 @@ from agent.config import STAND_Z
 from agent.h2 import colliding_geoms
 from agent.l3_cmd import CMD_ARMS, CMD_H, CMD_VX, CMD_VY, CMD_WZ, clip_command, stand_command
 
+# The sim thread and this loader both enter torch. On this build that overlap
+# is an access violation, so only one of them runs native torch at a time.
+TORCH_GATE = threading.Lock()
+
 PI0_REPO = "lerobot/pi0_base"
 VLA_H, VLA_W = 240, 320
 ARM_DELTA = 0.12
@@ -32,6 +44,9 @@ BASE_VX = 0.25
 BASE_WZ = 0.40
 BASE_DEAD = 0.15
 HOLD_TICKS = 10
+SIM_DT = 0.002
+LATCH_TAU_S = 0.25
+BLEND_HOLDS = 2
 WORLD_MOVE_M = 0.02
 HINGE_LEVER_M = 0.30
 _BASE_IMAGE = "observation.images.base_0_rgb"
@@ -110,12 +125,67 @@ def retarget_action(action, arm_q, lo, hi) -> np.ndarray:
     return clip_command(cmd)
 
 
+def _bleed_base(cmd: np.ndarray) -> np.ndarray:
+    """Ease vx/wz toward zero. Arm targets stay. One call is one sim tick."""
+    out = np.array(cmd, dtype=np.float32, copy=True)
+    keep = math.exp(-SIM_DT / LATCH_TAU_S)
+    out[CMD_VX] = np.float32(float(out[CMD_VX]) * keep)
+    out[CMD_WZ] = np.float32(float(out[CMD_WZ]) * keep)
+    if abs(float(out[CMD_VX])) < 1e-3:
+        out[CMD_VX] = np.float32(0.0)
+    if abs(float(out[CMD_WZ])) < 1e-3:
+        out[CMD_WZ] = np.float32(0.0)
+    return out
+
+
 def _torch_distributed_ok() -> bool:
     try:
         import torch.distributed.distributed_c10d  # noqa: F401
     except Exception:
         return False
     return True
+
+
+_SAFETENSORS_DTYPE = {
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
+
+def read_safetensors(path) -> dict[str, torch.Tensor]:
+    """Read a checkpoint without mmap.
+
+    ``safetensors.torch.load_file`` maps the file and then calls ``.item()`` on
+    that storage. On this torch build that faults, so the bytes are copied in.
+    """
+    path = Path(path)
+    with path.open("rb") as handle:
+        header_n = struct.unpack("<Q", handle.read(8))[0]
+        header = json.loads(handle.read(header_n))
+        base = 8 + header_n
+        out: dict[str, torch.Tensor] = {}
+        for key, spec in header.items():
+            if key == "__metadata__":
+                continue
+            start, end = spec["data_offsets"]
+            handle.seek(base + int(start))
+            raw = handle.read(int(end) - int(start))
+            tensor = torch.frombuffer(raw, dtype=_SAFETENSORS_DTYPE[spec["dtype"]])
+            out[key] = tensor.reshape(spec["shape"]).clone()
+        return out
+
+
+def _load_file_nommap(filename, device="cpu"):
+    tensors = read_safetensors(filename)
+    if str(device) not in ("cpu", "cpu:0"):
+        tensors = {key: value.to(device) for key, value in tensors.items()}
+    return tensors
 
 
 def _import_pi0():
@@ -173,6 +243,13 @@ class System15:
         self._hold = 0
         self._anchor: np.ndarray | None = None
         self._latched: np.ndarray | None = None
+        self._queued: np.ndarray | None = None
+        self._blend_from: np.ndarray | None = None
+        self._blend_left = 0
+        self._blend_total = 0
+        self._infer_s: float | None = None
+        self._slow_noted = False
+        self._load_noted = False
 
     @property
     def error(self) -> str:
@@ -190,23 +267,81 @@ class System15:
                 return "run"
             return "ready"
 
-    def ensure_started(self) -> str | None:
+    def load_now(self) -> str | None:
+        """Load on the calling thread.
+
+        safetensors faults (0xC0000005) in torch on a fresh thread with this build.
+        The process that already runs the walk net can read the checkpoint.
+        """
         with self._lock:
-            if self._thread is None:
-                self._thread = threading.Thread(target=self._loop, name="pi0", daemon=True)
-                self._thread.start()
-                self._pending = "System 1.5: гружу lerobot/pi0_base."
+            if self._ready or self._thread is not None:
+                note = self._pending
+                self._pending = None
+                return note
+        try:
+            self._load_weights()
+        except Exception as exc:
+            with self._lock:
+                self._error = f"{type(exc).__name__}: {exc}"
+                self._pending = f"System 1.5 не поднялась: {self._error}"
+                note = self._pending
+                self._pending = None
+                return note
+        with self._lock:
+            self._ready = True
+            self._pending = "System 1.5 готова."
+            self._thread = threading.Thread(target=self._serve, name="pi0", daemon=True)
+            self._thread.start()
             note = self._pending
             self._pending = None
             return note
 
+    def ensure_started(self) -> str | None:
+        with self._lock:
+            if self._thread is None and not self._ready and not self._error and not self._load_noted:
+                self._pending = "System 1.5: гружу lerobot/pi0_base."
+                self._load_noted = True
+            note = self._pending
+            self._pending = None
+            return note
+
+    def infer_s(self) -> float | None:
+        with self._lock:
+            return self._infer_s
+
+    def _steps_left(self) -> int:
+        if self._chunk is None:
+            return 0
+        return int(len(self._chunk) - self._i)
+
+    def _prefetch_steps(self) -> int:
+        n = 1 if self._chunk is None else int(len(self._chunk))
+        if self._infer_s is None:
+            return max(1, n // 2)
+        step_s = SIM_DT * HOLD_TICKS
+        need = int(math.ceil(float(self._infer_s) / step_s)) + BLEND_HOLDS
+        return max(1, min(need, max(1, n - 1)))
+
     def wants_frame(self) -> bool:
         with self._lock:
-            return bool(self._ready and not self._busy and self._chunk is None)
+            if not self._ready or self._busy or self._queued is not None:
+                return False
+            if self._chunk is None:
+                return True
+            return self._steps_left() <= self._prefetch_steps()
+
+    def wants_still_frame(self) -> bool:
+        """True only between chunks. A look taken mid-motion becomes the next yank."""
+        with self._lock:
+            if not self._ready or self._busy or self._queued is not None:
+                return False
+            return self._chunk is None
 
     def submit(self, rgb: np.ndarray, text: str, state: np.ndarray) -> None:
         with self._lock:
-            if not self._ready or self._busy or self._chunk is not None:
+            if not self._ready or self._busy or self._queued is not None:
+                return
+            if self._chunk is not None and self._steps_left() > self._prefetch_steps():
                 return
             self._busy = True
             gen = int(self._gen)
@@ -223,14 +358,40 @@ class System15:
             with self._lock:
                 self._busy = False
 
+    def _install_queued(self) -> None:
+        if self._queued is None or self._chunk is not None:
+            return
+        nxt = self._queued
+        self._queued = None
+        self._blend_from = None if self._latched is None else self._latched.copy()
+        self._blend_left = BLEND_HOLDS * HOLD_TICKS
+        self._blend_total = int(self._blend_left)
+        self._chunk = nxt
+        self._i = 0
+        self._hold = 0
+        self._anchor = None
+
+    def _blend(self, cmd: np.ndarray) -> np.ndarray:
+        if self._blend_left <= 0 or self._blend_from is None or self._blend_total <= 0:
+            return cmd
+        weight = 1.0 - (float(self._blend_left) / float(self._blend_total))
+        mixed = (1.0 - weight) * self._blend_from + weight * cmd
+        self._blend_left -= 1
+        if self._blend_left <= 0:
+            self._blend_from = None
+        return clip_command(mixed)
+
     def command(self, arm_q, lo, hi) -> np.ndarray | None:
         with self._lock:
+            self._install_queued()
             if self._chunk is None:
-                return None if self._latched is None else self._latched.copy()
+                if self._latched is None:
+                    return None
+                self._latched = _bleed_base(self._latched)
+                return self._latched.copy()
             if self._anchor is None:
                 self._anchor = np.asarray(arm_q, dtype=np.float32).reshape(14).copy()
-            action = self._chunk[self._i]
-            cmd = retarget_action(action, self._anchor, lo, hi)
+            cmd = self._blend(retarget_action(self._chunk[self._i], self._anchor, lo, hi))
             self._latched = cmd
             self._hold += 1
             if self._hold >= HOLD_TICKS:
@@ -240,6 +401,7 @@ class System15:
                 if self._i >= len(self._chunk):
                     self._chunk = None
                     self._i = 0
+                    self._install_queued()
             return cmd.copy()
 
     def reset_chunk(self) -> None:
@@ -250,6 +412,10 @@ class System15:
             self._hold = 0
             self._anchor = None
             self._latched = None
+            self._queued = None
+            self._blend_from = None
+            self._blend_left = 0
+            self._blend_total = 0
             self._busy = False
         while True:
             try:
@@ -257,17 +423,7 @@ class System15:
             except queue.Empty:
                 break
 
-    def _loop(self) -> None:
-        try:
-            self._load()
-        except Exception as exc:
-            with self._lock:
-                self._error = f"{type(exc).__name__}: {exc}"
-                self._pending = f"System 1.5 не поднялась: {self._error}"
-            return
-        with self._lock:
-            self._ready = True
-            self._pending = "System 1.5 готова."
+    def _serve(self) -> None:
         while True:
             rgb, text, state, gen = self._jobs.get()
             try:
@@ -275,13 +431,17 @@ class System15:
                     current = int(self._gen)
                 if gen != current:
                     continue
-                chunk = self._infer(rgb, text, state)
+                chunk, elapsed = self._infer(rgb, text, state)
                 with self._lock:
+                    self._infer_s = float(elapsed)
+                    chunk_s = float(len(chunk)) * HOLD_TICKS * SIM_DT
+                    if elapsed > chunk_s and not self._slow_noted:
+                        self._slow_noted = True
+                        self._pending = (
+                            f"System 1.5: инференс {elapsed:.2f} с длиннее чанка {chunk_s:.2f} с."
+                        )
                     if gen == int(self._gen):
-                        self._chunk = chunk
-                        self._i = 0
-                        self._hold = 0
-                        self._anchor = None
+                        self._queued = chunk
             except Exception as exc:
                 with self._lock:
                     self._error = f"{type(exc).__name__}: {exc}"
@@ -291,8 +451,19 @@ class System15:
                     self._busy = False
 
     def _load(self) -> None:
+        with TORCH_GATE:
+            self._load_weights()
+
+    def _load_weights(self) -> None:
         policy_cls, make_processors = _import_pi0()
-        policy = policy_cls.from_pretrained(PI0_REPO)
+        import safetensors.torch as safetensors_torch
+
+        # lerobot prints a checkmark after the load. On a cp1251 console that
+        # raises, and the caller treats it as a failed load and drops the weights.
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        safetensors_torch.load_file = _load_file_nommap
+        policy = policy_cls.from_pretrained(PI0_REPO, local_files_only=True)
         policy.eval()
         policy.to(self.device)
         pre, post = make_processors(
@@ -304,7 +475,12 @@ class System15:
         self._pre = pre
         self._post = post
 
-    def _infer(self, rgb: np.ndarray, text: str, state: np.ndarray) -> np.ndarray:
+    def _infer(self, rgb: np.ndarray, text: str, state: np.ndarray) -> tuple[np.ndarray, float]:
+        with TORCH_GATE:
+            return self._infer_unlocked(rgb, text, state)
+
+    def _infer_unlocked(self, rgb: np.ndarray, text: str, state: np.ndarray) -> tuple[np.ndarray, float]:
+        t0 = time.perf_counter()
         image = torch.from_numpy(rgb).permute(2, 0, 1).float().div_(255.0)
         obs = {
             _BASE_IMAGE: image,
@@ -324,4 +500,4 @@ class System15:
             pad = np.zeros((arr.shape[0], 17), dtype=np.float32)
             pad[:, : arr.shape[-1]] = arr
             arr = pad
-        return arr
+        return arr, time.perf_counter() - t0

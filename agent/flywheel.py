@@ -636,7 +636,7 @@ class FlywheelMixin:
 
     def _attempt_done(self) -> bool:
         """The queue has reached a frame that is no longer asking the robot to travel."""
-        if not self._ep_armed or self._ep_slept or self._ep_failed or self._trial_busy:
+        if self._awaiting_plan or not self._ep_armed or self._ep_slept or self._ep_failed or self._trial_busy:
             return False
         if self.outcome == "fall" or not getattr(self, "_queue", None):
             return False
@@ -646,20 +646,20 @@ class FlywheelMixin:
             return False
         frame = self._queue[self._queue_i]
         elapsed = (int(self._tick) - int(self._queue_tick0)) * float(self.model.opt.timestep)
-        held = elapsed >= float(frame["hold_s"])
-        if int(frame["steps"]) > 0 and self._step_count >= int(frame["steps"]):
-            held = True
-        if frame["yaw"] is not None and self._turn_done():
-            held = True
+        steps_done = int(frame["steps"]) > 0 and self._step_count >= int(frame["steps"])
+        turn_done = frame["yaw"] is not None and self._turn_done()
+        held = elapsed >= float(frame["hold_s"]) or steps_done or turn_done
         if frame.get("approaching"):
             return False
         reach = frame.get("reach") or {}
         if "u" in reach and not reach.get("done"):
             return False
-        cmd = np.asarray(frame["cmd"], dtype=np.float64)
-        traveling = max(abs(float(cmd[0])), abs(float(cmd[1])), abs(float(cmd[2]))) > 0.05
-        if traveling:
-            return False
+        # The touch timer must not end a pull: π0 stays on the hands after it.
+        # A finished step count or turn has already stopped the base.
+        if not (steps_done or turn_done):
+            cmd = np.asarray(frame["cmd"], dtype=np.float64)
+            if max(abs(float(cmd[0])), abs(float(cmd[1])), abs(float(cmd[2]))) > 0.05:
+                return False
         return bool(held)
 
     def _consider_sleep(self) -> None:

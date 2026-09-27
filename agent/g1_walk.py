@@ -78,11 +78,20 @@ class G1LegPolicy:
         """True once the legs are on the stiff stand PD and the net is idle."""
         return self._fade >= 1.0
 
-    def update(self, data, qadr: np.ndarray, vadr: np.ndarray, cmd_v: np.ndarray, *, dynamic: bool = False) -> None:
+    def update(
+        self,
+        data,
+        qadr: np.ndarray,
+        vadr: np.ndarray,
+        cmd_v: np.ndarray,
+        *,
+        dynamic: bool = False,
+    ) -> None:
         """One 50 Hz step. cmd_v is [vx, vy, wz] in the same units as Unitree's yaml.
 
-        dynamic keeps the clock running at a zero velocity command, so a
-        forward arm pose can be balanced by stepping instead of a fixed stand.
+        dynamic keeps the net in the loop at a zero velocity command, so a
+        forward arm pose can be balanced instead of a fixed stand. The phase
+        keeps moving: this net has no static pose, and freezing the clock falls.
         """
         cmd = np.asarray(cmd_v, dtype=np.float32).reshape(3)
         moving = float(np.max(np.abs(cmd))) > CMD_IDLE

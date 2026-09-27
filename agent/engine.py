@@ -39,11 +39,16 @@ from agent.h2 import (
     MODEL_XML,
     N_ACT,
     SPAWN_Z,
+    SPAWN_XY,
     STAND_Q,
+    WAIST_P,
+    WAIST_R,
+    WAIST_Y,
     actuator_addrs,
     arm_hang_cmd,
     box_geom,
     colliding_geoms,
+    disable_wrist_mesh_contacts,
     joint_limits,
 )
 from agent.joint_pd import compute_torques
@@ -72,8 +77,10 @@ from agent.reach import (
     GRASP_TRIES,
     LIFT_M,
     LIFT_MPS,
+    RAISE_GAP_M,
     STANDOFF_M,
     TOUCH_M,
+    assembly_root,
     attach_reach,
     body_can_move,
     camera_basis,
@@ -82,6 +89,7 @@ from agent.reach import (
     ray_direction,
     ray_hit,
     reach_goal_from_step,
+    refine_arm,
     servo_reach,
     solve_arm,
     touch_lesson,
@@ -90,7 +98,7 @@ from agent.reach import (
 from agent.planner import Level1Planner
 from agent.policy import encode_instr, load_matching, load_state, resolve_device
 from agent.s1 import CTX, HIST_DIM, N_RAYS, CommandTransformer
-from agent.vla import VLA_H, VLA_W, arm_contact_geoms, pose_moved, subtree_bodies, System15
+from agent.vla import VLA_H, VLA_W, TORCH_GATE, arm_contact_geoms, pose_moved, subtree_bodies, System15
 from agent.trials import MultiTrialBuffer
 
 STEP_PERIOD = 0.55
@@ -112,6 +120,7 @@ class RobotEngine(FlywheelMixin):
             raise RuntimeError(f"G1 nu={self.model.nu}, expected at least {N_ACT}")
         if self.model.actuator(N_ACT - 1).name != "right_wrist_yaw":
             raise RuntimeError("body actuators must stay the first 29, fingers after them")
+        disable_wrist_mesh_contacts(self.model)
         self.renderer: mujoco.Renderer | None = None
         self.eye: mujoco.Renderer | None = None
         self.pelvis_id = self.model.body("pelvis").id
@@ -192,6 +201,7 @@ class RobotEngine(FlywheelMixin):
         self._ep_armed = False
         self._ep_slept = False
         self._ep_failed = False
+        self._awaiting_plan = False
         self._quiet_tick: int | None = None
         self._reach_sol: np.ndarray | None = None
         self._reach_tick = -10**9
@@ -200,6 +210,18 @@ class RobotEngine(FlywheelMixin):
         self._touch_best: float | None = None
         self._blocked_tick0: int | None = None
         self._approach_arrived = False
+        self._reach_close = False
+        self._relook_used = False
+        self._walk_released = False
+        self._arm_wait0: int | None = None
+        self._gaze_locked = False
+        self._need_gaze_plan = False
+        self._jpeg_was_gaze = False
+        self._marker_pos: np.ndarray | None = None
+        self._marker_aim: np.ndarray | None = None
+        self._marker_dim = False
+        self._anchor: dict | None = None
+        self._pi0_approach_hold = False
         self._grasp_tick0: int | None = None
         self._slip_tick0: int | None = None
         self._contact_tick0: int | None = None
@@ -256,7 +278,7 @@ class RobotEngine(FlywheelMixin):
         mujoco.mj_resetData(self.model, self.data)
         if int(self.model.nkey) > 0:
             mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
-        self.data.qpos[0:3] = (0.0, 0.0, SPAWN_Z)
+        self.data.qpos[0:3] = (float(SPAWN_XY[0]), float(SPAWN_XY[1]), SPAWN_Z)
         self.data.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)
         self.data.qpos[self.qadr] = STAND_Q
         self.data.qvel[:] = 0
@@ -312,6 +334,20 @@ class RobotEngine(FlywheelMixin):
         self._rays = np.ones(N_RAYS, dtype=np.float32)
         self._load_queue(self.waypoint)
         self.status = "stand"
+        self._awaiting_plan = False
+        self._approach_arrived = False
+        self._reach_close = False
+        self._relook_used = False
+        self._walk_released = False
+        self._arm_wait0 = None
+        self._gaze_locked = False
+        self._need_gaze_plan = False
+        self._jpeg_was_gaze = False
+        self._marker_pos = None
+        self._marker_aim = None
+        self._marker_dim = False
+        self._anchor = None
+        self._pi0_approach_hold = False
         self._reset_pi0_episode()
         self._kick_render = True
         if not keep_trials:
@@ -415,25 +451,209 @@ class RobotEngine(FlywheelMixin):
             self._touch_d0 = float(dist)
         self._touch_best = float(dist) if self._touch_best is None else min(float(self._touch_best), float(dist))
 
+    def _workspace_pitch(self) -> float:
+        """Legacy lean toward a low counter. Unused for routine pointing — it hid tall objects."""
+        jid = int(self.model.actuator_trnid[WAIST_P, 0])
+        lo, hi = (float(self.model.jnt_range[jid, 0]), float(self.model.jnt_range[jid, 1]))
+        return float(np.clip(0.36, lo, hi))
+
+    def _gaze_ready(self) -> bool:
+        """Upright head frame for a relook JPEG. No mandatory lean into the floor."""
+        if not self._pi0_task():
+            return False
+        q = self.data.qpos
+        adr = self.qadr
+        upright = abs(float(q[adr[WAIST_P]])) < 0.12
+        straight = abs(float(q[adr[WAIST_Y]])) < 0.10 and abs(float(q[adr[WAIST_R]])) < 0.10
+        return upright and straight
+
+    def _holding_gaze(self) -> bool:
+        """Stand still for a relook JPEG. Do not lean the waist."""
+        if not self._pi0_task():
+            return False
+        if getattr(self, "_need_gaze_plan", False) and not getattr(self, "_gaze_locked", False):
+            return True
+        if not getattr(self, "_gaze_locked", False):
+            return False
+        frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
+        reach = (frame or {}).get("reach") or {}
+        return "u" in reach and reach.get("point") is None and not reach.get("stale")
+
+    def reach_prior(self) -> dict | None:
+        """Pixel/world memory for a close relook — so L1 is not amnesic."""
+        with self.lock:
+            frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
+            reach = (frame or {}).get("reach") or {}
+            anchor = getattr(self, "_anchor", None) or {}
+            u = reach.get("u", anchor.get("u"))
+            v = reach.get("v", anchor.get("v"))
+            if u is None or v is None:
+                return None
+            return {
+                "u": float(u),
+                "v": float(v),
+                "hand": str(reach.get("hand") or anchor.get("hand") or "right"),
+                "has_world": bool(anchor.get("point") is not None or reach.get("point") is not None),
+            }
+
+    def _body_name(self, body: int) -> str:
+        return mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, int(body)) or "?"
+
+    def _cast_is_junk(self, name: str, u: float, *, refining: bool = False) -> bool:
+        low = name.lower()
+        if "wall" in low or "floor" in low or low in {"world", "ground"}:
+            return True
+        # Border pixels are fine for a first approach cast, but not as a close refine.
+        if refining and (u < 0.10 or u > 0.90):
+            return True
+        return False
+
+    def _save_anchor(self, goal: dict) -> None:
+        point = goal.get("point")
+        body = goal.get("body")
+        if point is None or body is None or "u" not in goal:
+            return
+        name = self._body_name(int(body))
+        u = float(goal["u"])
+        if self._cast_is_junk(name, u):
+            return
+        # Prefer not to remember an image-border grip as the lasting target.
+        if u < 0.12 or u > 0.88:
+            return
+        self._anchor = {
+            "point": np.asarray(point, dtype=np.float64).copy(),
+            "aim": None if goal.get("aim") is None else np.asarray(goal["aim"], dtype=np.float64).copy(),
+            "body": int(body),
+            "u": u,
+            "v": float(goal["v"]),
+            "hand": str(goal.get("hand") or "right"),
+            "name": name,
+        }
+
+    def _restore_anchor(self, goal: dict) -> bool:
+        anchor = getattr(self, "_anchor", None)
+        if not anchor or anchor.get("point") is None:
+            return False
+        goal["point"] = np.asarray(anchor["point"], dtype=np.float64).copy()
+        if anchor.get("aim") is not None:
+            goal["aim"] = np.asarray(anchor["aim"], dtype=np.float64).copy()
+        goal["body"] = int(anchor["body"])
+        goal["u"] = float(anchor["u"])
+        goal["v"] = float(anchor["v"])
+        goal["hand"] = str(anchor.get("hand") or goal.get("hand") or "right")
+        goal.pop("stale", None)
+        goal["drawn"] = 0.0
+        self._marker_pos = np.asarray(goal["point"], dtype=np.float64).copy()
+        self._marker_aim = None if goal.get("aim") is None else np.asarray(goal["aim"], dtype=np.float64).copy()
+        self._marker_dim = False
+        self._gaze_locked = True
+        self._need_gaze_plan = False
+        self._note(f"Держу цель с подхода: {anchor.get('name', '?')}")
+        return True
+
     def _cast_look(self, goal: dict) -> None:
         if goal.get("stale") or goal.get("point") is not None or "u" not in goal:
+            return
+        # Pixel came from an upright head frame (first plan or relook). Wait out any old lean.
+        if not getattr(self, "_gaze_locked", False):
+            return
+        if abs(float(self.data.qpos[self.qadr[WAIST_P]])) > 0.12:
             return
         origin, rot, fovy = camera_basis(self.model, self.data)
         direction = ray_direction(rot, fovy, LOOK_W / LOOK_H, float(goal["u"]), float(goal["v"]))
         hit = ray_hit(self.model, self.data, origin, direction, int(self.pelvis_id))
         if hit is None:
+            if self._restore_anchor(goal):
+                return
+            self._note("Луч мимо. Нужен другой ракурс.")
+            self._gaze_locked = False
+            self._need_gaze_plan = True
             return
         point, body = hit
-        goal["body"] = int(body)
-        goal["point"] = np.asarray(point, dtype=np.float64) - direction * STANDOFF_M
+        root = int(assembly_root(self.model, int(body)))
+        # The palm cannot drop onto a hit below the forearm. Walk up the same
+        # body in the image, at most 12 cm, and stop when the ray leaves it.
+        chosen = np.asarray(point, dtype=np.float64)
+        chosen_dir = direction
+        if float(chosen[2]) < 0.78:
+            u0 = float(goal["u"])
+            v0 = float(goal["v"])
+            for k in range(1, 5):
+                d2 = ray_direction(rot, fovy, LOOK_W / LOOK_H, u0, v0 - 0.04 * k)
+                hit2 = ray_hit(self.model, self.data, origin, d2, int(self.pelvis_id))
+                if hit2 is None:
+                    break
+                p2, b2 = hit2
+                if int(assembly_root(self.model, int(b2))) != root:
+                    break
+                if float(p2[2]) - float(chosen[2]) > 0.12:
+                    break
+                chosen = np.asarray(p2, dtype=np.float64)
+                chosen_dir = d2
+                if float(chosen[2]) >= 0.78:
+                    break
+        name = self._body_name(root)
+        refining = bool(getattr(self, "_anchor", None) or getattr(self, "_relook_used", False))
+        if self._cast_is_junk(name, float(goal["u"]), refining=refining) and self._restore_anchor(goal):
+            print(f"cast reject u={float(goal['u']):.2f} v={float(goal['v']):.2f} {name} → anchor", flush=True)
+            return
+        if "wall" in name.lower() or "floor" in name.lower():
+            self._note(f"Луч в {name}. Нужен другой ракурс.")
+            self._gaze_locked = False
+            self._need_gaze_plan = True
+            return
+        goal["body"] = root
+        goal["aim"] = np.asarray(chosen_dir, dtype=np.float64).copy()
+        goal["drawn"] = 0.0
+        goal["point"] = chosen - chosen_dir * STANDOFF_M
+        point = chosen
+        self._marker_pos = np.asarray(goal["point"], dtype=np.float64).copy()
+        self._marker_aim = np.asarray(chosen_dir, dtype=np.float64).copy()
+        self._marker_dim = False
+        self._save_anchor(goal)
+        waist = float(self.data.qpos[self.qadr[WAIST_P]])
+        print(
+            f"cast u={float(goal['u']):.2f} v={float(goal['v']):.2f} {name} z={float(point[2]):.2f} waist={waist:.2f} yaw={self._heading():.2f} wy={float(self.data.qpos[self.qadr[WAIST_Y]]):.2f}",
+            flush=True,
+        )
+        self._note(f"Цель: {name} · z={float(point[2]):.2f}")
+
+    def _draw_contact(self, goal: dict) -> None:
+        """Once the hand is on the point, bring that point back along the look.
+
+        A front face that can move comes with the hand. No joint class and no arc.
+        """
+        aim = goal.get("aim")
+        point = goal.get("point")
+        if aim is None or point is None:
+            return
+        if float(getattr(self, "_reach_gap", 1.0)) > TOUCH_M * 1.5 and not self._reach_close:
+            return
+        drawn = float(goal.get("drawn") or 0.0)
+        limit = 0.14
+        if drawn >= limit:
+            return
+        step = min(limit - drawn, 0.12 * float(self.model.opt.timestep))
+        goal["point"] = np.asarray(point, dtype=np.float64) - np.asarray(aim, dtype=np.float64) * step
+        goal["drawn"] = drawn + step
 
     def _drop_grasp(self, goal: dict, frame: dict, note: str) -> None:
         self._grasp_tries += 1
         goal["stale"] = True
         goal.pop("point", None)
         goal.pop("body", None)
+        goal.pop("aim", None)
+        goal.pop("drawn", None)
         goal["held"] = False
+        self._marker_dim = True
         self._approach_arrived = False
+        self._reach_close = False
+        self._walk_released = False
+        self._arm_wait0 = None
+        self._gaze_locked = False
+        self._need_gaze_plan = True
+        self._jpeg_was_gaze = False
+        self._pi0_approach_hold = False
         self._reach_sol = None
         self._reach_tick = -10**9
         self._blocked_tick0 = None
@@ -447,7 +667,7 @@ class RobotEngine(FlywheelMixin):
             goal["done"] = True
             self._note("Хват не получился.")
         else:
-            self._note(note)
+            self._note(note or "Хват мимо. Смотрю ещё раз.")
 
     def _grasp_progress(self, goal: dict, frame: dict) -> bool:
         """After arrival, contact is the task. A free body also has to rise."""
@@ -456,6 +676,18 @@ class RobotEngine(FlywheelMixin):
         self._grasp_mark = int(self._tick)
         if not self._approach_arrived or goal.get("done") or goal.get("target") == "head":
             return False
+        # Geometric servo owns contact. π0 needs a short settle before the miss clock.
+        if "u" in goal and self._pi0_driving and not goal.get("held"):
+            since = (int(self._tick) - int(getattr(self, "_queue_tick0", self._tick))) * float(self.model.opt.timestep)
+            if since < 4.0:
+                self._grasp_tick0 = None
+                return False
+        # Geometric: wait until the palm is near before starting the miss clock.
+        if "u" in goal and not self._pi0_driving and not goal.get("held"):
+            near = bool(self._reach_close or float(getattr(self, "_reach_gap", 1.0)) <= TOUCH_M * 2.0)
+            if not near:
+                self._grasp_tick0 = None
+                return False
         body = goal.get("body")
         if body is None or goal.get("point") is None:
             return False
@@ -544,6 +776,8 @@ class RobotEngine(FlywheelMixin):
         return True
 
     def _servo_reach(self, cmd: np.ndarray) -> np.ndarray:
+        if self._awaiting_plan:
+            return cmd
         frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
         goal = frame.get("reach") if frame else None
         if not goal or self.outcome == "fall":
@@ -559,20 +793,152 @@ class RobotEngine(FlywheelMixin):
         if goal.get("unresolved") or ("u" in goal and goal.get("point") is None):
             self._touch_goal = True
             frame["approaching"] = False
-            return cmd
+            # No pixel yet. A student residual here walks him off while he is leaning.
+            held = np.array(cmd, dtype=np.float32, copy=True)
+            held[0] = np.float32(0.0)
+            held[1] = np.float32(0.0)
+            held[2] = np.float32(0.0)
+            held[CMD_ARMS] = arm_hang_cmd()
+            return held
         self._note_touch(goal)
         out = np.array(cmd, dtype=np.float32, copy=True)
         world = goal.get("point") is not None and goal.get("target") != "head"
-        if self._reach_sol is None or int(self._tick) - int(self._reach_tick) >= 300:
+        # The lean is only for the picture. Walk waits until the waist is back
+        # and the stand has stopped rocking, or the first step falls backward.
+        if world and not self._walk_released:
+            waist = abs(float(self.data.qpos[self.qadr[WAIST_P]]))
+            rocking = float(np.linalg.norm(self.data.qvel[0:6]))
+            if waist > 0.05 or rocking > 0.25:
+                out[0] = np.float32(0.0)
+                out[1] = np.float32(0.0)
+                out[2] = np.float32(0.0)
+                out[CMD_ARMS] = arm_hang_cmd()
+                frame["approaching"] = False
+                self._reach_sol = None
+                return out
+            self._walk_released = True
+        if world and abs(float(self.data.qpos[self.qadr[WAIST_P]])) > 0.10:
+            out[0] = np.float32(0.0)
+            out[1] = np.float32(0.0)
+            out[2] = np.float32(0.0)
+            out[CMD_ARMS] = arm_hang_cmd()
+            frame["approaching"] = False
+            self._reach_sol = None
+            return out
+        if world and self._approach_arrived and self._reach_sol is not None and goal.get("point") is not None:
+            # Solver gap is only refreshed every few ticks. The palm can already be
+            # on the handle while the cache still says 15 cm — that blocked the pull.
+            live = goal_distance(self.model, self.data, goal)
+            if live is not None:
+                self._reach_gap = min(float(getattr(self, "_reach_gap", live)), float(live))
+        if world and self._approach_arrived:
+            self._draw_contact(goal)
+        # The grid is for finding a pose. Once he is there, a short jacobian
+        # step keeps the palm on the point while the gait sways. A full grid
+        # is ~100 ms and would hitch the stand.
+        track = (
+            world
+            and self._approach_arrived
+            and self._reach_sol is not None
+            and float(getattr(self, "_reach_gap", 1.0)) <= TOUCH_M * 3.0
+            and int(self._tick) - int(self._reach_tick) >= 25
+        )
+        if track:
+            self._reach_sol, gap = refine_arm(
+                self.model, self.data, goal, self.qadr, self.vadr, self._reach_sol
+            )
+            self._reach_gap = float(gap)
+            self._reach_tick = int(self._tick)
+        elif self._reach_sol is None or int(self._tick) - int(self._reach_tick) >= (
+            100
+            if world and not self._reach_close and float(getattr(self, "_reach_gap", 1.0)) < 0.30
+            else 300
+        ):
             self._reach_sol, gap = solve_arm(self.model, self.data, goal, self.qadr, self.vadr)
             self._reach_gap = float(gap)
             self._reach_tick = int(self._tick)
+            shift = goal.get("shift")
+            key = None if shift is None else (round(float(shift[0]), 2), round(float(shift[1]), 2))
+            if key != getattr(self, "_shift_print", None):
+                self._shift_print = key
+                pelvis = self._pelvis()
+                print(
+                    f"reach gap={float(gap):.2f} shift={key} pelvis={float(pelvis[0]):.2f},{float(pelvis[1]):.2f} yaw={self._heading():.2f}",
+                    flush=True,
+                )
         was_approaching = bool(frame.get("approaching"))
-        gap = float(getattr(self, "_reach_gap", 0.0))
+        gap = float(getattr(self, "_reach_gap", 1.0))
         point = np.asarray(goal["point"], dtype=np.float64) if goal.get("point") is not None else None
-        approaching = bool(world and point is not None and gap > TOUCH_M and goal.get("shift") is not None)
+        # The cached gap is the same on every physics tick. Counting it each tick
+        # cancelled the step after 6 ms and the stand fell backward.
+        just_solved = int(self._reach_tick) == int(self._tick)
+        if world and point is not None and not self._reach_close and just_solved:
+            best = float(goal.get("best_gap", gap + 1.0))
+            here = np.asarray(self._pelvis()[:2], dtype=np.float64)
+            origin = goal.get("flat_xy")
+            moved = 0.0 if origin is None else float(np.linalg.norm(here - np.asarray(origin, dtype=np.float64)))
+            if gap < best - 0.02:
+                goal["best_gap"] = float(gap)
+                goal["flat"] = 0
+                goal["flat_xy"] = here.copy()
+            elif moved > 0.10:
+                goal["flat"] = int(goal.get("flat") or 0) + 1
+                goal["flat_xy"] = here.copy()
+                if gap < best:
+                    goal["best_gap"] = float(gap)
+            elif origin is None:
+                goal["flat_xy"] = here.copy()
+            # A new look from a few centimetres away hits a different object.
+            # Stop only after the body has actually travelled and the hand is no closer.
+            if int(goal.get("flat") or 0) >= 4 and gap > TOUCH_M:
+                goal["shift"] = None
+        # A clearance search can stop while the palm is still short. Creep toward
+        # the point until a later solve can actually put the hand on it.
+        if (
+            world
+            and point is not None
+            and just_solved
+            and gap > TOUCH_M * 1.5
+            and goal.get("shift") is None
+            and not self._reach_close
+            and int(goal.get("flat") or 0) < 4
+        ):
+            delta = np.asarray(point[:2], dtype=np.float64) - np.asarray(self._pelvis()[:2], dtype=np.float64)
+            dist = float(np.linalg.norm(delta))
+            if dist > TOUCH_M:
+                goal["shift"] = delta / dist * min(0.12, dist)
+        if world and gap <= TOUCH_M * 1.5:
+            self._reach_close = True
+            goal["best_gap"] = float(gap)
+            goal["shift"] = None
+        if self._reach_close:
+            goal["shift"] = None
+        approaching = bool(
+            world
+            and point is not None
+            and gap > RAISE_GAP_M
+            and goal.get("shift") is not None
+            and not self._reach_close
+        )
         frame["approaching"] = approaching
-        if approaching:
+        # Flat cleared the walk while the palm was still short (e.g. gap 0.39): raise
+        # from here instead of freezing with hang arms forever.
+        stranded = bool(
+            world
+            and point is not None
+            and goal.get("shift") is None
+            and int(goal.get("flat") or 0) >= 4
+            and gap <= 0.55
+            and not self._reach_close
+        )
+        raise_arm = bool(world and (self._reach_close or gap <= RAISE_GAP_M or stranded))
+        if raise_arm:
+            frame["approaching"] = False
+            approaching = False
+            goal["shift"] = None
+        if world and not raise_arm:
+            out[CMD_ARMS] = arm_hang_cmd()
+        if approaching and not raise_arm:
             shift = np.asarray(goal["shift"], dtype=np.float64)
             yaw = self._heading()
             if float(np.linalg.norm(shift[:2])) > TOUCH_M:
@@ -586,24 +952,81 @@ class RobotEngine(FlywheelMixin):
                     dest[1] += float(shift[1])
                     vx, wz = velocity_toward(yaw, self._pelvis(), dest)
                     vy = 0.0
-                out[0] = np.float32(vx)
-                out[1] = np.float32(vy)
-                out[2] = np.float32(wz)
-                if self._shift_followed(vx, vy):
-                    self._blocked_tick0 = None
-                elif self._stall(goal, frame, "Рука не проходит. Смотрю ещё раз."):
-                    return out
+                    vx = float(np.clip(vx, -0.22, 0.22))
+                # Near the point, yaw-only commands make the gait stomp without progress.
+                if abs(vx) < 0.05 and gap <= RAISE_GAP_M + 0.08:
+                    goal["shift"] = None
+                    out[0] = np.float32(0.0)
+                    out[1] = np.float32(0.0)
+                    out[2] = np.float32(0.0)
+                    frame["approaching"] = False
+                    approaching = False
+                    raise_arm = True
+                else:
+                    out[0] = np.float32(vx)
+                    out[1] = np.float32(vy)
+                    out[2] = np.float32(wz)
+                    if self._shift_followed(vx, vy):
+                        self._blocked_tick0 = None
+                    elif self._stall(goal, frame, "Рука не проходит. Смотрю ещё раз."):
+                        return out
             else:
                 self._blocked_tick0 = None
-        elif world:
+            if approaching:
+                speed = max(abs(float(out[0])), abs(float(out[1])), abs(float(out[2])))
+                if speed > 0.05:
+                    return out
+                frame["approaching"] = False
+                out[0] = np.float32(0.0)
+                out[1] = np.float32(0.0)
+                out[2] = np.float32(0.0)
+                out[CMD_ARMS] = arm_hang_cmd()
+                return out
+        if world and not raise_arm:
+            out[0] = np.float32(0.0)
+            out[1] = np.float32(0.0)
+            out[2] = np.float32(0.0)
+            out[CMD_ARMS] = arm_hang_cmd()
+            return out
+        if world:
+            if not self._approach_arrived:
+                self._arm_wait0 = int(self._tick)
+                # Keep the approach world point as memory. Close relook may refine
+                # only if the handle is still visible — otherwise restore the anchor.
+                if not getattr(self, "_relook_used", False):
+                    self._relook_used = True
+                    self._approach_arrived = True
+                    self._save_anchor(goal)
+                    self._need_gaze_plan = True
+                    self._gaze_locked = False
+                    self._jpeg_was_gaze = False
+                    frame["approaching"] = False
+                    self._note("Подошёл. Уточняю точку, если ручка ещё в кадре.")
+                    out[0] = np.float32(0.0)
+                    out[1] = np.float32(0.0)
+                    out[2] = np.float32(0.0)
+                    out[CMD_ARMS] = arm_hang_cmd()
+                    return out
+                self._note("На месте. Поднимаю руку.")
+                vla = getattr(self, "vla", None)
+                if vla is not None:
+                    vla.reset_chunk()
             self._approach_arrived = True
             out[0] = np.float32(0.0)
             out[1] = np.float32(0.0)
             out[2] = np.float32(0.0)
             if was_approaching:
                 self._queue_tick0 = int(self._tick)
+            # Fresh solve when we just planted — hang-time cache has no raised pose.
+            if self._reach_sol is None or int(self._tick) - int(self._reach_tick) >= 25:
+                self._reach_sol, gap = solve_arm(self.model, self.data, goal, self.qadr, self.vadr)
+                self._reach_gap = float(gap)
+                self._reach_tick = int(self._tick)
             if self._grasp_progress(goal, frame):
                 return out
+            if self._pi0_driving:
+                return out
+            return servo_reach(self.model, self.data, out, goal, self.qadr, self._reach_sol)
         return servo_reach(self.model, self.data, out, goal, self.qadr, self._reach_sol)
 
     def _lesson_block(self) -> str | None:
@@ -657,7 +1080,8 @@ class RobotEngine(FlywheelMixin):
 
     def _plan_command(self) -> np.ndarray:
         self._advance_queue()
-        cmd = np.array(self._queue[self._queue_i]["cmd"], dtype=np.float32, copy=True)
+        frame = self._queue[self._queue_i]
+        cmd = np.array(frame["cmd"], dtype=np.float32, copy=True)
         if self._steps_goal > 0 and self._step_count >= self._steps_goal:
             cmd[CMD_VX] = 0.0
         if self.outcome == "fall":
@@ -718,7 +1142,11 @@ class RobotEngine(FlywheelMixin):
                 self._finish_episode(train=False)
                 self._home()
             else:
-                self._finish_episode(train=True)
+                finished = self._attempt_done()
+                if self._ep_armed and not finished and not self._ep_slept and not self._ep_failed:
+                    self._note("Команда прервана новой.")
+                self._finish_episode(train=finished)
+            self._awaiting_plan = True
             self._ep_armed = True
             self._ep_slept = False
             self._ep_failed = False
@@ -728,6 +1156,18 @@ class RobotEngine(FlywheelMixin):
             self._touch_best = None
             self._blocked_tick0 = None
             self._approach_arrived = False
+            self._reach_close = False
+            self._relook_used = False
+            self._walk_released = False
+            self._arm_wait0 = None
+            self._gaze_locked = False
+            self._need_gaze_plan = False
+            self._jpeg_was_gaze = False
+            self._marker_pos = None
+            self._marker_aim = None
+            self._marker_dim = False
+            self._anchor = None
+            self._pi0_approach_hold = False
             self._grasp_tick0 = None
             self._slip_tick0 = None
             self._contact_tick0 = None
@@ -756,6 +1196,7 @@ class RobotEngine(FlywheelMixin):
         with self.lock:
             self.last_l1 = time.monotonic()
             self.l1_ok = bool(l1_ok)
+            self._awaiting_plan = False
             if self.outcome == "fall":
                 self.user_cmd = ""
                 self.status = "failed"
@@ -797,7 +1238,37 @@ class RobotEngine(FlywheelMixin):
                 old = self._queue[0]
                 frame = self._frame(plan.queue[0])
                 kept = old.get("reach") or {}
-                if kept.get("point") is not None and not kept.get("stale"):
+                new_reach = frame.get("reach") or {}
+                if getattr(self, "_jpeg_was_gaze", False) and "u" in new_reach:
+                    # Close relook may refine; junk casts fall back to the approach anchor.
+                    merged = dict(kept)
+                    merged["u"] = float(new_reach["u"])
+                    merged["v"] = float(new_reach.get("v", kept.get("v", 0.5)))
+                    if "hand" in new_reach:
+                        merged["hand"] = new_reach["hand"]
+                    merged.pop("point", None)
+                    merged.pop("body", None)
+                    merged.pop("aim", None)
+                    merged.pop("drawn", None)
+                    merged.pop("stale", None)
+                    frame["reach"] = merged
+                    self._reach_sol = None
+                    self._reach_tick = -10**9
+                    self._reach_close = False
+                    self._grasp_tick0 = None
+                    self._slip_tick0 = None
+                    self._contact_tick0 = None
+                elif getattr(self, "_jpeg_was_gaze", False) and "u" not in new_reach:
+                    # Handle not visible up close — keep / restore the approach world point.
+                    frame["reach"] = dict(kept)
+                    if frame["reach"].get("point") is None:
+                        self._restore_anchor(frame["reach"])
+                    frame["approaching"] = False
+                elif kept.get("held"):
+                    frame["reach"] = kept
+                    frame["approaching"] = bool(old.get("approaching"))
+                elif kept.get("point") is not None and not kept.get("stale"):
+                    # Freeze the world target while walking. Mid-walk L1 must not recast onto walls.
                     frame["reach"] = kept
                     frame["approaching"] = bool(old.get("approaching"))
                 elif kept.get("stale") and not kept.get("done"):
@@ -807,6 +1278,9 @@ class RobotEngine(FlywheelMixin):
                         frame["approaching"] = False
                     else:
                         self._approach_arrived = False
+                        self._reach_close = False
+                        self._arm_wait0 = None
+                        self._pi0_approach_hold = False
                         self._reach_sol = None
                         self._reach_tick = -10**9
                         self._blocked_tick0 = None
@@ -826,13 +1300,39 @@ class RobotEngine(FlywheelMixin):
                     self._turn_heading0 = None
                     self._requested_yaw = None
             self.status = plan.instruction[:80]
+            frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
+            reach = (frame or {}).get("reach") or {}
+            if getattr(self, "_jpeg_was_gaze", False):
+                self._need_gaze_plan = False
+                self._jpeg_was_gaze = False
+                if "u" in reach and reach.get("point") is None:
+                    self._gaze_locked = True
+                    self._note("Повторный кадр. Точка с него.")
+                elif reach.get("point") is not None:
+                    self._gaze_locked = True
+                    self._note("Близко ручка не видна — цель с подхода.")
+                else:
+                    self._gaze_locked = False
+                    self._note("Объект не виден — меняю ракурс.")
+            elif "u" in reach and not self._gaze_locked:
+                # First plan already pointed on the upright head JPEG — cast it, do not lean.
+                self._gaze_locked = True
+                self._need_gaze_plan = False
+                self._note("Точка с прямого кадра.")
             if fresh or jumped:
                 self._clear_errors()
+
+    def wants_gaze_point(self) -> bool:
+        """Object miss: ask for a new pixel on the current upright frame, not a new gait."""
+        with self.lock:
+            return bool(getattr(self, "_need_gaze_plan", False) and getattr(self, "_jpeg_was_gaze", False))
 
     def l1_due(self) -> bool:
         with self.lock:
             if self.l1_busy or not self.user_cmd:
                 return False
+            if getattr(self, "_need_gaze_plan", False):
+                return self._gaze_ready()
             if self._steps_goal > 0 and self._step_count < self._steps_goal:
                 return False
             if getattr(self, "_queue", None) and self._queue_i < len(self._queue) - 1:
@@ -852,7 +1352,22 @@ class RobotEngine(FlywheelMixin):
 
     def _slew(self, desired: np.ndarray) -> np.ndarray:
         q = self.q_cmd.astype(np.float32)
-        return np.clip(q + np.clip(desired.astype(np.float32) - q, -SLEW, SLEW), self.lo, self.hi)
+        step = np.clip(desired.astype(np.float32) - q, -SLEW, SLEW)
+        if self._pi0_driving or (self._approach_arrived and self._pi0_task()):
+            # q_cmd is actuator order (29). qadr is qpos addresses and must not index it.
+            # 1 rad/s. A chunk, or a solved pose, can ask for the whole arm at once.
+            # Once the palm is latched — or nearly there — let the wrist finish turning.
+            # The crawl left fingers hanging under the bone on the handle.
+            arm_step = 0.008 if (self._reach_close or float(getattr(self, "_reach_gap", 1.0)) <= RAISE_GAP_M) else 0.002
+            step[15:29] = np.clip(desired.astype(np.float32)[15:29] - q[15:29], -arm_step, arm_step)
+        if self._holding_gaze() or abs(float(q[WAIST_P])) > 0.12:
+            # Recover upright slowly. Relook waits for a straight frame, never for a lean.
+            slow = desired.astype(np.float32)
+            step[WAIST_P] = np.clip(slow[WAIST_P] - q[WAIST_P], -0.0015, 0.0015)
+            if self._holding_gaze():
+                step[WAIST_Y] = np.clip(slow[WAIST_Y] - q[WAIST_Y], -0.0015, 0.0015)
+                step[WAIST_R] = np.clip(slow[WAIST_R] - q[WAIST_R], -0.0015, 0.0015)
+        return np.clip(q + step, self.lo, self.hi)
 
     def _pd_torque(self, q_cmd: np.ndarray) -> np.ndarray:
         return compute_torques(self.model, self.data, q_cmd, self.kp, self.kd, self.qadr, self.vadr)
@@ -868,7 +1383,7 @@ class RobotEngine(FlywheelMixin):
             vla.reset_chunk()
 
     def _pi0_task(self) -> bool:
-        if self.outcome == "fall" or not (self.user_cmd or self.intent):
+        if self._awaiting_plan or self.outcome == "fall" or not (self.user_cmd or self.intent):
             return False
         frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
         if not frame:
@@ -878,6 +1393,31 @@ class RobotEngine(FlywheelMixin):
             return False
         return "u" in reach
 
+    def _hands_ready(self) -> bool:
+        """The body has reached the stance and the legs have settled, so the arm may start."""
+        if not getattr(self, "_approach_arrived", False):
+            return False
+        if getattr(self, "_need_gaze_plan", False):
+            return False
+        frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
+        if frame is None or frame.get("approaching"):
+            return False
+        reach = frame.get("reach") or {}
+        if "u" in reach and reach.get("point") is None:
+            return False
+        walk = getattr(self, "walk", None)
+        data = getattr(self, "data", None)
+        settled = (walk is None or walk.holding) and (
+            data is None or float(np.linalg.norm(data.qvel[0:6])) < 0.12
+        )
+        if settled:
+            return True
+        wait0 = getattr(self, "_arm_wait0", None)
+        if wait0 is None or getattr(self, "model", None) is None:
+            return False
+        waited = (int(self._tick) - int(wait0)) * float(self.model.opt.timestep)
+        return waited >= 1.5
+
     def _render_vla(self) -> np.ndarray:
         if self._vla_eye is None:
             self._vla_eye = mujoco.Renderer(self.model, VLA_H, VLA_W)
@@ -885,15 +1425,23 @@ class RobotEngine(FlywheelMixin):
         return np.ascontiguousarray(self._vla_eye.render())
 
     def _pi0_command(self, proprio: np.ndarray) -> np.ndarray | None:
-        if not self._pi0_task():
+        if not self._pi0_task() or not self._hands_ready():
             return None
-        note = self.vla.ensure_started()
-        if note:
-            self._note(note)
-        if self._tick % VISION_STRIDE == 0 and self.vla.wants_frame():
+        # Geometric servo owns the hand until π0 is already up. ensure_started
+        # grabs TORCH_GATE and freezes physics for a multi-GB load mid-reach.
+        if not getattr(self.vla, "_ready", False):
+            return None
+        if self._tick % VISION_STRIDE == 0 and self.vla.wants_still_frame():
             self.vla.submit(self._render_vla(), self.user_cmd or self.intent, proprio)
         arm = np.asarray(proprio[15:29], dtype=np.float32)
-        return self.vla.command(arm, self.lo[15:29], self.hi[15:29])
+        cmd = self.vla.command(arm, self.lo[15:29], self.hi[15:29])
+        if cmd is None:
+            return None
+        # Legs already walked here. The chunk's base speed would start a second gait under the arm.
+        cmd[CMD_VX] = np.float32(0.0)
+        cmd[CMD_VY] = np.float32(0.0)
+        cmd[CMD_WZ] = np.float32(0.0)
+        return cmd
 
     def _mark_pi0_frame(self) -> None:
         frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
@@ -925,9 +1473,26 @@ class RobotEngine(FlywheelMixin):
     def _finger_command(self) -> np.ndarray:
         frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
         goal = frame.get("reach") if frame else None
-        if self._pi0_driving or not goal or frame.get("approaching") or goal.get("point") is None:
+        # Keep the hand open until the palm is on the point. _reach_close latches
+        # at ~12 cm and used to fist the hand before fingers could enter a handle.
+        if not goal or goal.get("point") is None or goal.get("target") == "head":
             return finger_target(None)
-        return finger_target(goal)
+        if goal.get("held"):
+            return finger_target(goal)
+        gap = float(getattr(self, "_reach_gap", 1.0))
+        live = goal_distance(self.model, self.data, goal)
+        if live is not None:
+            gap = min(gap, float(live))
+        near = gap <= TOUCH_M * 0.55
+        geometric = (
+            not frame.get("approaching")
+            and self._approach_arrived
+            and near
+            and not self._pi0_driving
+        )
+        if geometric:
+            return finger_target(goal)
+        return finger_target(None)
 
     def _finger_torque(self) -> np.ndarray:
         target = self._finger_command()
@@ -953,6 +1518,15 @@ class RobotEngine(FlywheelMixin):
             self._yaw_applied = self._achieved_yaw()
 
     def step(self):
+        if not TORCH_GATE.acquire(blocking=False):
+            # π0 is in native torch. Physics stays put: stepping a frozen walk pose falls.
+            return
+        try:
+            self._step_torch()
+        finally:
+            TORCH_GATE.release()
+
+    def _step_torch(self):
         err = self._balance_err()
         self.errors.append(err.copy())
         proprio = self._hinges()
@@ -1010,12 +1584,23 @@ class RobotEngine(FlywheelMixin):
                 drop = len(self.logs) - 3_000
                 self.logs = self.logs[drop:]
                 self._ep_i = max(0, int(self._ep_i) - drop)
-        if self.outcome != "fall":
+        if self.outcome != "fall" and not self._awaiting_plan:
             chosen = self._mix(teacher, student)
             if self.alpha > 1e-8:
                 self.ctrl_source = f"l3+l2-{self.stage}"
         self._last_teacher = teacher
         self._cmd = chosen if self._pi0_driving else self._servo_reach(chosen)
+        if self._pi0_driving:
+            self._cmd[CMD_VX] = np.float32(0.0)
+            self._cmd[CMD_VY] = np.float32(0.0)
+            self._cmd[CMD_WZ] = np.float32(0.0)
+        elif self._holding_gaze():
+            self._cmd[CMD_VX] = np.float32(0.0)
+            self._cmd[CMD_VY] = np.float32(0.0)
+            self._cmd[CMD_WZ] = np.float32(0.0)
+            self._cmd[CMD_ARMS] = arm_hang_cmd()
+        elif self._pi0_task() and not self._approach_arrived:
+            self._cmd[CMD_ARMS] = arm_hang_cmd()
         if self._tick % VISION_STRIDE == 0:
             err_now = self.errors[-1] if self.errors else np.zeros(3, dtype=np.float32)
             self._push_hist(chosen, err_now, self._rays)
@@ -1053,18 +1638,19 @@ class RobotEngine(FlywheelMixin):
             vx=vx,
         )
         q_des = np.clip(q_des, self.lo, self.hi)
+        if self._holding_gaze():
+            # Stay upright while waiting for a relook JPEG — never lean toward the floor.
+            q_des[WAIST_P] = np.float32(0.0)
+            q_des[WAIST_Y] = np.float32(0.0)
+            q_des[WAIST_R] = np.float32(0.0)
+            q_des[WAIST_P] = np.clip(q_des[WAIST_P], self.lo[WAIST_P], self.hi[WAIST_P])
         self.q_cmd = self._slew(q_des)
         self._write_ctrl()
         cmd_v = np.array([self._cmd[CMD_VX], self._cmd[CMD_VY], self._cmd[CMD_WZ]], dtype=np.float32)
-        # Arms forward move the mass past the toes. The stiff stand cannot
-        # catch that; the walk net can, by stepping, so it stays in the loop.
-        reach = {}
-        if getattr(self, "_queue", None):
-            reach = self._queue[self._queue_i].get("reach") or {}
         arm_q = np.asarray(self.data.qpos[self.qadr[15:29]], dtype=np.float64)
         arms_clear = float(np.max(np.abs(arm_q - arm_hang_cmd()))) > 0.45
-        reaching = reach.get("point") is not None or reach.get("target") == "head"
-        arms_out = reaching or arms_clear or float(np.max(np.abs(self._cmd[CMD_ARMS] - arm_hang_cmd()))) > 0.45
+        # A reach point alone used to keep the gait marching while the arms did something else.
+        arms_out = arms_clear or float(np.max(np.abs(self._cmd[CMD_ARMS] - arm_hang_cmd()))) > 0.45
         if self.walk is not None:
             leg = self.walk.leg_torque(
                 self.data,
@@ -1082,10 +1668,20 @@ class RobotEngine(FlywheelMixin):
             else:
                 self.ctrl_source = "g1-stand"
         mujoco.mj_step(self.model, self.data)
-        if self._pi0_driving:
+        frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
+        goal = frame.get("reach") if frame else None
+        if goal and self._pi0_driving:
             self._note_pi0_contact()
+        if goal and (self._pi0_driving or self._approach_arrived):
+            self._grasp_progress(goal, frame)
         if self.walk is not None and (self._tick + 1) % DECIMATION == 0 and not self.walk.holding:
-            self.walk.update(self.data, self.qadr, self.vadr, cmd_v, dynamic=arms_out)
+            self.walk.update(
+                self.data,
+                self.qadr,
+                self.vadr,
+                cmd_v,
+                dynamic=arms_out,
+            )
         elif self.walk is not None and self.walk.holding:
             self.walk.reset()
         if self._fell():
@@ -1163,11 +1759,81 @@ class RobotEngine(FlywheelMixin):
         self.model.cam_pos[cid] = origin + off
         mujoco.mj_camlight(self.model, self.data)
 
+    def _draw_goal_markers(self, scn) -> None:
+        """Paint the cast reach point into the operator preview. Survives brief stale gaps."""
+        pos = getattr(self, "_marker_pos", None)
+        aim = getattr(self, "_marker_aim", None)
+        frame = self._queue[self._queue_i] if getattr(self, "_queue", None) else None
+        goal = (frame or {}).get("reach") or {}
+        if goal.get("point") is not None and not goal.get("done"):
+            pos = np.asarray(goal["point"], dtype=np.float64)
+            aim = goal.get("aim")
+            self._marker_pos = pos.copy()
+            if aim is not None:
+                self._marker_aim = np.asarray(aim, dtype=np.float64).copy()
+            self._marker_dim = False
+        if pos is None or goal.get("done"):
+            return
+        pos = np.asarray(pos, dtype=np.float64).reshape(3)
+        dim = bool(getattr(self, "_marker_dim", False) or goal.get("stale"))
+        alpha = 0.45 if dim else 0.95
+        if int(scn.ngeom) >= int(scn.maxgeom):
+            return
+        mujoco.mjv_initGeom(
+            scn.geoms[scn.ngeom],
+            type=mujoco.mjtGeom.mjGEOM_SPHERE,
+            size=np.array([0.04, 0.0, 0.0], dtype=np.float64),
+            pos=pos,
+            mat=np.eye(3, dtype=np.float64).flatten(),
+            rgba=np.array([1.0, 0.2, 0.05, alpha], dtype=np.float32),
+        )
+        scn.ngeom += 1
+        if aim is None or int(scn.ngeom) >= int(scn.maxgeom):
+            return
+        aim = np.asarray(aim, dtype=np.float64).reshape(3)
+        n = float(np.linalg.norm(aim))
+        if n < 1e-6:
+            return
+        aim = aim / n
+        surface = pos + aim * max(0.0, float(STANDOFF_M))
+        mujoco.mjv_initGeom(
+            scn.geoms[scn.ngeom],
+            type=mujoco.mjtGeom.mjGEOM_SPHERE,
+            size=np.array([0.025, 0.0, 0.0], dtype=np.float64),
+            pos=surface,
+            mat=np.eye(3, dtype=np.float64).flatten(),
+            rgba=np.array([0.15, 0.85, 0.25, alpha * 0.95], dtype=np.float32),
+        )
+        scn.ngeom += 1
+        if int(scn.ngeom) >= int(scn.maxgeom):
+            return
+        try:
+            idx = int(scn.ngeom)
+            mujoco.mjv_initGeom(
+                scn.geoms[idx],
+                type=mujoco.mjtGeom.mjGEOM_LINE,
+                size=np.zeros(3, dtype=np.float64),
+                pos=np.zeros(3, dtype=np.float64),
+                mat=np.eye(3, dtype=np.float64).flatten(),
+                rgba=np.array([1.0, 0.85, 0.1, alpha], dtype=np.float32),
+            )
+            mujoco.mjv_connector(
+                scn.geoms[idx],
+                mujoco.mjtGeom.mjGEOM_LINE,
+                2.0,
+                surface.reshape(3, 1),
+                pos.reshape(3, 1),
+            )
+            scn.ngeom += 1
+        except Exception:
+            pass
+
     def _render(self):
         if self.renderer is None:
             self.renderer = mujoco.Renderer(self.model, PREVIEW_H, PREVIEW_W)
         self._place_demo_camera()
         self.renderer.update_scene(self.data, camera="demo", scene_option=self._view_opt)
+        self._draw_goal_markers(self.renderer.scene)
         # JPEG runs on the stream thread. Copy now: the renderer reuses this buffer.
         self._preview_rgb = np.array(self.renderer.render(), copy=True)
         self._preview_seq += 1
@@ -1204,6 +1870,7 @@ class RobotEngine(FlywheelMixin):
             rgb = np.ascontiguousarray(self.look.render())
         buf = io.BytesIO()
         Image.fromarray(rgb).save(buf, format="JPEG", quality=80)
+        self._jpeg_was_gaze = bool(getattr(self, "_need_gaze_plan", False) and self._gaze_ready())
         return buf.getvalue()
 
     def eye_jpeg(self) -> bytes:
@@ -1309,8 +1976,10 @@ class RobotEngine(FlywheelMixin):
                 "kick": round(self.waypoint.teacher().kick, 2),
                 "steps_left": max(0, self._steps_goal - self._step_count),
                 "s15": self.vla.phase(),
+                "s15_s": None if self.vla.infer_s() is None else round(float(self.vla.infer_s()), 3),
                 "s15_err": self.vla.error,
                 "l1_ok": self.l1_ok,
+                "l1_model": self.planner.model,
                 "l1_url": self.planner.base_url,
                 "l1_err": self.planner.last_err,
                 "status": self.status,

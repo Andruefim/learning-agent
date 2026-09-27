@@ -89,7 +89,11 @@ async def _run_l1(bot: RobotEngine, text: str, *, fresh: bool) -> Plan:
     cmd = text.strip()
     try:
         scene = bot.scene_brief()
-        plan, ok = await bot.planner.plan(cmd, scene, bot.planner_jpeg())
+        jpeg = bot.planner_jpeg()
+        if bot.wants_gaze_point():
+            plan, ok = await bot.planner.plan_point(cmd, jpeg, prior=bot.reach_prior())
+        else:
+            plan, ok = await bot.planner.plan(cmd, scene, jpeg)
         if bot.intent == cmd:
             bot.apply_plan(plan, fresh=fresh, l1_ok=ok)
         return plan

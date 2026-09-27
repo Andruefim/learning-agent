@@ -36,6 +36,8 @@ R_SH, L_SH = R_SP, L_SP
 R_SX, L_SX = R_SR, L_SR
 HIP_YAW_LIM = 1.0
 SPAWN_Z = 0.783
+# App spawn: one metre back from the counter so the head sees the kitchen, not the stove face.
+SPAWN_XY = (-1.0, 0.0)
 ARM_RAISE = -1.55
 # CAD q=0 on the arms is not a hang: the forearm body sits along +X, so zeros
 # reach ~90° forward and shove CoM past the toes. Hang = positive shoulder
@@ -138,6 +140,29 @@ def disable_mesh_contacts(model: mujoco.MjModel) -> int:
         model.geom_contype[g] = 0
         model.geom_conaffinity[g] = 0
         n += 1
+    return n
+
+
+def disable_wrist_mesh_contacts(model: mujoco.MjModel) -> int:
+    """Keep palm_col contact; the wrist_yaw STL sticks past the rubber palm and
+    makes every reach look like opening with the bone."""
+    n = 0
+    mesh = int(mujoco.mjtGeom.mjGEOM_MESH)
+    for side in ("left", "right"):
+        bid = int(model.body(f"{side}_wrist_yaw_link").id)
+        for g in range(int(model.ngeom)):
+            if int(model.geom_bodyid[g]) != bid:
+                continue
+            if int(model.geom_type[g]) != mesh:
+                continue
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or ""
+            if "palm" in name:
+                continue
+            if int(model.geom_contype[g]) == 0 and int(model.geom_conaffinity[g]) == 0:
+                continue
+            model.geom_contype[g] = 0
+            model.geom_conaffinity[g] = 0
+            n += 1
     return n
 
 
