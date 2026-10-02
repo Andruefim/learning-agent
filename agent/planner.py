@@ -8,7 +8,29 @@ import os
 from pathlib import Path
 
 from agent.plan import Plan, attach_arm_channel
-from agent.reach import attach_reach
+from agent.reach import attach_reach, strip_planner_pixels
+
+
+def _pointing_rules() -> str:
+    """Vision-only grasp pixel rules (plan_point / gaze)."""
+    return (
+        "Name a hand and the grasp place on the attached head image: "
+        "u=0 left, u=1 right, v=0 top, v=1 bottom.\n"
+        "Put u,v on the graspable surface the command names — what you see, not image center.\n"
+        "Opening means the metal HANDLE you pull — not glass, knobs, burners, or flat panels.\n"
+        "Do NOT point at walls, floor, seams, or borders. Keep 0.12 < u < 0.88.\n"
+        "If the target is not clearly visible, reply {\"visible\": false}.\n"
+    )
+
+
+def _motion_plan_rules() -> str:
+    """Main planner: motion and intent only — never u,v."""
+    return (
+        "Touch/grasp/open on a visible object: put hand_goal with ONLY "
+        '{"hand":"left"|"right"|"both"} on the interaction frame — no u, no v. '
+        "Pixels come from a separate pointing step.\n"
+        "Robot head target: hand_goal {hand, target: head} only.\n"
+    )
 
 
 def _wsl_windows_host() -> str | None:
@@ -82,6 +104,7 @@ class Level1Planner:
             )
             attach_reach(plan, user_command)
             attach_arm_channel(plan, user_command)
+            strip_planner_pixels(plan)
             return plan
         except (TypeError, ValueError):
             return None
@@ -101,24 +124,18 @@ class Level1Planner:
             '{hand: left|right|both, target: head}. Do not answer hold.\n'
             '  "положи левую руку на голову" → {"instruction":"левая рука на голову","queue":['
             '{"hand_goal":{"hand":"left","target":"head"},"vx":0,"hold_s":4}],"done":false}\n'
-            "Touching something visible is the same channel, for any object. "
-            "Name a hand and the place on the attached head image: u=0 left, "
-            "u=1 right, v=0 top, v=1 bottom. "
-            "Write hand_goal {hand: left|right|both, u, v} on that object in this image. "
-            "hand both means both arms go to that pixel and both hands close on it. "
-            "For doors/cabinets/fridges/ovens: point at the metal handle bar itself, "
-            "not the glass, not the flat panel, and not the vertical door seam/edge. "
-            "Keep 0.12 < u < 0.88 — values near 0 or 1 are the image border, not a grip. "
-            "Measure u and v on this image. If the object is not clearly visible, do not "
-            "invent a hand_goal on the wall or the floor: write a short look instead — "
-            "turn left/right, or step back (vx negative), with no hand_goal. "
-            "Only put hand_goal when you can see the object in this frame.\n"
+            "Touching something visible is the same channel, for any object.\n"
+            f"{_motion_plan_rules()}"
             '  object not in frame → {"instruction":"ищу объект","queue":['
             '{"direction":"left","hold_s":2},{"vx":0,"hold_s":1}],"done":false}\n'
             '  too close / cut off → {"instruction":"отойти","queue":['
             '{"direction":"backward","speed":"slow","hold_s":2},{"vx":0,"hold_s":1}],"done":false}\n'
-            '  object visible → {"instruction":"...","queue":['
-            '{"hand_goal":{"hand":"right","u":0.62,"v":0.41},"vx":0,"hold_s":8}],"done":false}\n'
+            '  open the oven → {"instruction":"открыть духовку","queue":['
+            '{"hand_goal":{"hand":"right"},"vx":0,"hold_s":8}],"done":false}\n'
+            '  open the fridge → {"instruction":"открыть холодильник","queue":['
+            '{"hand_goal":{"hand":"right"},"vx":0,"hold_s":8}],"done":false}\n'
+            '  pick up the toaster → {"instruction":"поднять тостер","queue":['
+            '{"hand_goal":{"hand":"both"},"vx":0,"hold_s":8}],"done":false}\n'
             "Examples:\n"
             '  "сделай 5 шагов вперед" → {"skill":"locomote","params":{"direction":"forward","speed":"medium","distance_hint":"5"}}\n'
             '  "иди вперёд" → {"skill":"locomote","params":{"direction":"forward","speed":"medium"}}\n'
@@ -205,10 +222,7 @@ class Level1Planner:
             "The image is the robot head camera, upright, often close to the object.\n"
             f"Command: {user_command}\n"
             f"{prior_line}"
-            "Opening a door/fridge/oven/cabinet means grasping the metal handle bar, "
-            "not the glass and not the flat panel and not the vertical seam.\n"
-            "Keep 0.12 < u < 0.88.\n"
-            "u=0 left, u=1 right, v=0 top, v=1 bottom.\n"
+            f"{_pointing_rules()}"
             "Reply JSON with keys hand, u, v — or visible:false."
         )
         message: dict = {"role": "user", "content": prompt, "images": [base64.b64encode(image).decode("ascii")]}
@@ -241,7 +255,7 @@ class Level1Planner:
                     done=False,
                     queue=[{"vx": 0, "hold_s": 4}],
                 )
-                print("gaze point: not visible up close → keep prior", flush=True)
+                print("gaze point: not visible up close -> keep prior", flush=True)
                 self.last_err = ""
                 return plan, True
             hand = str(data.get("hand") or (prior or {}).get("hand") or "right").strip().lower()
@@ -257,7 +271,7 @@ class Level1Planner:
                     done=False,
                     queue=[{"vx": 0, "hold_s": 4}],
                 )
-                print(f"gaze point: border u={u:.2f} → keep prior", flush=True)
+                print(f"gaze point: border u={u:.2f} -> keep prior", flush=True)
                 self.last_err = ""
                 return plan, True
             goal = {"hand": hand, "u": u, "v": v}
@@ -276,6 +290,53 @@ class Level1Planner:
             self.last_err = f"{type(e).__name__}: {e}"[:160]
             print(f"gaze point failed: {self.last_err}", flush=True)
             return self.hold(user_command, {}), False
+
+    async def verify(self, user_command: str, image: bytes) -> dict:
+        """Did the language goal succeed in this head frame? Visual done, no joints."""
+        prompt = (
+            "The image is the robot head camera.\n"
+            f"Command: {user_command}\n"
+            "Has this command been successfully completed in the scene you see?\n"
+            "Examples: a door/fridge/oven that should be open is clearly open; "
+            "a toaster/appliance that should be on shows that state; "
+            "an object that should be grasped is clearly in hand.\n"
+            "If not done: is the graspable part (handle/button/object) still visible "
+            "so the robot should point again?\n"
+            'Reply JSON only: {"done": true|false, "retry": "hold"|"repoint"}.\n'
+            'Use retry="repoint" when the target is visible but the task is not done. '
+            'Use retry="hold" when waiting or the view is unclear.'
+        )
+        message: dict = {"role": "user", "content": prompt, "images": [base64.b64encode(image).decode("ascii")]}
+        payload = {
+            "model": self.model,
+            "messages": [message],
+            "stream": False,
+            "format": "json",
+            "think": False,
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 80, "think": False},
+        }
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                r = await client.post(f"{self.base_url}/api/chat", json=payload)
+                r.raise_for_status()
+                text = r.json()["message"]["content"]
+            text = text.strip()
+            if "</think>" in text:
+                text = text.split("</think>", 1)[-1]
+            start, end = text.find("{"), text.rfind("}")
+            data = json.loads(text[start : end + 1] if start >= 0 else text)
+            done = bool(data.get("done"))
+            retry = str(data.get("retry") or ("hold" if done else "repoint")).strip().lower()
+            if retry not in {"hold", "repoint", "look", "point"}:
+                retry = "repoint" if not done else "hold"
+            self.last_err = ""
+            return {"done": done, "retry": retry}
+        except Exception as e:
+            self.last_err = f"{type(e).__name__}: {e}"[:160]
+            print(f"verify failed: {self.last_err}", flush=True)
+            return {"done": False, "retry": "hold"}
 
 
 def np_clip(value) -> float:

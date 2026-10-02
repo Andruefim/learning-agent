@@ -16,8 +16,34 @@
           <span id="hold" class="bg-zinc-800 text-zinc-500 px-2 py-1 rounded">stand</span>
         </div>
       </header>
-      <div id="view" class="flex-1 bg-black rounded-xl overflow-hidden border border-zinc-800 flex items-center justify-center cursor-grab">
-        <img src="/video_feed" alt="MuJoCo" draggable="false" class="w-full h-full object-contain pointer-events-none select-none">
+      <div id="view" class="relative flex-1 bg-black rounded-xl overflow-hidden border border-zinc-800">
+        <img src="/video_feed" alt="MuJoCo" draggable="false"
+             class="absolute inset-0 w-full h-full object-contain pointer-events-none select-none">
+        <div id="camDrag" class="absolute inset-0 cursor-grab" title="Тянуть — вращение"></div>
+        <div class="absolute bottom-3 left-3 z-10 pointer-events-none select-none">
+          <div class="rounded-lg overflow-hidden border border-zinc-600 bg-black/80 shadow-lg w-72">
+            <img src="/eye_feed" alt="Head cam" draggable="false"
+                 class="block w-full aspect-[4/3] object-cover">
+            <div class="px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-zinc-400 bg-zinc-900/90">head · L1 320×240</div>
+          </div>
+        </div>
+        <div class="absolute bottom-3 right-3 z-10 flex flex-col gap-1.5 pointer-events-auto select-none">
+          <div class="grid grid-cols-3 gap-1 w-[7.5rem]">
+            <span></span>
+            <button type="button" data-cam="0,-36" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-sm" title="Выше">▲</button>
+            <span></span>
+            <button type="button" data-cam="-48,0" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-sm" title="Влево">◀</button>
+            <button type="button" data-cam="reset" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1 text-[10px] text-zinc-400" title="Сброс">⊙</button>
+            <button type="button" data-cam="48,0" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-sm" title="Вправо">▶</button>
+            <span></span>
+            <button type="button" data-cam="0,36" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-sm" title="Ниже">▼</button>
+            <span></span>
+          </div>
+          <div class="flex gap-1">
+            <button type="button" data-cam-zoom="in" class="cam-btn flex-1 bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-sm font-semibold" title="Ближе">+</button>
+            <button type="button" data-cam-zoom="out" class="cam-btn flex-1 bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-sm font-semibold" title="Дальше">−</button>
+          </div>
+        </div>
       </div>
       <dl id="stats" class="grid grid-cols-4 gap-2 mt-3 text-[11px] text-zinc-500 font-mono">
         <div class="bg-zinc-900 rounded px-2 py-1">err <span id="s-err" class="text-zinc-200">—</span></div>
@@ -110,6 +136,29 @@
     }
 
     function wsSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+    function camOrbit(dx, dy) { wsSend({ type: "camera", dx, dy }); }
+    function camZoom(deltaY) { wsSend({ type: "camera", zoom: deltaY }); }
+
+    document.querySelectorAll(".cam-btn[data-cam]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const raw = btn.getAttribute("data-cam");
+        if (raw === "reset") {
+          wsSend({ type: "camera_reset" });
+          return;
+        }
+        const [dx, dy] = raw.split(",").map((n) => parseFloat(n));
+        camOrbit(dx, dy);
+      });
+    });
+    document.querySelectorAll(".cam-btn[data-cam-zoom]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const dir = btn.getAttribute("data-cam-zoom");
+        camZoom(dir === "in" ? -120 : 120);
+      });
+    });
+
     function send() {
       const el = document.getElementById("cmd");
       if (!el.value.trim()) return;
@@ -118,35 +167,40 @@
     }
     document.getElementById("cmd").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
 
-    const view = document.getElementById("view");
+    const camDrag = document.getElementById("camDrag");
     let dragging = false;
     let lastX = 0;
     let lastY = 0;
-    view.addEventListener("pointerdown", (e) => {
+    camDrag.addEventListener("pointerdown", (e) => {
       if (e.button !== 0) return;
+      if (e.target.closest(".cam-btn")) return;
       dragging = true;
       lastX = e.clientX;
       lastY = e.clientY;
-      view.classList.add("cursor-grabbing");
-      view.setPointerCapture(e.pointerId);
+      camDrag.classList.add("cursor-grabbing");
+      camDrag.setPointerCapture(e.pointerId);
+      e.preventDefault();
     });
-    view.addEventListener("pointermove", (e) => {
+    camDrag.addEventListener("pointermove", (e) => {
       if (!dragging) return;
       const dx = e.clientX - lastX;
       const dy = e.clientY - lastY;
       lastX = e.clientX;
       lastY = e.clientY;
-      if (dx || dy) wsSend({ type: "camera", dx, dy });
+      if (dx || dy) camOrbit(dx, dy);
     });
     function endDrag() {
       dragging = false;
-      view.classList.remove("cursor-grabbing");
+      camDrag.classList.remove("cursor-grabbing");
     }
-    view.addEventListener("pointerup", endDrag);
-    view.addEventListener("pointercancel", endDrag);
-    view.addEventListener("wheel", (e) => {
+    camDrag.addEventListener("pointerup", endDrag);
+    camDrag.addEventListener("pointercancel", endDrag);
+    camDrag.addEventListener("pointerleave", (e) => {
+      if (dragging && !camDrag.hasPointerCapture(e.pointerId)) endDrag();
+    });
+    camDrag.addEventListener("wheel", (e) => {
       e.preventDefault();
-      wsSend({ type: "camera", zoom: e.deltaY });
+      camZoom(e.deltaY);
     }, { passive: false });
 
     connect();

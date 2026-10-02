@@ -24,5 +24,7 @@ python app.py
 |---|---|
 | `L1_MODEL` / `L1_BASE_URL` | Ollama. WSL rewrites localhost to the Windows host. |
 | `L2_DEVICE` | `cpu` / `cuda` / `rocm` |
+| `E2E_ENABLE` / `E2E_DEVICE` / `E2E_REPO` | Whole-body VLA → 29 joints → PD. One GPU teacher; unload Ollama. |
+| `PI0_ENABLE` / `PI0_DEVICE` | Arms-only System 1.5 (off when e2e is on). |
 | `L2_DRIVE` | `0` default. Student on motors only with H1 pass. |
 | `STORAGE_DIR` / `PORT` | replay and HTTP |

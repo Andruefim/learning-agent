@@ -38,6 +38,8 @@ from agent.l3_cmd import CMD_ARMS, CMD_H, CMD_VX, CMD_VY, CMD_WZ, clip_command, 
 TORCH_GATE = threading.Lock()
 
 PI0_REPO = "lerobot/pi0_base"
+# After approach, if the first chunk never arrives, fall back to geometric IK.
+PI0_WAIT_S = 3.0
 VLA_H, VLA_W = 240, 320
 ARM_DELTA = 0.12
 BASE_VX = 0.25
@@ -188,6 +190,33 @@ def _load_file_nommap(filename, device="cpu"):
     return tensors
 
 
+def _pi0_enabled() -> bool:
+    import os
+
+    return os.getenv("PI0_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _pi0_tokenizer_available() -> bool:
+    """Processors need gated google/paligemma-3b-pt-224. Skip the crashy weight load if missing."""
+    import os
+
+    if not _pi0_enabled():
+        return False
+    if os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        return True
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        from huggingface_hub.file_download import _CACHED_NO_EXIST
+
+        for name in ("tokenizer.model", "tokenizer.json"):
+            path = try_to_load_from_cache("google/paligemma-3b-pt-224", name)
+            if path is not None and path is not _CACHED_NO_EXIST and Path(path).is_file():
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _import_pi0():
     """Import π0 without pulling every other policy.
 
@@ -274,12 +303,25 @@ class System15:
         The process that already runs the walk net can read the checkpoint.
         """
         with self._lock:
-            if self._ready or self._thread is not None:
+            if self._ready or self._thread is not None or self._error:
+                note = self._pending
+                self._pending = None
+                return note
+        # pi0_base on CPU blocks the physics loop for minutes (looks "stuck forever").
+        if str(self.device).startswith("cpu"):
+            with self._lock:
+                self._error = (
+                    "π0 на CPU слишком медленная для sim-loop. "
+                    "Поставь PI0_DEVICE=cuda (освободи VRAM у Ollama) или PI0_ENABLE=0 для IK."
+                )
+                self._pending = f"System 1.5 пропущена: {self._error}"
                 note = self._pending
                 self._pending = None
                 return note
         try:
-            self._load_weights()
+            # Hold the gate: another torch entry on this build is an access violation.
+            with TORCH_GATE:
+                self._load_weights()
         except Exception as exc:
             with self._lock:
                 self._error = f"{type(exc).__name__}: {exc}"
@@ -289,7 +331,7 @@ class System15:
                 return note
         with self._lock:
             self._ready = True
-            self._pending = "System 1.5 готова."
+            self._pending = f"System 1.5 готова ({self.device})."
             self._thread = threading.Thread(target=self._serve, name="pi0", daemon=True)
             self._thread.start()
             note = self._pending
@@ -455,7 +497,15 @@ class System15:
             self._load_weights()
 
     def _load_weights(self) -> None:
+        if not _pi0_enabled():
+            raise RuntimeError("PI0_ENABLE=0 — near-field на geometric IK.")
+        if not _pi0_tokenizer_available():
+            raise RuntimeError(
+                "нет HF_TOKEN и локального google/paligemma-3b-pt-224 — "
+                "π0 пропущена, near-field на IK."
+            )
         policy_cls, make_processors = _import_pi0()
+        import os
         import safetensors.torch as safetensors_torch
 
         # lerobot prints a checkmark after the load. On a cp1251 console that
@@ -466,11 +516,28 @@ class System15:
         policy = policy_cls.from_pretrained(PI0_REPO, local_files_only=True)
         policy.eval()
         policy.to(self.device)
-        pre, post = make_processors(
-            policy.config,
-            PI0_REPO,
-            preprocessor_overrides={"device_processor": {"device": str(self.device)}},
-        )
+        # Processors pull google/paligemma-3b-pt-224 (gated). Need HF_TOKEN + license.
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        try:
+            pre, post = make_processors(
+                policy.config,
+                PI0_REPO,
+                preprocessor_overrides={"device_processor": {"device": str(self.device)}},
+            )
+        except Exception as exc:
+            msg = str(exc)
+            gated = any(s in msg.lower() for s in ("401", "gated", "paligemma", "unauthorized", "auth"))
+            if gated and not token:
+                raise RuntimeError(
+                    "π0 processors need HF_TOKEN and access to google/paligemma-3b-pt-224 "
+                    "(accept the Gemma license on Hugging Face). Near-field falls back to L2."
+                ) from exc
+            if gated:
+                raise RuntimeError(
+                    "π0 processors: gated google/paligemma-3b-pt-224 — accept the license "
+                    "on Hugging Face with this HF_TOKEN. Near-field falls back to L2."
+                ) from exc
+            raise
         self._policy = policy
         self._pre = pre
         self._post = post

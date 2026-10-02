@@ -7,3 +7,4 @@ flywheel_data/
 !models/unitree_g1/motion.pt
 *.engine
 .DS_Store
+.env

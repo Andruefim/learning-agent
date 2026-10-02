@@ -23,6 +23,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from starlette.websockets import WebSocketState
 
 from agent import Plan, RobotEngine
+from agent.reach import GRASP_TRIES, attach_reach, merge_grasp_point, plan_wants_grasp_point, strip_planner_pixels
 
 engine: RobotEngine | None = None
 _stop = threading.Event()
@@ -63,12 +64,11 @@ def health():
     return {"ok": True, **t}
 
 
-@app.get("/video_feed")
-def video_feed():
+def _mjpeg(get_frame):
     def frames():
         last = None
         while True:
-            jpeg = _bot().jpeg()
+            jpeg = get_frame()
             if jpeg and jpeg is not last:
                 last = jpeg
                 yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
@@ -83,6 +83,42 @@ def video_feed():
     )
 
 
+@app.get("/video_feed")
+def video_feed():
+    return _mjpeg(lambda: _bot().jpeg())
+
+
+@app.get("/eye_feed")
+def eye_feed():
+    """Head camera at L1 look size — operator preview, not the 48×64 L2 buffer."""
+    return _mjpeg(lambda: _bot().look_jpeg())
+
+
+async def _resolve_grasp(bot: RobotEngine, cmd: str, plan: Plan, jpeg: bytes) -> None:
+    """Vision-only u,v merged into a motion-only plan, then raycast-validated."""
+    prior = bot.reach_prior()
+    attempts = min(3, int(GRASP_TRIES))
+    for _ in range(attempts):
+        point_plan, pt_ok = await bot.planner.plan_point(cmd, jpeg, prior=prior)
+        if not pt_ok or not merge_grasp_point(plan, point_plan):
+            continue
+        hg = plan.params.get("hand_goal") if isinstance(plan.params, dict) else None
+        if not isinstance(hg, dict):
+            continue
+        u, v = hg.get("u"), hg.get("v")
+        if u is None or v is None:
+            continue
+        good, body = await asyncio.to_thread(bot.validate_grasp_uv, float(u), float(v))
+        if good:
+            print(f"grasp cast ok u={float(u):.2f} v={float(v):.2f} body={body}", flush=True)
+            return
+        print(f"grasp cast reject u={float(u):.2f} v={float(v):.2f} body={body}", flush=True)
+        strip_planner_pixels(plan)
+        attach_reach(plan, cmd)
+        prior = {"u": float(u), "v": float(v), "hand": str(hg.get("hand") or "right")}
+    print("grasp: no valid pixel after pointing", flush=True)
+
+
 async def _run_l1(bot: RobotEngine, text: str, *, fresh: bool) -> Plan:
     while not bot.begin_l1():
         await asyncio.sleep(0.05)
@@ -94,9 +130,25 @@ async def _run_l1(bot: RobotEngine, text: str, *, fresh: bool) -> Plan:
             plan, ok = await bot.planner.plan_point(cmd, jpeg, prior=bot.reach_prior())
         else:
             plan, ok = await bot.planner.plan(cmd, scene, jpeg)
+            if ok and plan_wants_grasp_point(plan):
+                await _resolve_grasp(bot, cmd, plan, jpeg)
         if bot.intent == cmd:
             bot.apply_plan(plan, fresh=fresh, l1_ok=ok)
         return plan
+    finally:
+        bot.end_l1()
+
+
+async def _run_verify(bot: RobotEngine) -> dict:
+    while not bot.begin_l1():
+        await asyncio.sleep(0.05)
+    cmd = (bot.user_cmd or "").strip()
+    try:
+        jpeg = bot.planner_jpeg()
+        result = await bot.planner.verify(cmd, jpeg)
+        if bot.intent == cmd:
+            bot.apply_verify(result)
+        return result
     finally:
         bot.end_l1()
 
@@ -134,6 +186,8 @@ async def ws(sock: WebSocket):
                         float(raw.get("dy") or 0),
                         float(raw.get("zoom") or 0),
                     )
+                elif kind == "camera_reset":
+                    bot.reset_demo_camera()
                 elif kind == "reset":
                     await asyncio.to_thread(bot.reset_sim)
                     await sock.send_json({"type": "log", "text": "Reset · spawn."})
@@ -153,6 +207,14 @@ async def ws(sock: WebSocket):
                             + f" · {result.get('skill')}",
                         }
                     )
+            elif bot.wants_verify():
+                result = await _run_verify(bot)
+                await sock.send_json(
+                    {
+                        "type": "log",
+                        "text": f"verify done={result.get('done')} retry={result.get('retry')}",
+                    }
+                )
             elif bot.l1_due():
                 plan = await _run_l1(bot, bot.user_cmd, fresh=False)
                 if plan.done:

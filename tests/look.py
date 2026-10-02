@@ -4,17 +4,23 @@ import mujoco
 import numpy as np
 
 from agent.h2 import MODEL_XML, SPAWN_Z, STAND_Q
+from agent.plan import Plan
+from agent.planner import Level1Planner
 from agent.reach import (
     LOOK_H,
     LOOK_W,
     TOUCH_M,
     body_can_move,
     camera_basis,
+    cast_grasp_uv,
     goal_distance,
+    merge_grasp_point,
+    plan_wants_grasp_point,
     ray_direction,
     ray_hit,
     reach_goal_from_step,
     solve_arm,
+    strip_planner_pixels,
     touch_lesson,
     velocity_toward,
     walk_is_blocked,
@@ -25,13 +31,83 @@ from agent.reach import _arm_penetration
 def _stand():
     model = mujoco.MjModel.from_xml_path(str(MODEL_XML))
     data = mujoco.MjData(model)
-    data.qpos[2] = SPAWN_Z
+    from agent.h2 import SPAWN_XY
+
+    data.qpos[0:3] = (float(SPAWN_XY[0]), float(SPAWN_XY[1]), SPAWN_Z)
     data.qpos[3] = 1.0
     for i in range(len(STAND_Q)):
         jid = int(model.actuator_trnid[i, 0])
         data.qpos[int(model.jnt_qposadr[jid])] = STAND_Q[i]
     mujoco.mj_forward(model, data)
     return model, data
+
+
+def test_main_plan_strips_pixels():
+    raw = (
+        '{"instruction":"поднять тостер","queue":['
+        '{"hand_goal":{"hand":"both","u":0.5,"v":0.5},"vx":0,"hold_s":8}],"done":false}'
+    )
+    plan = Level1Planner()._parse(raw, "поднять тостер")
+    assert plan is not None
+    g = reach_goal_from_step(plan.queue[0])
+    assert g.get("unresolved") is True and "u" not in g
+
+
+def test_merge_and_cast_grasp():
+    model, data = _stand()
+    pelvis = int(model.body("pelvis").id)
+    motion = Plan(
+        instruction="поднять тостер",
+        skill="hold",
+        params={},
+        done=False,
+        queue=[{"hand_goal": {"hand": "both"}, "vx": 0, "hold_s": 8}],
+    )
+    assert plan_wants_grasp_point(motion)
+    body = int(model.body("toaster_main_group_main").id)
+    center = np.asarray(data.xpos[body], dtype=np.float64)
+    origin, rot, fovy = camera_basis(model, data)
+    delta = center - origin
+    x, y, z = float(np.dot(delta, rot[:, 0])), float(np.dot(delta, rot[:, 1])), float(np.dot(delta, rot[:, 2]))
+    aspect = LOOK_W / LOOK_H
+    fov_y = float(np.deg2rad(fovy))
+    fov_x = 2.0 * float(np.arctan(np.tan(fov_y / 2.0) * aspect))
+    fwd = -z
+    u = 0.5 + (x / fwd) / (2.0 * np.tan(fov_x / 2.0))
+    v = 0.5 - (y / fwd) / (2.0 * np.tan(fov_y / 2.0))
+    point_plan = Plan(
+        instruction="поднять тостер",
+        skill="hold",
+        params={"hand_goal": {"hand": "both", "u": u, "v": v}},
+        done=False,
+        queue=[{"hand_goal": {"hand": "both", "u": u, "v": v}, "vx": 0, "hold_s": 1}],
+    )
+    assert merge_grasp_point(motion, point_plan)
+    ok, hit = cast_grasp_uv(model, data, pelvis, u, v)
+    assert ok and "toast" in model.body(int(hit)).name.lower()
+    center_ok, _ = cast_grasp_uv(model, data, pelvis, 0.5, 0.5)
+    assert center_ok
+    assert not cast_grasp_uv(model, data, pelvis, 0.02, 0.5)[0]
+
+
+def test_look_errors_sign():
+    """Waist sense: desired = current - err centers the head camera."""
+    model, data = _stand()
+    body = int(model.body("toaster_main_group_main").id)
+    point = np.asarray(data.xpos[body], dtype=np.float64)
+    from agent.reach import look_errors
+
+    err0 = look_errors(model, data, point)
+    assert err0 is not None
+    yaw0, pitch0 = err0
+    # Toaster is right of spawn center → positive yaw error.
+    assert yaw0 > 0.05, yaw0
+    yp = int(model.jnt_qposadr[model.joint("waist_yaw_joint").id])
+    data.qpos[yp] = float(data.qpos[yp]) - yaw0
+    mujoco.mj_forward(model, data)
+    err1 = look_errors(model, data, point)
+    assert err1 is not None
+    assert abs(err1[0]) < abs(yaw0)
 
 
 def test_name_is_not_a_point():
@@ -65,6 +141,43 @@ def test_pixel_hits_the_body_in_frame():
     point, body = hit
     assert body == int(model.body("toaster_main_group_main").id)
     assert float(np.linalg.norm(point - center)) < 0.25, np.linalg.norm(point - center)
+
+
+def test_spawn_center_ray_hits_kitchen_not_wall():
+    """Upright+tilted head at SPAWN: image center is kitchen, not the far wall."""
+    model, data = _stand()
+    origin, rot, fovy = camera_basis(model, data)
+    aspect = LOOK_W / LOOK_H
+    direction = ray_direction(rot, fovy, aspect, 0.5, 0.5)
+    hit = ray_hit(model, data, origin, direction, int(model.body("pelvis").id))
+    assert hit is not None
+    name = model.body(int(hit[1])).name.lower()
+    assert "wall" not in name, name
+
+
+def test_toaster_pixel_in_frame_hits_toaster():
+    """Toaster is off-center in the head image; the correct UV must hit it."""
+    model, data = _stand()
+    body = int(model.body("toaster_main_group_main").id)
+    center = np.asarray(data.xpos[body], dtype=np.float64)
+    origin, rot, fovy = camera_basis(model, data)
+    delta = center - origin
+    x = float(np.dot(delta, rot[:, 0]))
+    y = float(np.dot(delta, rot[:, 1]))
+    z = float(np.dot(delta, rot[:, 2]))
+    assert z < 0.0
+    aspect = LOOK_W / LOOK_H
+    fov_y = float(np.deg2rad(fovy))
+    fov_x = 2.0 * float(np.arctan(np.tan(fov_y / 2.0) * aspect))
+    fwd = -z
+    u = 0.5 + (x / fwd) / (2.0 * np.tan(fov_x / 2.0))
+    v = 0.5 - (y / fwd) / (2.0 * np.tan(fov_y / 2.0))
+    assert 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0, (u, v)
+    # Not forced to image center — toaster sits to the right of stove.
+    assert abs(u - 0.5) > 0.05 or abs(v - 0.5) > 0.02, (u, v)
+    hit = ray_hit(model, data, origin, ray_direction(rot, fovy, aspect, u, v), int(model.body("pelvis").id))
+    assert hit is not None
+    assert "toast" in model.body(int(hit[1])).name.lower()
 
 
 def test_velocity_faces_the_point():

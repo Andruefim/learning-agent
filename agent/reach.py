@@ -132,6 +132,88 @@ def attach_reach(plan, text: str) -> None:
     plan.params["hand_goal"] = dict(goal)
 
 
+def strip_planner_pixels(plan) -> None:
+    """Main L1 plan must not carry u,v — pointing is a separate vision pass."""
+    for step in plan.queue or []:
+        raw = step.get("hand_goal")
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("target") or "").strip().lower() == "head":
+            continue
+        raw.pop("u", None)
+        raw.pop("v", None)
+        raw.pop("look", None)
+    params = plan.params if isinstance(plan.params, dict) else {}
+    raw = params.get("hand_goal")
+    if isinstance(raw, dict) and str(raw.get("target") or "").strip().lower() != "head":
+        raw.pop("u", None)
+        raw.pop("v", None)
+        raw.pop("look", None)
+
+
+def plan_wants_grasp_point(plan) -> bool:
+    """Touch/grasp a visible object — needs plan_point(), not coordinates in the main plan."""
+    for step in plan.queue or []:
+        g = reach_goal_from_step(step)
+        if g is None:
+            continue
+        if g.get("target") == "head":
+            continue
+        return True
+    params = plan.params if isinstance(plan.params, dict) else {}
+    raw = params.get("hand_goal")
+    if isinstance(raw, dict) and _hand_name(raw):
+        if str(raw.get("target") or "").strip().lower() == "head":
+            return False
+        return True
+    return False
+
+
+def merge_grasp_point(plan, point_plan) -> bool:
+    """Inject hand,u,v from the vision-only pointing plan."""
+    merged: dict | None = None
+    for step in point_plan.queue or []:
+        raw = step.get("hand_goal")
+        if isinstance(raw, dict) and _image_uv(raw):
+            merged = {"hand": _hand_name(raw) or "right", "u": float(raw["u"]), "v": float(raw["v"])}
+            break
+    if merged is None:
+        params = point_plan.params if isinstance(point_plan.params, dict) else {}
+        raw = params.get("hand_goal")
+        if isinstance(raw, dict):
+            uv = _image_uv(raw)
+            if uv:
+                merged = {"hand": _hand_name(raw) or "right", "u": uv[0], "v": uv[1]}
+    if merged is None:
+        return False
+    for step in plan.queue or []:
+        g = reach_goal_from_step(step)
+        if g is not None and g.get("target") != "head":
+            step["hand_goal"] = dict(merged)
+    plan.params = dict(plan.params or {})
+    plan.params["hand_goal"] = dict(merged)
+    attach_reach(plan, plan.instruction)
+    return True
+
+
+def cast_grasp_uv(model, data, pelvis_id: int, u: float, v: float) -> tuple[bool, int | None]:
+    """True when the head-camera ray at (u,v) hits a solid body, not wall/floor/miss."""
+    origin, rot, fovy = camera_basis(model, data)
+    direction = ray_direction(rot, fovy, LOOK_W / LOOK_H, float(u), float(v))
+    hit = ray_hit(model, data, origin, direction, int(pelvis_id))
+    if hit is None:
+        return False, None
+    _point, body = hit
+    root = int(assembly_root(model, int(body)))
+    name = (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, root) or "?").lower()
+    if "wall" in name or "floor" in name or name in {"world", "ground"}:
+        return False, root
+    u_f, v_f = float(u), float(v)
+    if u_f < 0.12 or u_f > 0.88 or v_f < 0.12 or v_f > 0.88:
+        return False, root
+    return True, root
+
+
 def touch_lesson(aimed: bool, d0: float | None, best: float | None) -> str | None:
     """Sleep keeps a reach only when the palm got closer. Other commands are unchanged."""
     if not aimed:
@@ -149,6 +231,25 @@ def camera_basis(model, data):
     rot = np.asarray(data.cam_xmat[cam], dtype=np.float64).reshape(3, 3)
     fovy = float(model.cam_fovy[cam])
     return origin, rot, fovy
+
+
+def look_errors(model, data, point: np.ndarray) -> tuple[float, float] | None:
+    """Yaw/pitch error (rad) of the head camera relative to a world point.
+
+    Positive yaw_err → target is to the camera's right.
+    Positive pitch_err → target is above the image center.
+    """
+    origin, rot, _ = camera_basis(model, data)
+    delta = np.asarray(point, dtype=np.float64) - origin
+    right = rot[:, 0]
+    up = rot[:, 1]
+    forward = -rot[:, 2]
+    depth = float(np.dot(delta, forward))
+    if depth < 0.05:
+        return None
+    yaw_err = float(np.arctan2(float(np.dot(delta, right)), depth))
+    pitch_err = float(np.arctan2(float(np.dot(delta, up)), depth))
+    return yaw_err, pitch_err
 
 
 def ray_direction(rot: np.ndarray, fovy_deg: float, aspect: float, u: float, v: float) -> np.ndarray:
@@ -201,6 +302,19 @@ def assembly_root(model, body: int) -> int:
         if parent <= 0:
             return origin
         body = parent
+
+
+def palm_near_point(model, data, hand: str, point, max_m: float) -> bool:
+    """True when the named palm is within max_m of the grasp point."""
+    sides = ("left", "right") if hand == "both" else (str(hand),)
+    point = np.asarray(point, dtype=np.float64).reshape(3)
+    for side in sides:
+        if side not in _HAND_BODY:
+            continue
+        palm, _ = _palm(model, data, side)
+        if float(np.linalg.norm(palm - point)) <= float(max_m):
+            return True
+    return False
 
 
 def _under(model, body: int, root: int) -> bool:

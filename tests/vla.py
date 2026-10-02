@@ -103,13 +103,23 @@ def test_the_arm_waits_until_the_body_has_stopped():
     bot.data = None
     bot._approach_arrived = False
     bot._arm_wait0 = None
-    bot._queue = [_frame(reach={"u": 0.5, "v": 0.6})]
+    bot._queue = [_frame(reach={"u": 0.5, "v": 0.6, "point": np.zeros(3)})]
     bot._queue[0]["approaching"] = True
     assert bot._pi0_task() is True
     assert bot._hands_ready() is False
     bot._approach_arrived = True
     bot._queue[0]["approaching"] = False
     assert bot._hands_ready() is True
+
+
+def test_arm_waits_without_cast_point():
+    bot = _bare_engine()
+    bot.walk = None
+    bot.data = None
+    bot._approach_arrived = True
+    bot._queue = [_frame(reach={"u": 0.5, "v": 0.6})]
+    bot._queue[0]["approaching"] = False
+    assert bot._hands_ready() is False
 
 
 def test_a_waiting_arm_is_not_a_miss():
@@ -124,6 +134,105 @@ def test_a_waiting_arm_is_not_a_miss():
     assert bot._grasp_progress(goal, frame) is False
     assert goal.get("stale") is not True
     assert bot._grasp_tick0 is None
+
+
+def test_verify_repoint_keeps_anchor_near_field():
+    bot = _bare_engine()
+    bot.lock = __import__("threading").Lock()
+    bot._approach_arrived = True
+    bot._anchor = {"point": np.array([1.0, 0.0, 1.0]), "body": 3, "u": 0.5, "v": 0.5}
+    bot._need_gaze_plan = False
+    bot._need_verify = False
+    bot.last_l1 = 0.0
+    bot._queue = [_frame(reach={"u": 0.5, "v": 0.5, "point": np.zeros(3)})]
+    bot._notes = []
+    bot._note = lambda m: bot._notes.append(m)
+    bot.apply_verify({"done": False, "retry": "repoint"})
+    assert bot._need_gaze_plan is False
+    assert bot._need_verify is False
+    assert any("якорю" in n for n in bot._notes)
+
+
+def test_wall_cast_restores_anchor():
+    bot = _bare_engine()
+    bot._gaze_locked = True
+    bot.data = type("D", (), {"qpos": np.zeros(50)})()
+    bot.qadr = np.arange(29)
+    # WAIST_P must be an index into qpos via qadr
+    from agent.h2 import WAIST_P
+
+    bot.qadr = np.arange(29)
+    bot.data.qpos = np.zeros(40)
+    bot._anchor = {
+        "point": np.array([0.5, 0.0, 1.0]),
+        "aim": np.array([1.0, 0.0, 0.0]),
+        "body": 3,
+        "u": 0.5,
+        "v": 0.5,
+        "hand": "right",
+        "name": "fridge_door",
+    }
+    bot._notes = []
+    bot._note = lambda m: bot._notes.append(m)
+    bot._marker_pos = None
+    bot._marker_aim = None
+    bot._marker_dim = False
+    bot._need_gaze_plan = True
+    goal = {"u": 0.5, "v": 0.5}
+    # Monkeypatch ray path to hit a wall body
+    import agent.engine as eng
+
+    def fake_basis(*a, **k):
+        return np.zeros(3), np.eye(3), 45.0
+
+    def fake_dir(*a, **k):
+        return np.array([1.0, 0.0, 0.0])
+
+    def fake_hit(*a, **k):
+        return np.array([1.0, 0.0, 1.0]), 9
+
+    def fake_root(model, body):
+        return int(body)
+
+    bot.model = type("M", (), {})()
+    bot.pelvis_id = 0
+    bot._body_name = lambda b: "wall_room_main"
+    orig = (eng.camera_basis, eng.ray_direction, eng.ray_hit, eng.assembly_root)
+    eng.camera_basis, eng.ray_direction, eng.ray_hit, eng.assembly_root = (
+        fake_basis,
+        fake_dir,
+        fake_hit,
+        fake_root,
+    )
+    try:
+        bot._cast_look(goal)
+    finally:
+        eng.camera_basis, eng.ray_direction, eng.ray_hit, eng.assembly_root = orig
+    assert goal.get("point") is not None
+    assert np.allclose(goal["point"], bot._anchor["point"])
+    assert bot._need_gaze_plan is False
+
+
+def test_fingers_stay_curled_for_raise():
+    from agent.dex3 import finger_curl
+
+    bot = _bare_engine()
+    bot._queue = [_frame(reach={"u": 0.5, "v": 0.5, "point": np.zeros(3), "hand": "right"})]
+    q = bot._finger_command()
+    assert float(np.max(np.abs(q - finger_curl("right")))) < 1e-5
+    bot._queue = [_frame(reach={})]
+    q2 = bot._finger_command()
+    assert float(np.max(np.abs(q2 - finger_curl("both")))) < 1e-5
+
+
+def test_neural_near_after_approach():
+    bot = _bare_engine()
+    bot._approach_arrived = False
+    bot._queue = [_frame(reach={"u": 0.5, "v": 0.6, "point": np.zeros(3)})]
+    assert bot._neural_near() is False
+    bot._approach_arrived = True
+    assert bot._neural_near() is True
+    assert bot._pi0_owns_near() is False
 
 
 def test_the_next_chunk_is_asked_for_early():
@@ -245,6 +354,30 @@ def test_chunk_plays_without_the_weights():
     assert teacher.command(arm, lo, hi) is None
 
 
+def test_pi0_device_defaults_to_cuda_when_present(monkeypatch):
+    from agent.policy import resolve_pi0_device
+
+    monkeypatch.delenv("PI0_DEVICE", raising=False)
+    if torch.cuda.is_available():
+        assert resolve_pi0_device().type == "cuda"
+    monkeypatch.setenv("PI0_DEVICE", "cpu")
+    assert resolve_pi0_device().type == "cpu"
+    monkeypatch.setenv("PI0_DEVICE", "cuda")
+    if torch.cuda.is_available():
+        assert resolve_pi0_device().type == "cuda"
+    else:
+        assert resolve_pi0_device().type == "cpu"
+
+
+def test_load_now_refuses_cpu():
+    teacher = System15(torch.device("cpu"))
+    note = teacher.load_now()
+    assert note is not None and "CPU" in note
+    assert teacher.error
+    assert teacher._ready is False
+    assert teacher._thread is None
+
+
 if __name__ == "__main__":
     test_retarget_stays_inside_the_command()
     test_a_hinge_swing_counts_as_motion()
@@ -258,4 +391,5 @@ if __name__ == "__main__":
     test_the_first_chunk_is_played_whole()
     test_a_finished_command_is_recognized()
     test_chunk_plays_without_the_weights()
+    test_load_now_refuses_cpu()
     print("ok")

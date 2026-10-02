@@ -606,7 +606,10 @@ class FlywheelMixin:
         if self._ep_slept or self._ep_failed or not self._ep_armed:
             return
         rows = self._trim_idle_tail(self.logs[self._ep_i :])
-        if getattr(self, "_ep_pi0", False):
+        if getattr(self, "_ep_e2e", False):
+            rows = [row for row in rows if row.get("source") == "e2e"]
+            block = None if rows else "Сон пропущен: нет e2e кадров."
+        elif getattr(self, "_ep_pi0", False):
             if not self._pi0_moved():
                 block = "Сон пропущен: касание не сдвинуло мир."
             else:
@@ -652,11 +655,11 @@ class FlywheelMixin:
         if frame.get("approaching"):
             return False
         reach = frame.get("reach") or {}
-        if "u" in reach and not reach.get("done"):
+        if "u" in reach and not reach.get("done") and not getattr(self, "_e2e_mode", False):
             return False
         # The touch timer must not end a pull: π0 stays on the hands after it.
         # A finished step count or turn has already stopped the base.
-        if not (steps_done or turn_done):
+        if not (steps_done or turn_done) and not getattr(self, "_ep_e2e", False):
             cmd = np.asarray(frame["cmd"], dtype=np.float64)
             if max(abs(float(cmd[0])), abs(float(cmd[1])), abs(float(cmd[2]))) > 0.05:
                 return False

@@ -31,6 +31,18 @@ def resolve_device(spec: str | None = None) -> torch.device:
     return torch.device("cpu")
 
 
+def resolve_pi0_device(spec: str | None = None) -> torch.device:
+    """π0 is a large VLA — CPU inference freezes the 500 Hz sim loop for minutes."""
+    raw = spec if spec is not None else os.getenv("PI0_DEVICE", "")
+    raw = (raw or "").lower().strip()
+    if not raw:
+        # Default: GPU when present. Empty PI0_DEVICE + no CUDA → cpu (caller should skip).
+        return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    if raw in {"cuda", "gpu", "rocm", "hip"} and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 def encode_instr(text: str) -> np.ndarray:
     raw = (text or "").encode("utf-8")[:INSTR_BYTES]
     out = np.zeros(INSTR_BYTES, dtype=np.int64)
