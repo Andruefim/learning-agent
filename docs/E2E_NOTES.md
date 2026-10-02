@@ -19,7 +19,7 @@ friction/stiffness. The student must never see those privileged fields.
 |---|---|---|
 | 3.1 zero policy | PASS | `reports/gate31_zero/summary.json` — 0/20 success, 0 falls |
 | 3.2A Tier A K=1 | PASS | `reports/tier_a_gate100/summary.json` — 100/100, Wilson95 ≥ 0.96 |
-| 3.2B Tier B | running | `reports/tier_b_gate100/` — k1_default 100/100; k5_random partial; k5_llm pending |
+| 3.2B Tier B | PASS | `reports/tier_b_gate100/tier_b_report.md` — k1=0%, k5_random=60% [0.50,0.69], k5_llm=82% [0.73,0.88]; Wilson intervals non-overlapping |
 | 3.3 dataset | code ready | `scripts/collect_flywheel_data.py`, `agent/oven_dataset.py`, `scripts/validate_dataset.py` |
 | 3.4 student BC | code ready | `scripts/train_student_oven.py` |
 | 3.5 DAgger | code ready | `scripts/run_dagger.py` |
@@ -40,8 +40,9 @@ friction/stiffness. The student must never see those privileged fields.
 
 1. Can Dex3 open the door with contact only (no hinge assist)? Not yet.
 2. Tier C GR00T zero-shot deferred until after Tier B report.
-3. In-context student effect (§3.7) unknown until data + trained student exist.
-4. Ego `VISION_H/W=48×64` — confirm handle visibility after first D_success dump.
+3. In-context teacher effect (§3.2B) **supported**: k5_llm 82% vs k5_random 60% on 100 shared seeds (non-overlapping Wilson 95%).
+4. In-context student effect (§3.7) unknown until trained student + closed-loop H1.
+5. Ego `VISION_H/W=48×64` — confirm handle visibility after first D_success dump.
 
 ## Tier C (placeholder)
 

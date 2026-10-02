@@ -1,0 +1,13 @@
+{
+  "mode": "k1_default",
+  "n": 100,
+  "successes": 0,
+  "success_rate": 0.0,
+  "wilson95": [
+    0.0,
+    0.03699480747600191
+  ],
+  "mean_attempts": 1.0,
+  "total_wall_s": 372.8537843001541,
+  "path": "C:\\Users\\Andrey\\Desktop\\agi\\learning-agent\\reports\\tier_b_gate100\\k1_default.jsonl"
+}
