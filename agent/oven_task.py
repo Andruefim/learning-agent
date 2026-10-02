@@ -38,25 +38,25 @@ PROMPTS = (
 )
 
 DEFAULT_THETA = {
-    "stance_x": -0.55,
+    "stance_x": -0.30,
     "stance_y": 0.0,
     "stance_yaw": 0.0,
     "contact_offset_along_handle": 0.0,
-    "pregrasp_clearance": 0.08,
-    "pull_speed": 0.25,
-    "grip_close": 0.85,
+    "pregrasp_clearance": 0.06,
+    "pull_speed": 0.30,
+    "grip_close": 0.95,
     "pull_arc_scale": 1.0,
 }
 
 THETA_BOUNDS = {
-    "stance_x": (-0.90, -0.35),
-    "stance_y": (-0.25, 0.25),
+    "stance_x": (-0.42, -0.22),
+    "stance_y": (-0.20, 0.20),
     "stance_yaw": (-0.35, 0.35),
-    "contact_offset_along_handle": (-0.25, 0.25),
-    "pregrasp_clearance": (0.03, 0.18),
-    "pull_speed": (0.08, 0.45),
-    "grip_close": (0.40, 1.0),
-    "pull_arc_scale": (0.6, 1.4),
+    "contact_offset_along_handle": (-0.20, 0.20),
+    "pregrasp_clearance": (0.03, 0.12),
+    "pull_speed": (0.10, 0.50),
+    "grip_close": (0.50, 1.0),
+    "pull_arc_scale": (0.7, 1.3),
 }
 
 

@@ -27,10 +27,13 @@ if not os.environ.get("MUJOCO_GL"):
 def _one(args: tuple) -> dict:
     seed, seconds, randomize, policy = args
     from agent.oven_task import run_zero_policy_episode
+    from agent.oven_teacher import run_tier_a_episode
 
-    if policy != "zero":
-        raise ValueError(f"unsupported policy={policy!r} (phase 3.1 supports zero)")
-    return run_zero_policy_episode(seed, seconds=seconds, randomize=randomize).to_json()
+    if policy == "zero":
+        return run_zero_policy_episode(seed, seconds=seconds, randomize=randomize).to_json()
+    if policy == "tier_a":
+        return run_tier_a_episode(seed, seconds=seconds, randomize=randomize)
+    raise ValueError(f"unsupported policy={policy!r}")
 
 
 def main() -> int:
@@ -38,7 +41,7 @@ def main() -> int:
     p.add_argument("--n", type=int, default=20, help="number of episodes")
     p.add_argument("--seed", type=int, default=0, help="base seed (episode i uses seed+i)")
     p.add_argument("--seconds", type=float, default=60.0, help="sim time limit per episode")
-    p.add_argument("--policy", choices=("zero",), default="zero")
+    p.add_argument("--policy", choices=("zero", "tier_a"), default="zero")
     p.add_argument("--workers", type=int, default=1, help="process pool size")
     p.add_argument("--run", type=str, default="", help="reports/<run> name")
     p.add_argument("--no-randomize", action="store_true")
@@ -58,12 +61,18 @@ def main() -> int:
     t0 = time.perf_counter()
     if int(args.workers) <= 1:
         from agent.oven_task import OvenScene, run_zero_policy_episode
+        from agent.oven_teacher import run_tier_a_episode
 
         scene = OvenScene()
         for seed, seconds, randomize, policy in jobs:
-            if policy != "zero":
+            if policy == "zero":
+                results.append(
+                    run_zero_policy_episode(seed, seconds=seconds, randomize=randomize, scene=scene).to_json()
+                )
+            elif policy == "tier_a":
+                results.append(run_tier_a_episode(seed, seconds=seconds, randomize=randomize, scene=scene))
+            else:
                 raise ValueError(policy)
-            results.append(run_zero_policy_episode(seed, seconds=seconds, randomize=randomize, scene=scene).to_json())
     else:
         with ProcessPoolExecutor(max_workers=int(args.workers)) as pool:
             futs = [pool.submit(_one, job) for job in jobs]
