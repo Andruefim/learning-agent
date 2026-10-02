@@ -1,4 +1,7 @@
-"""Whole-body e2e teacher: one VLA → absolute body joints → Joint-PD.
+"""DEPRECATED whole-body π0/π0.5 teacher (kept behind E2E_ENABLE=0).
+
+Superseded by the oven flywheel ladder (Tier A/B privileged teacher → student).
+Do not enable for new work. Default is off (E2E_ENABLE=0).
 
 OpenHLM-style contract for this repo:
   language + head RGB + proprio(29) → action chunk → q_body[29]

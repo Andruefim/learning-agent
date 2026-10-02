@@ -3,6 +3,7 @@
 Sources checked while implementing `E2E_ZEROSHOT_FLYWHEEL.md` (2026-10-02):
 
 - NVIDIA Isaac GR00T / policy docs (stateless policy; pretrain tags vs posttrain) — see plan §0.
+  - https://github.com/NVIDIA/Isaac-GR00T (docs/policy.md — «the policy is stateless», checked 2026-09/10)
 - Repo flywheel already present: `agent/flywheel.py`, `agent/trials.py`, `agent/policy.py`.
 
 ## Assumption (user confirmation)
@@ -18,7 +19,14 @@ friction/stiffness. The student must never see those privileged fields.
 |---|---|---|
 | 3.1 zero policy | PASS | `reports/gate31_zero/summary.json` — 0/20 success, 0 falls |
 | 3.2A Tier A K=1 | PASS | `reports/tier_a_gate100/summary.json` — 100/100, Wilson95 ≥ 0.96 |
-| 3.2B Tier B | running | `reports/tier_b_gate100/` |
+| 3.2B Tier B | running | `reports/tier_b_gate100/` — k1_default 100/100; k5_random partial; k5_llm pending |
+| 3.3 dataset | code ready | `scripts/collect_flywheel_data.py`, `agent/oven_dataset.py`, `scripts/validate_dataset.py` |
+| 3.4 student BC | code ready | `scripts/train_student_oven.py` |
+| 3.5 DAgger | code ready | `scripts/run_dagger.py` |
+| 3.6 student-only | code ready | `STUDENT_ONLY_EVAL` in `agent/config.py` + `_mix` in `flywheel.py` |
+| 3.7 H1 closed-loop | code ready | `scripts/run_h1_closed_loop.py` → `reports/h1_closed_loop.md` |
+| 3.8 flywheel turns | code ready | `scripts/run_flywheel_loop.py` → `reports/flywheel.csv` |
+| 3.9 cleanup | partial | `E2E_ENABLE=0` default; README G1; π0.5 path deprecated |
 
 ## Tier A design notes
 
@@ -32,7 +40,8 @@ friction/stiffness. The student must never see those privileged fields.
 
 1. Can Dex3 open the door with contact only (no hinge assist)? Not yet.
 2. Tier C GR00T zero-shot deferred until after Tier B report.
-3. In-context student effect (§3.7) unknown until data exists.
+3. In-context student effect (§3.7) unknown until data + trained student exist.
+4. Ego `VISION_H/W=48×64` — confirm handle visibility after first D_success dump.
 
 ## Tier C (placeholder)
 

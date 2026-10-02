@@ -2,4 +2,6 @@ Official Unitree H2 MJCF from
 https://github.com/unitreerobotics/unitree_mujoco
 path: unitree_robots/h2/ (h2_mujoco.xml, scene.xml, meshes/)
 
-Do not edit h2_mujoco.xml / scene.xml. App loads scene_app.xml.
+UNUSED in this project. The live robot is Unitree G1 (`models/unitree_g1`,
+loaded via `agent/h2.py` — module name is historical). Kept only as reference;
+do not point `MODEL_XML` here.

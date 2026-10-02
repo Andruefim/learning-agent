@@ -1,4 +1,4 @@
-"""Physics + planner smoke for the Unitree H2 foundation controller.
+"""Physics + planner smoke for the Unitree G1 foundation controller.
 
 Run: `MUJOCO_GL=egl python app.py --smoke` or `python -m tests.smoke`.
 """

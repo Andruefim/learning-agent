@@ -31,24 +31,52 @@ def wilson(n_ok: int, n: int, z: float = 1.96) -> list[float]:
     return [max(0.0, center - half), min(1.0, center + half)]
 
 
-def run_mode(mode: str, n: int, seed: int, seconds: float, k_max: int, out_dir: Path) -> dict:
+def _load_jsonl(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    if not path.exists():
+        return rows
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            print(f"skip bad jsonl line in {path.name}: {e}", flush=True)
+    return rows
+
+
+def run_mode(mode: str, n: int, seed: int, seconds: float, k_max: int, out_dir: Path, *, resume: bool = False) -> dict:
     from agent.oven_task import OvenScene
     from agent.oven_tier_b import ThetaLLM, run_scene
 
+    # Recreate MuJoCo scene periodically — long GLFW/MuJoCo sessions hard-crash on Windows.
+    SCENE_REFRESH = 10
     scene = OvenScene()
     llm = ThetaLLM() if mode == "k5_llm" else None
     path = out_dir / f"{mode}.jsonl"
-    ok = 0
-    rows = []
+    rows = _load_jsonl(path) if resume else []
+    ok = sum(int(r["success"]) for r in rows)
+    start_i = len(rows)
+    if resume and start_i > 0:
+        print(f"{mode}: resume from {start_i}/{n}", flush=True)
     t0 = time.perf_counter()
-    with path.open("w", encoding="utf-8") as f:
-        for i in range(n):
+    mode_flag = "a" if resume and start_i > 0 else "w"
+    with path.open(mode_flag, encoding="utf-8") as f:
+        for i in range(start_i, n):
+            if (i - start_i) > 0 and (i - start_i) % SCENE_REFRESH == 0:
+                print(f"{mode}: refresh OvenScene at {i}/{n}", flush=True)
+                scene = OvenScene()
             s = int(seed) + i
             res = run_scene(s, mode, k_max=k_max, seconds=seconds, scene=scene, llm=llm)  # type: ignore[arg-type]
             row = res.to_json()
             rows.append(row)
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
             ok += int(res.success)
             print(
                 f"{mode} [{i+1}/{n}] seed={s} success={res.success} "
@@ -80,6 +108,7 @@ def main() -> int:
     p.add_argument("--seconds", type=float, default=12.0)
     p.add_argument("--k", type=int, default=5)
     p.add_argument("--run", type=str, default="")
+    p.add_argument("--resume", action="store_true", help="append to existing jsonl for each mode")
     args = p.parse_args()
 
     run = args.run or time.strftime("tier_b_%Y%m%d_%H%M%S")
@@ -89,7 +118,35 @@ def main() -> int:
     modes = ("k1_default", "k5_random", "k5_llm") if args.all else (args.mode,)
     table = []
     for mode in modes:
-        table.append(run_mode(mode, args.n, args.seed, args.seconds, args.k, out_dir))
+        summary_path = out_dir / f"{mode}_summary.json"
+        jsonl_path = out_dir / f"{mode}.jsonl"
+        n_done = 0
+        if args.resume and jsonl_path.exists():
+            n_done = len(_load_jsonl(jsonl_path))
+        if args.resume and n_done >= int(args.n):
+            if summary_path.exists():
+                data = json.loads(summary_path.read_text(encoding="utf-8"))
+            else:
+                # Rebuild summary from jsonl so --resume can finish a partial crash.
+                rows = _load_jsonl(jsonl_path)
+                ok = sum(int(r["success"]) for r in rows)
+                data = {
+                    "mode": mode,
+                    "n": args.n,
+                    "successes": ok,
+                    "success_rate": ok / max(args.n, 1),
+                    "wilson95": wilson(ok, args.n),
+                    "mean_attempts": sum(len(r["attempts"]) for r in rows) / max(args.n, 1),
+                    "total_wall_s": 0.0,
+                    "path": str(jsonl_path),
+                }
+                summary_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            print(f"skip finished {mode}", flush=True)
+            table.append(data)
+            continue
+        table.append(
+            run_mode(mode, args.n, args.seed, args.seconds, args.k, out_dir, resume=args.resume)
+        )
 
     report = out_dir / "tier_b_report.md"
     lines = [

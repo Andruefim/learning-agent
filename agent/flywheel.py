@@ -26,6 +26,7 @@ from agent.config import (
     SKILL_IDS,
     SKILL_TO_I,
     STAND_Z,
+    STUDENT_ONLY_EVAL,
     TRIAL_MAX,
     TURN_IN_CONTEXT_OK,
     VISION_H,
@@ -154,6 +155,9 @@ class FlywheelMixin:
                     self.stage = "C"
 
     def _mix(self, teacher: np.ndarray, student: np.ndarray) -> np.ndarray:
+        # §3.6: headless oven eval may run the student alone. Interactive default unchanged.
+        if STUDENT_ONLY_EVAL:
+            return clip_command(student)
         if self.alpha <= 1e-8 or self.outcome == "fall":
             return teacher
         delta = np.clip(student - teacher, -RESIDUAL_LIMIT, RESIDUAL_LIMIT)

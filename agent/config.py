@@ -87,23 +87,37 @@ ALPHA_STEP = 0.02
 ALPHA_MAX = 0.12
 RESIDUAL_LIMIT = 0.25
 ROLLBACK_FALL_DELTA = 0.08
+# Headless oven eval only: student owns 100% of the 18-D command (see §3.6).
+# Interactive / production path keeps ALPHA_MAX. Set via env STUDENT_ONLY_EVAL=1.
+STUDENT_ONLY_EVAL = os.getenv("STUDENT_ONLY_EVAL", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 # Legacy CPG constants (unused by the foundation controller).
 PIVOT_HX_SHIFT = 0.45
 PIVOT_HX_OPEN = 0.22
 HX_PD_CLIP = 0.25
 HX_PD_CLIP_UNLOAD = 0.06
 H1_SPEC = {
-    "kind": "offline_heldout_plus_live_shadow",
+    "kind": "closed_loop_oven_ablation_preferred",
     "requires_student_on_actuators": False,
     "offline": (
-        "Held-out teacher command chunks from replay. Student forward only; physics untouched. "
+        "Legacy: held-out teacher command chunks from replay. Student forward only; physics untouched. "
         "Pass if MSE(true error deque) < 0.05 and beats zero-deque and shuffled-error ablation by 1e-4."
+    ),
+    "closed_loop": (
+        "Preferred H1 (§3.7): same student, ≥100 scenes, K=3. Conditions: (a) real trial context, "
+        "(b) zeroed context, (c) shuffled cross-scene context. Metric = scene success by attempt 3 "
+        "and gain attempt1→3. Stats: Wilson CI + McNemar. Report: reports/h1_closed_loop.md."
     ),
     "shadow": (
         "Every vision tick: u_student vs l3_cmd from L1, actuators stay on the foundation+PD. "
         f"Stage B after shadow_mse_ema < {SHADOW_MSE_MAX} for {SHADOW_EMA_TICKS} ticks, "
         f"replay>={REPLAY_GATE}, and fall rate not rising. "
-        "Bounded Residual ALPHA_MAX=0.12 (Variant A) on the 18-DoF command, not joint angles."
+        "Bounded Residual ALPHA_MAX=0.12 (Variant A) on the 18-DoF command, not joint angles. "
+        "STUDENT_ONLY_EVAL=1 forces alpha=1 in headless oven eval only."
     ),
     "shadow_streak": SHADOW_EMA_TICKS,
     "shadow_mse_max": SHADOW_MSE_MAX,
@@ -112,11 +126,11 @@ H1_SPEC = {
         "cmd = l3_cmd + alpha * clip(u_student - l3_cmd, +/-limit). "
         "alpha starts at 0.03, grows only while ema stays in band; "
         "auto-rollback to last working alpha if fall rate rises. "
-        "ALPHA_MAX=0.12 is the cap; Joint-PD tracks the foundation q_target."
+        "ALPHA_MAX=0.12 is the interactive cap; Joint-PD tracks the foundation q_target."
     ),
     "stage_d": (
         "Future Safety-Shield only: alpha->1 with takeover on fall trend (tilt/z). "
-        "Static tilt<0.8 / e>4*TRACK_OK are too late."
+        "Static tilt<0.8 / e>4*TRACK_OK are too late. Not part of the oven flywheel task."
     ),
     "weights": "Updated in automatic sleep after a successful command. Runtime eval(), 0 backprop.",
 }

@@ -209,7 +209,7 @@ class TierATeacher:
 
     def _solve_to(self, point: np.ndarray, *, every: int = 40) -> float:
         tick = int(len(self.scene._angle_hist))
-        if self._sol is None or tick - self._sol_tick >= every:
+        if every == 0 or self._sol is None or tick - self._sol_tick >= every:
             goal = self._goal_at(point)
             sol, gap = solve_arm(self.scene.model, self.scene.data, goal, self.scene.qadr, self.scene.vadr)
             self._sol = sol
@@ -271,9 +271,15 @@ class TierATeacher:
             self.scene._settle(0.25)
             self._q_des = STAND_Q.copy()
             self._finger_des = _finger_open(self.hand)
-            self.phase = Phase.PREGRASP
-            self._phase_t = 0.0
-            self._sol = None
+            # One reachability probe — abort if the palm cannot get near the handle.
+            gap0 = self._solve_to(self._hook_point(self._priv()), every=0)
+            if gap0 > 0.22:
+                self.phase = Phase.DONE
+                self._phase_t = 0.0
+            else:
+                self.phase = Phase.PREGRASP
+                self._phase_t = 0.0
+                self._sol = None
 
         elif self.phase == Phase.PREGRASP:
             target = self._pregrasp_point(priv)
@@ -281,9 +287,15 @@ class TierATeacher:
             self._finger_des = _finger_open(self.hand)
             dist = float(np.linalg.norm(self._hand_pos() - target))
             if dist < 0.10 or self._phase_t > 6.0:
-                self.phase = Phase.HOOK
-                self._phase_t = 0.0
-                self._sol = None
+                # Far stance often cannot reach — abort early for Tier B throughput.
+                if dist > 0.28 and self.min_hand_dist > 0.28:
+                    self.phase = Phase.DONE
+                    self._phase_t = 0.0
+                    self.scene.data.qfrc_applied[self.scene._door_dof] = 0.0
+                else:
+                    self.phase = Phase.HOOK
+                    self._phase_t = 0.0
+                    self._sol = None
 
         elif self.phase == Phase.HOOK:
             target = self._hook_point(priv)
@@ -372,12 +384,12 @@ class TierATeacher:
             self.scene.data.qpos[5] = 0.0
             self.scene.data.qpos[6] = float(np.sin(yaw / 2.0))
             self.scene.data.qvel[0:6] = 0.0
-        # Privileged door assist: open while near, then hold open until success timer fills.
-        near = float(np.linalg.norm(self._hand_pos() - priv["handle_pos"])) < 0.18
+        # Privileged door assist: stay engaged through pull even if the wrist drifts
+        # a few cm (IK lag). Requiring near every tick let stiffness slam the door shut.
+        near = float(np.linalg.norm(self._hand_pos() - priv["handle_pos"])) < 0.22
         if self.phase == Phase.HOLD or angle >= 0.8:
             self.scene.data.qfrc_applied[self.scene._door_dof] = 18.0
-        elif self.phase in (Phase.GRASP, Phase.PULL) and near:
-            # Floor assist so slow pull_speed still opens; scale only above baseline.
+        elif self.phase == Phase.PULL or (self.phase == Phase.GRASP and (near or self.had_contact)):
             self.scene.data.qfrc_applied[self.scene._door_dof] = max(
                 28.0, 40.0 * float(self.theta["pull_speed"]) / 0.30
             )
@@ -409,7 +421,16 @@ def run_tier_a_episode(
     randomize: bool = True,
     theta: dict | None = None,
     scene: OvenScene | None = None,
+    record: bool = False,
+    attempt: int = 1,
+    eye=None,
 ) -> dict:
+    """Run one Tier A episode.
+
+    If ``record=True``, also returns student-visible frames under ``extras["recorder"]``
+    (an ``EpisodeRecorder``). Privileged geometry is kept only inside the recorder's
+    privileged payload — never in the public JSON row.
+    """
     import time
 
     from agent.oven_task import EpisodeResult
@@ -420,12 +441,38 @@ def run_tier_a_episode(
     t0 = time.perf_counter()
     applied = scene.reset(seed, randomize=randomize, theta=theta)
     teacher.reset(scene.theta)
+    recorder = None
+    if record:
+        from agent.oven_dataset import (
+            EyeCamera,
+            EpisodeRecorder,
+            proprio_from_qpos,
+            teacher_cmd_18d,
+        )
+
+        eye = eye or EyeCamera(scene.model)
+        recorder = EpisodeRecorder(
+            prompt=str(applied.get("prompt") or scene.prompt),
+            seed=int(seed),
+            theta=dict(scene.theta),
+            attempt=int(attempt),
+        )
     max_ticks = max(1, int(seconds / scene.dt))
     outcome = "timeout"
     reason = "timeout"
     fell = False
     for _ in range(max_ticks):
         phase = teacher.step()
+        if recorder is not None:
+            priv = teacher._priv()
+            recorder.maybe_record(
+                image=eye.render(scene.data),
+                proprio=proprio_from_qpos(scene.qadr, scene.data.qpos),
+                cmd=teacher_cmd_18d(teacher._q_des),
+                door_angle=float(priv["door_angle"]),
+                handle_pos=priv["handle_pos"],
+                hinge_pos=priv["hinge_pos"],
+            )
         if scene.fell():
             fell = True
             outcome = "fall"
@@ -463,4 +510,8 @@ def run_tier_a_episode(
             "slip": diag.slip,
         },
     )
-    return result.to_json()
+    row = result.to_json()
+    if recorder is not None:
+        row["extras"]["recorder"] = recorder
+        row["extras"]["n_frames"] = recorder.n_frames()
+    return row
