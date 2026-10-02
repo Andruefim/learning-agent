@@ -1,0 +1,12 @@
+{
+  "run": "gate31_zero",
+  "n": 20,
+  "policy": "zero",
+  "successes": 0,
+  "falls": 0,
+  "mean_wall_s": 2.117419405002147,
+  "mean_sim_s": 10.0,
+  "total_wall_s": 45.670770099852234,
+  "episodes_per_hour": 1576.5006774044512,
+  "path": "C:\\Users\\Andrey\\Desktop\\agi\\learning-agent\\reports\\gate31_zero\\episodes.jsonl"
+}
