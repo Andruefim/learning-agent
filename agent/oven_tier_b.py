@@ -21,12 +21,12 @@ from agent.oven_task import (
 )
 from agent.oven_teacher import run_tier_a_episode
 
-# Suboptimal start so K>1 methods have headroom (Tier A default already ~100%).
+# Suboptimal start so K>1 methods have headroom (production Tier A defaults ~100%).
 TIER_B_START_THETA = {
     **DEFAULT_THETA,
-    "stance_x": -0.48,
+    "stance_x": -0.55,
     "pregrasp_clearance": 0.14,
-    "pull_speed": 0.12,
+    "pull_speed": 0.15,
     "contact_offset_along_handle": 0.22,
     "pull_arc_scale": 0.75,
 }

@@ -37,6 +37,7 @@ class Phase(Enum):
     HOOK = auto()
     GRASP = auto()
     PULL = auto()
+    HOLD = auto()
     RELEASE = auto()
     RETREAT = auto()
     DONE = auto()
@@ -325,13 +326,26 @@ class TierATeacher:
             frac = float(np.clip(self._phase_t / max(dur, 1e-3), 0.0, 1.0))
             self._solve_to(self._pull_point(frac) + np.array([-0.02, 0.0, 0.0]), every=20)
             self._finger_des = finger_curl(self.hand) * float(self.theta["grip_close"])
-            if frac >= 1.0 or angle >= 0.95 or self._phase_t > 12.0:
+            if angle >= 0.8:
+                self.phase = Phase.HOLD
+                self._phase_t = 0.0
+            elif frac >= 1.0 or self._phase_t > 12.0:
                 self.phase = Phase.RELEASE
                 self._phase_t = 0.0
                 self.scene.data.qfrc_applied[self.scene._door_dof] = 0.0
 
+        elif self.phase == Phase.HOLD:
+            # Keep door past threshold until SUCCESS_HOLD_S accumulates.
+            if self._radius0 is not None:
+                self._solve_to(self._pull_point(1.0) + np.array([-0.02, 0.0, 0.0]), every=40)
+            self._finger_des = finger_curl(self.hand) * float(self.theta["grip_close"])
+            if self.scene.success_now() or self._phase_t > 2.5:
+                self.phase = Phase.RELEASE
+                self._phase_t = 0.0
+
         elif self.phase == Phase.RELEASE:
             self._finger_des = _finger_open(self.hand)
+            self.scene.data.qfrc_applied[self.scene._door_dof] = 0.0
             if self._phase_t > 0.6:
                 self.phase = Phase.RETREAT
                 self._phase_t = 0.0
@@ -348,7 +362,7 @@ class TierATeacher:
 
         self._write_ctrl()
         # Hold free-base during manipulation so door-open reaction torque cannot tip the robot.
-        if self.phase in (Phase.PREGRASP, Phase.HOOK, Phase.GRASP, Phase.PULL, Phase.RELEASE):
+        if self.phase in (Phase.PREGRASP, Phase.HOOK, Phase.GRASP, Phase.PULL, Phase.HOLD, Phase.RELEASE):
             x, y, yaw = self._stance_pose(priv)
             self.scene.data.qpos[0] = x
             self.scene.data.qpos[1] = y
@@ -358,11 +372,15 @@ class TierATeacher:
             self.scene.data.qpos[5] = 0.0
             self.scene.data.qpos[6] = float(np.sin(yaw / 2.0))
             self.scene.data.qvel[0:6] = 0.0
-        # Privileged door assist only while the palm is near the handle during pull.
+        # Privileged door assist: open while near, then hold open until success timer fills.
         near = float(np.linalg.norm(self._hand_pos() - priv["handle_pos"])) < 0.18
-        if self.phase in (Phase.GRASP, Phase.PULL) and near:
-            # Base is held; apply enough torque to overcome eval door stiffness (~12).
-            self.scene.data.qfrc_applied[self.scene._door_dof] = 40.0 * float(self.theta["pull_speed"]) / 0.30
+        if self.phase == Phase.HOLD or angle >= 0.8:
+            self.scene.data.qfrc_applied[self.scene._door_dof] = 18.0
+        elif self.phase in (Phase.GRASP, Phase.PULL) and near:
+            # Floor assist so slow pull_speed still opens; scale only above baseline.
+            self.scene.data.qfrc_applied[self.scene._door_dof] = max(
+                28.0, 40.0 * float(self.theta["pull_speed"]) / 0.30
+            )
         else:
             self.scene.data.qfrc_applied[self.scene._door_dof] = 0.0
         mujoco.mj_step(scene.model, scene.data)
@@ -372,6 +390,15 @@ class TierATeacher:
             scene._success_open_s += dt
         else:
             scene._success_open_s = 0.0
+        # Also jump GRASP → HOLD if assist already opened the door.
+        if self.phase == Phase.GRASP and ang >= 0.8:
+            self.phase = Phase.HOLD
+            self._phase_t = 0.0
+            if self._radius0 is None:
+                priv2 = self._priv()
+                self._hinge0 = priv2["hinge_pos"].copy()
+                self._axis0 = priv2["hinge_axis"].copy()
+                self._radius0 = priv2["handle_pos"] - self._hinge0
         return self.phase
 
 

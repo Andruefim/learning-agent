@@ -49,14 +49,14 @@ DEFAULT_THETA = {
 }
 
 THETA_BOUNDS = {
-    "stance_x": (-0.42, -0.22),
+    "stance_x": (-0.55, -0.20),
     "stance_y": (-0.20, 0.20),
     "stance_yaw": (-0.35, 0.35),
-    "contact_offset_along_handle": (-0.20, 0.20),
-    "pregrasp_clearance": (0.03, 0.12),
-    "pull_speed": (0.10, 0.50),
+    "contact_offset_along_handle": (-0.25, 0.25),
+    "pregrasp_clearance": (0.03, 0.16),
+    "pull_speed": (0.08, 0.50),
     "grip_close": (0.50, 1.0),
-    "pull_arc_scale": (0.7, 1.3),
+    "pull_arc_scale": (0.6, 1.3),
 }
 
 
