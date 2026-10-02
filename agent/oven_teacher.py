@@ -276,7 +276,7 @@ class TierATeacher:
 
         elif self.phase == Phase.PREGRASP:
             target = self._pregrasp_point(priv)
-            self._solve_to(target, every=50)
+            self._solve_to(target, every=80)
             self._finger_des = _finger_open(self.hand)
             dist = float(np.linalg.norm(self._hand_pos() - target))
             if dist < 0.10 or self._phase_t > 6.0:
@@ -286,7 +286,7 @@ class TierATeacher:
 
         elif self.phase == Phase.HOOK:
             target = self._hook_point(priv)
-            self._solve_to(target, every=50)
+            self._solve_to(target, every=80)
             self._finger_des = _finger_open(self.hand)
             dist = float(np.linalg.norm(self._hand_pos() - priv["handle_pos"]))
             if dist < 0.10 or self._phase_t > 6.0:
@@ -296,7 +296,7 @@ class TierATeacher:
 
         elif self.phase == Phase.GRASP:
             target = self._hook_point(priv)
-            self._solve_to(target, every=50)
+            self._solve_to(target, every=80)
             self._finger_des = finger_curl(self.hand) * float(self.theta["grip_close"])
             dist = float(np.linalg.norm(self._hand_pos() - priv["handle_pos"]))
             if self._phase_t > 1.0 and dist < 0.14:

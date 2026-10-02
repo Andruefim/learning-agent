@@ -46,6 +46,7 @@ def main() -> int:
     p.add_argument("--run", type=str, default="", help="reports/<run> name")
     p.add_argument("--no-randomize", action="store_true")
     p.add_argument("--gate31", action="store_true", help="assert 0 success and 0 falls")
+    p.add_argument("--gate32a", action="store_true", help="assert Tier A success rate >= 0.70")
     args = p.parse_args()
 
     run = args.run or time.strftime("run_%Y%m%d_%H%M%S")
@@ -59,42 +60,70 @@ def main() -> int:
     ]
     results: list[dict] = []
     t0 = time.perf_counter()
-    if int(args.workers) <= 1:
-        from agent.oven_task import OvenScene, run_zero_policy_episode
-        from agent.oven_teacher import run_tier_a_episode
+    # Stream jsonl so long runs leave evidence even if interrupted.
+    out_f = out_path.open("w", encoding="utf-8")
+    try:
+        if int(args.workers) <= 1:
+            from agent.oven_task import OvenScene, run_zero_policy_episode
+            from agent.oven_teacher import run_tier_a_episode
 
-        scene = OvenScene()
-        for seed, seconds, randomize, policy in jobs:
-            if policy == "zero":
-                results.append(
-                    run_zero_policy_episode(seed, seconds=seconds, randomize=randomize, scene=scene).to_json()
+            scene = OvenScene()
+            for i, (seed, seconds, randomize, policy) in enumerate(jobs):
+                if policy == "zero":
+                    row = run_zero_policy_episode(
+                        seed, seconds=seconds, randomize=randomize, scene=scene
+                    ).to_json()
+                elif policy == "tier_a":
+                    row = run_tier_a_episode(seed, seconds=seconds, randomize=randomize, scene=scene)
+                else:
+                    raise ValueError(policy)
+                results.append(row)
+                out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                out_f.flush()
+                print(
+                    f"[{i+1}/{len(jobs)}] seed={seed} {row['outcome']} "
+                    f"ang={row['max_angle']:.3f} wall={row['wall_s']:.1f}s",
+                    flush=True,
                 )
-            elif policy == "tier_a":
-                results.append(run_tier_a_episode(seed, seconds=seconds, randomize=randomize, scene=scene))
-            else:
-                raise ValueError(policy)
-    else:
-        with ProcessPoolExecutor(max_workers=int(args.workers)) as pool:
-            futs = [pool.submit(_one, job) for job in jobs]
-            for fut in as_completed(futs):
-                results.append(fut.result())
-        results.sort(key=lambda r: int(r["seed"]))
-
-    with out_path.open("w", encoding="utf-8") as f:
-        for row in results:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        else:
+            with ProcessPoolExecutor(max_workers=int(args.workers)) as pool:
+                futs = {pool.submit(_one, job): job[0] for job in jobs}
+                done_n = 0
+                for fut in as_completed(futs):
+                    row = fut.result()
+                    results.append(row)
+                    done_n += 1
+                    print(
+                        f"[{done_n}/{len(jobs)}] seed={row['seed']} {row['outcome']} "
+                        f"ang={row['max_angle']:.3f}",
+                        flush=True,
+                    )
+            results.sort(key=lambda r: int(r["seed"]))
+            for row in results:
+                out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    finally:
+        out_f.close()
 
     n_ok = sum(1 for r in results if r["success"])
     n_fall = sum(1 for r in results if r["fell"])
     wall = time.perf_counter() - t0
     mean_wall = float(np_mean([r["wall_s"] for r in results]))
     mean_sim = float(np_mean([r["sim_s"] for r in results]))
+    # Wilson CI for success rate
+    n = max(len(results), 1)
+    phat = n_ok / n
+    z = 1.96
+    denom = 1 + z * z / n
+    center = (phat + z * z / (2 * n)) / denom
+    half = (z / denom) * ((phat * (1 - phat) / n + z * z / (4 * n * n)) ** 0.5)
     summary = {
         "run": run,
         "n": len(results),
         "policy": args.policy,
         "successes": n_ok,
         "falls": n_fall,
+        "success_rate": phat,
+        "wilson95": [max(0.0, center - half), min(1.0, center + half)],
         "mean_wall_s": mean_wall,
         "mean_sim_s": mean_sim,
         "total_wall_s": wall,
@@ -109,6 +138,11 @@ def main() -> int:
             print(f"GATE 3.1 FAILED: successes={n_ok} falls={n_fall}", flush=True)
             return 1
         print("GATE 3.1 PASSED: 0 successes, 0 falls", flush=True)
+    if args.gate32a:
+        if phat < 0.70:
+            print(f"GATE 3.2A FAILED: success_rate={phat:.3f} < 0.70", flush=True)
+            return 1
+        print(f"GATE 3.2A PASSED: success_rate={phat:.3f}", flush=True)
     return 0
 
 
