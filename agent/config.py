@@ -1,4 +1,4 @@
-"""Shared constants. Body-specific joints and poses live in `agent.h2`."""
+"""Shared configuration for the SLEEP continual-learning Unitree G1 runtime."""
 
 from __future__ import annotations
 
@@ -6,136 +6,38 @@ import os
 import sys
 from pathlib import Path
 
-if not os.environ.get("MUJOCO_GL"):
-    os.environ["MUJOCO_GL"] = "glfw" if sys.platform == "darwin" else "egl"
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
-ERROR_LEN = 8
-CHUNK = 12
-FLOW_STEPS = 2
-VISION_H, VISION_W = 48, 64
-VISION_STRIDE = 4
-VISION_DIM = 64
-INSTR_BYTES = 64
-LANG_DIM = 32
-Z_DIM = 8
-L1_PERIOD = 2.5
-SLEW = 0.04
-TRACK_OK = 0.05
-BRACE_TILT = 0.72
-FALL_Z = 0.50
-STAND_Z = 0.78
-# Honest oven success (Day A Rule 7 + contact). Thresholds are logged per episode.
-OVEN_SUCCESS_ANGLE = 0.8
-OVEN_SUCCESS_HOLD_S = 1.0
-OVEN_CONTACT_OPEN_MS = 200.0
-OVEN_CONTACT_MIN_ANGLE = 0.4
-BRACE_ERR_WIN = 80
-BRACE_TILT_WIN = 40
-TURN_IN_CONTEXT_OK = False
-TRIAL_MAX = 3
-TRIAL_EMB = 32
-PARAM_KEYS = ("h", "vx", "yaw", "steps", "wave", "kick", "r_arm", "l_arm")
-SKILL_IDS = ("hold", "stand", "squat", "locomote", "turn", "wave", "kick", "reach")
-SKILL_TO_I = {name: i for i, name in enumerate(SKILL_IDS)}
-DEFAULT_PARAMS = {
-    "h": 1.0,
-    "vx": 0.0,
-    "yaw": 0.0,
-    "steps": 0.0,
-    "wave": 0.0,
-    "kick": 0.0,
-    "r_arm": 0.0,
-    "l_arm": 0.0,
-}
-PARAM_SCALE = {
-    "h": 1.0,
-    "vx": 1.0,
-    "yaw": 1.0,
-    "steps": 8.0,
-    "wave": 1.0,
-    "kick": 1.0,
-    "r_arm": 1.0,
-    "l_arm": 1.0,
-}
-PARAM_OK = {
-    "h": 0.08,
-    "vx": 0.22,
-    "yaw": 0.22,
-    "steps": 0.20,
-    "wave": 0.45,
-    "kick": 0.40,
-    "r_arm": 0.22,
-    "l_arm": 0.22,
-}
-PARAM_MEASURE = {
-    "h": "pelvis height / stand height",
-    "vx": "forward displacement over the chunk",
-    "yaw": "pelvis yaw change",
-    "steps": "foot-contact step count",
-    "wave": "arm oscillation completed",
-    "kick": "leg flexion profile completed",
-    "r_arm": "right arm raise 0..1",
-    "l_arm": "left arm raise 0..1",
-}
-SHADOW_MSE_MAX = 0.12
-SHADOW_EMA = 0.95
-SHADOW_EMA_TICKS = 200
-REPLAY_GATE = 1000
-ALPHA_START = 0.03
-ALPHA_STEP = 0.02
-# Bounded Residual (Variant A): student adds a clipped residual on the L3 command.
-# ALPHA_MAX is the standing design, not a demo knob. Do not raise it without a
-# new stability argument. Stage D (Safety-Shield, alpha→1 with emergency
-# takeover) is a possible future direction — not implemented. If added, the
-# shield must trip on fall trends (tilt/z), not late static thresholds.
-ALPHA_MAX = 0.12
-RESIDUAL_LIMIT = 0.25
-ROLLBACK_FALL_DELTA = 0.08
-# Headless oven eval only: student owns 100% of the 18-D command (see §3.6).
-# Interactive / production path keeps ALPHA_MAX. Set via env STUDENT_ONLY_EVAL=1.
-STUDENT_ONLY_EVAL = os.getenv("STUDENT_ONLY_EVAL", "0").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-# Legacy CPG constants (unused by the foundation controller).
-PIVOT_HX_SHIFT = 0.45
-PIVOT_HX_OPEN = 0.22
-HX_PD_CLIP = 0.25
-HX_PD_CLIP_UNLOAD = 0.06
-H1_SPEC = {
-    "kind": "closed_loop_oven_ablation_preferred",
-    "requires_student_on_actuators": False,
-    "offline": (
-        "Legacy: held-out teacher command chunks from replay. Student forward only; physics untouched. "
-        "Pass if MSE(true error deque) < 0.05 and beats zero-deque and shuffled-error ablation by 1e-4."
-    ),
-    "closed_loop": (
-        "Preferred H1 (§3.7): same student, ≥100 scenes, K=3. Conditions: (a) real trial context, "
-        "(b) zeroed context, (c) shuffled cross-scene context. Metric = scene success by attempt 3 "
-        "and gain attempt1→3. Stats: Wilson CI + McNemar. Report: reports/h1_closed_loop.md."
-    ),
-    "shadow": (
-        "Every vision tick: u_student vs l3_cmd from L1, actuators stay on the foundation+PD. "
-        f"Stage B after shadow_mse_ema < {SHADOW_MSE_MAX} for {SHADOW_EMA_TICKS} ticks, "
-        f"replay>={REPLAY_GATE}, and fall rate not rising. "
-        "Bounded Residual ALPHA_MAX=0.12 (Variant A) on the 18-DoF command, not joint angles. "
-        "STUDENT_ONLY_EVAL=1 forces alpha=1 in headless oven eval only."
-    ),
-    "shadow_streak": SHADOW_EMA_TICKS,
-    "shadow_mse_max": SHADOW_MSE_MAX,
-    "replay_gate": REPLAY_GATE,
-    "residual": (
-        "cmd = l3_cmd + alpha * clip(u_student - l3_cmd, +/-limit). "
-        "alpha starts at 0.03, grows only while ema stays in band; "
-        "auto-rollback to last working alpha if fall rate rises. "
-        "ALPHA_MAX=0.12 is the interactive cap; Joint-PD tracks the foundation q_target."
-    ),
-    "stage_d": (
-        "Future Safety-Shield only: alpha->1 with takeover on fall trend (tilt/z). "
-        "Static tilt<0.8 / e>4*TRACK_OK are too late. Not part of the oven flywheel task."
-    ),
-    "weights": "Updated in automatic sleep after a successful command. Runtime eval(), 0 backprop.",
-}
+load_dotenv(ROOT / ".env")
+
+if not os.environ.get("MUJOCO_GL"):
+    os.environ["MUJOCO_GL"] = "glfw" if sys.platform in ("darwin", "win32") else "egl"
+
+CHECKPOINT_DIR = Path(os.getenv("STORAGE_DIR", str(ROOT / "checkpoints")))
+
+# Physics & camera dimensions
+PHYSICS_DT = 0.002
+COGNITIVE_DT = 0.10          # 10 Hz System 1 / System 2 chunk execution tick
+SUBSTEPS_PER_COG_STEP = int(round(COGNITIVE_DT / PHYSICS_DT))  # 50 steps = 0.1s
+DECIMATION = 10              # 50 Hz RL gait update (0.02 s)
+
+LOOK_W, LOOK_H = 640, 480    # Head camera RGB & depth for VLM grounding
+PREVIEW_W, PREVIEW_H = 1280, 720
+PREVIEW_INTERVAL = 1.0 / 30.0
+
+# Balance / fall safety thresholds
+FALL_Z = 0.48
+TILT_LIM = 0.55
+STAND_Z = 0.783
+SLEW_RAD = 0.06
+
+# SLEEP Continual Learning (arXiv:2606.03979)
+SLEEP_IMG_SIZE = 128
+SLEEP_HORIZON = 6
+SLEEP_ACTION_DIM = 20        # [vx, wz, squat, waist_y, waist_p, r_arm(7), l_arm(7), r_grip]
+SLEEP_PROPRIO_DIM = 28
+TAU_THINK_DEFAULT = 0.35
+MICRO_SLEEP_IDLE_S = 3.5
+MICRO_SLEEP_MIN_STEPS = 8
+MAX_TASK_VOCAB = 32

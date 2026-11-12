@@ -1,36 +1,30 @@
-"""L1 VLM planner. Soft skill+params only; the foundation controller owns balance."""
+"""System 2 Vision-Language Planner: Gemini Cloud primary + automatic Ollama fallback."""
 
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
+import re
 from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
-from agent.plan import Plan, attach_arm_channel
-from agent.reach import attach_reach, strip_planner_pixels
+import httpx
+import numpy as np
+from PIL import Image
 
+PRIMITIVES = ["press_down", "push_forward", "pull_back", "lift_up", "slide_left", "slide_right"]
 
-def _pointing_rules() -> str:
-    """Vision-only grasp pixel rules (plan_point / gaze)."""
-    return (
-        "Name a hand and the grasp place on the attached head image: "
-        "u=0 left, u=1 right, v=0 top, v=1 bottom.\n"
-        "Put u,v on the graspable surface the command names — what you see, not image center.\n"
-        "Opening means the metal HANDLE you pull — not glass, knobs, burners, or flat panels.\n"
-        "Do NOT point at walls, floor, seams, or borders. Keep 0.12 < u < 0.88.\n"
-        "If the target is not clearly visible, reply {\"visible\": false}.\n"
-    )
+PRIMITIVE_HELP = (
+    "press_down = push downward (toaster lever, top button); "
+    "push_forward = push away from robot (close door/drawer, press front button/panel); "
+    "pull_back = hook/grasp handle and pull toward robot (open oven, fridge, dishwasher, cabinet, drawer); "
+    "lift_up = lift handle/lid upward; "
+    "slide_left / slide_right = swing or slide sideways (e.g. side-hinged fridge/cabinet handle)."
+)
 
-
-def _motion_plan_rules() -> str:
-    """Main planner: motion and intent only — never u,v."""
-    return (
-        "Touch/grasp/open on a visible object: put hand_goal with ONLY "
-        '{"hand":"left"|"right"|"both"} on the interaction frame — no u, no v. '
-        "Pixels come from a separate pointing step.\n"
-        "Robot head target: hand_goal {hand, target: head} only.\n"
-    )
+_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _wsl_windows_host() -> str | None:
@@ -66,57 +60,86 @@ def resolve_ollama_url(spec: str | None = None) -> str:
     return f"{scheme}://{win}:{after}" if sep else f"{scheme}://{win}"
 
 
-class Level1Planner:
-    def __init__(self):
+def _encode_jpeg_b64(rgb: np.ndarray, quality: int = 86) -> str:
+    buf = io.BytesIO()
+    Image.fromarray(np.asarray(rgb, dtype=np.uint8)).save(buf, format="JPEG", quality=quality)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _extract_json(text: str) -> Optional[Dict[str, Any]]:
+    txt = text.strip()
+    if "</think>" in txt:
+        txt = txt.split("</think>", 1)[-1].strip()
+    try:
+        data = json.loads(txt)
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        m = _JSON_RE.search(txt)
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(0))
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            return None
+
+
+def _norm_point_to_uv(pt: Any, width: int, height: int) -> Optional[tuple[float, float]]:
+    if not isinstance(pt, (list, tuple)) or len(pt) != 2:
+        return None
+    try:
+        x, y = float(pt[0]), float(pt[1])
+    except (TypeError, ValueError):
+        return None
+    if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+        u = x * width
+        v = y * height
+    else:
+        u = float(np.clip(x, 0.0, 1000.0)) / 1000.0 * width
+        v = float(np.clip(y, 0.0, 1000.0)) / 1000.0 * height
+    return float(np.clip(u, 0.0, width - 1.0)), float(np.clip(v, 0.0, height - 1.0))
+
+
+class VisionLanguagePlanner:
+    """Deliberative VLM planner using Cloud Gemini first and falling back to local Ollama."""
+
+    def __init__(self, log: Callable[[str], None] = print) -> None:
         self.api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        self.model = (
-            os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
-            if self.api_key
-            else os.getenv("L1_MODEL", "qwen3.5:9b-q8_0").strip()
-        )
-        self.base_url = resolve_ollama_url()
-        self.last_err = ""
-        if self.api_key:
-            print(f"L1 planner model={self.model} via Gemini API", flush=True)
-        else:
-            print(f"L1 planner model={self.model} url={self.base_url}", flush=True)
+        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+        self.ollama_model = os.getenv("L1_MODEL", "qwen3.5:9b").strip()
+        self.ollama_url = resolve_ollama_url()
+        self.log = log
+        self.active_backend = "gemini" if self.api_key else "ollama"
+        self.last_error = ""
 
-    async def _complete(self, prompt: str, image: bytes, max_tokens: int) -> str:
-        if self.api_key:
-            return await self._gemini(prompt, image, max_tokens)
-        return await self._ollama(prompt, image, max_tokens)
-
-    async def _gemini(self, prompt: str, image: bytes, max_tokens: int) -> str:
-        import httpx
-
+    def _call_gemini(self, prompt: str, images: List[np.ndarray], max_tokens: int) -> Dict[str, Any]:
+        if not self.api_key:
+            raise RuntimeError("GEMINI_API_KEY not set")
         parts: list[dict] = [{"text": prompt}]
-        if image:
+        for img in images:
             parts.append(
                 {
                     "inline_data": {
-                        "mime_type": "image/png" if image[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg",
-                        "data": base64.b64encode(image).decode("ascii"),
+                        "mime_type": "image/jpeg",
+                        "data": _encode_jpeg_b64(img),
                     }
                 }
             )
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.model}:generateContent"
-        )
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent"
         body = {
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
-                "temperature": 0,
+                "temperature": 0.0,
                 "maxOutputTokens": max_tokens,
                 "responseMimeType": "application/json",
                 "thinkingConfig": {"thinkingBudget": 0},
             },
         }
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(url, headers={"x-goog-api-key": self.api_key}, json=body)
+        with httpx.Client(timeout=20.0) as client:
+            r = client.post(url, headers={"x-goog-api-key": self.api_key}, json=body)
             if r.status_code == 400 and "thinkingConfig" in body["generationConfig"]:
                 body["generationConfig"].pop("thinkingConfig", None)
-                r = await client.post(url, headers={"x-goog-api-key": self.api_key}, json=body)
+                r = client.post(url, headers={"x-goog-api-key": self.api_key}, json=body)
             r.raise_for_status()
             data = r.json()
         texts = []
@@ -125,237 +148,216 @@ class Level1Planner:
                 continue
             if part.get("text"):
                 texts.append(part["text"])
-        if not texts:
-            raise RuntimeError("empty Gemini response")
-        return "".join(texts)
+        raw = "".join(texts)
+        parsed = _extract_json(raw)
+        if parsed is None:
+            raise ValueError(f"Invalid JSON from Gemini: {raw[:120]}")
+        return parsed
 
-    async def _ollama(self, prompt: str, image: bytes, max_tokens: int) -> str:
-        import httpx
-
-        message: dict = {"role": "user", "content": prompt}
-        if image:
-            message["images"] = [base64.b64encode(image).decode("ascii")]
+    def _call_ollama(self, prompt: str, images: List[np.ndarray], max_tokens: int) -> Dict[str, Any]:
+        msg: dict[str, Any] = {"role": "user", "content": prompt}
+        if images:
+            msg["images"] = [_encode_jpeg_b64(img) for img in images]
         payload = {
-            "model": self.model,
-            "messages": [message],
+            "model": self.ollama_model,
+            "messages": [msg],
             "stream": False,
             "format": "json",
             "think": False,
-            "options": {"temperature": 0, "num_ctx": 8192, "num_predict": max_tokens, "think": False},
+            "options": {"temperature": 0.0, "num_ctx": 8192, "num_predict": max_tokens, "think": False},
         }
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(f"{self.base_url}/api/chat", json=payload)
+        with httpx.Client(timeout=60.0) as client:
+            r = client.post(f"{self.ollama_url}/api/chat", json=payload)
             r.raise_for_status()
-            return r.json()["message"]["content"]
+            txt = r.json()["message"]["content"]
+        parsed = _extract_json(txt)
+        if parsed is None:
+            raise ValueError(f"Invalid JSON from Ollama: {txt[:120]}")
+        return parsed
 
-    def hold(self, user_command: str, scene: dict) -> Plan:
-        return Plan.stand(user_command.strip() or "stand")
-
-    def _parse(self, text: str, user_command: str) -> Plan | None:
-        text = text.strip()
-        if "</think>" in text:
-            text = text.split("</think>", 1)[-1].strip()
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            start, end = text.find("{"), text.rfind("}")
-            if start < 0 or end <= start:
-                return None
+    def _ask_json(self, prompt: str, images: List[np.ndarray], max_tokens: int = 384) -> Optional[Dict[str, Any]]:
+        if self.api_key:
             try:
-                data = json.loads(text[start : end + 1])
-            except json.JSONDecodeError:
-                return None
-        if not isinstance(data, dict):
-            return None
+                res = self._call_gemini(prompt, images, max_tokens)
+                self.active_backend = f"gemini ({self.gemini_model})"
+                self.last_error = ""
+                return res
+            except Exception as exc:
+                err_msg = f"{type(exc).__name__}: {exc}"[:160]
+                self.last_error = err_msg
+                self.log(f"[VLM] Gemini не ответил ({err_msg}) -> fallback на Ollama ({self.ollama_model})")
+
         try:
-            params = data.get("params") if isinstance(data.get("params"), dict) else {}
-            queue = data.get("queue") if isinstance(data.get("queue"), list) else []
-            plan = Plan(
-                instruction=str(data.get("instruction") or user_command),
-                skill=str(data.get("skill") or "hold"),
-                params=params,
-                done=bool(data.get("done", False)),
-                queue=queue,
-            )
-            attach_reach(plan, user_command)
-            attach_arm_channel(plan, user_command)
-            strip_planner_pixels(plan)
-            return plan
-        except (TypeError, ValueError):
+            res = self._call_ollama(prompt, images, max_tokens)
+            self.active_backend = f"ollama ({self.ollama_model})"
+            self.last_error = ""
+            return res
+        except Exception as exc:
+            err_msg = f"{type(exc).__name__}: {exc}"[:160]
+            self.last_error = err_msg
+            self.log(f"[VLM Error] Ollama также недоступна ({err_msg})")
             return None
 
-    async def plan(self, user_command: str, scene: dict, image: bytes = b"") -> tuple[Plan, bool]:
-        prompt = (
-            "You are the slow planner for a standing humanoid. The image is the camera.\n"
-            "The foundation controller balances at control rate. If outcome is fall or failed: "
-            'done=true, skill="hold", params={}. Do not invent a recovery gait.\n'
-            "Reply JSON with keys instruction, queue, done. skill and params are optional.\n"
-            "queue is an ordered list of command frames, at most 6. Each frame may set "
-            "vx (m/s), wz, h_m (pelvis height in meters), hold_s (seconds), pose, hand, hands, "
-            "direction, speed, depth. Do not pick a single skill name when the sentence has "
-            "several parts: write them as successive frames. The body already balances.\n"
-            "A frame without a skill is valid. vx, height and arms are one command.\n"
-            "Putting a hand on the robot's own head is not a skill name. Write hand_goal "
-            '{hand: left|right|both, target: head}. Do not answer hold.\n'
-            '  "положи левую руку на голову" → {"instruction":"левая рука на голову","queue":['
-            '{"hand_goal":{"hand":"left","target":"head"},"vx":0,"hold_s":4}],"done":false}\n'
-            "Touching something visible is the same channel, for any object.\n"
-            f"{_motion_plan_rules()}"
-            '  object not in frame → {"instruction":"ищу объект","queue":['
-            '{"direction":"left","hold_s":2},{"vx":0,"hold_s":1}],"done":false}\n'
-            '  too close / cut off → {"instruction":"отойти","queue":['
-            '{"direction":"backward","speed":"slow","hold_s":2},{"vx":0,"hold_s":1}],"done":false}\n'
-            '  open the oven → {"instruction":"открыть духовку","queue":['
-            '{"hand_goal":{"hand":"right"},"vx":0,"hold_s":8}],"done":false}\n'
-            '  open the fridge → {"instruction":"открыть холодильник","queue":['
-            '{"hand_goal":{"hand":"right"},"vx":0,"hold_s":8}],"done":false}\n'
-            '  pick up the toaster → {"instruction":"поднять тостер","queue":['
-            '{"hand_goal":{"hand":"both"},"vx":0,"hold_s":8}],"done":false}\n'
-            "Examples:\n"
-            '  "сделай 5 шагов вперед" → {"skill":"locomote","params":{"direction":"forward","speed":"medium","distance_hint":"5"}}\n'
-            '  "иди вперёд" → {"skill":"locomote","params":{"direction":"forward","speed":"medium"}}\n'
-            '  "стой" / "замри" → {"skill":"stand","params":{}}\n'
-            '  "опусти руки" → {"skill":"hold","params":{"hands":"down"}}\n'
-            '  "подними руки" → {"skill":"reach","params":{"hand":"both"}}\n'
-            '  "подними правую руку" → {"skill":"reach","params":{"hand":"right"}}\n'
-            '  "махни правой" → {"skill":"wave","params":{"hand":"right"}}\n'
-            '  "руки в стороны" → {"skill":"reach","params":{"pose":"t"}}\n'
-            '  "хлопни" → {"skill":"wave","params":{"pose":"clap"}}\n'
-            '  "ударь правой ногой" → {"skill":"kick","params":{"foot":"right"}}\n'
-            '  "присесть" / "наклонись" → {"skill":"squat","params":{"depth":"low"}}\n'
-            '  "повернись налево" → {"skill":"turn","params":{"direction":"left"},"done":false}\n'
-            '  "повернись направо" → {"skill":"turn","params":{"direction":"right"},"done":false}\n'
-            '  "повернись на 90" → {"skill":"turn","params":{"direction":"left","angle":"90"},"done":false}\n'
-            "One skill is the primary motion. Extra parts stay in params and run together "
-            "(walk and arms, squat and arms). Do not drop the second part.\n"
-            '  "иди вперед и руки в стороны" → {"skill":"locomote","params":{"direction":"forward","speed":"medium","pose":"t"}}\n'
-            '  "присядь и подними руки" → {"skill":"squat","params":{"depth":"low","hand":"both"}}\n'
-            '  "иди назад и подними правую руку" → {"skill":"locomote","params":{"direction":"backward","speed":"medium","hand":"right"}}\n'
-            "Prefer queue when the command is a sequence:\n"
-            '  "иди вперед, потом руки в стороны, потом стой" → {"instruction":"вперед, руки, стой","queue":['
-            '{"direction":"forward","speed":"medium","hold_s":3},'
-            '{"pose":"t","vx":0,"hold_s":2},'
-            '{"vx":0,"hands":"down","hold_s":2}],"done":false}\n'
-            '  "подними руки и иди вперед" → {"instruction":"руки и вперед","queue":['
-            '{"hand":"both","vx":0.4,"hold_s":4}],"done":false}\n'
-            "If the scene has requested_yaw and achieved_yaw: keep skill=turn and done=false until "
-            "|achieved_yaw-requested_yaw| is small; then done=true, skill=hold.\n"
-            f"Now: pelvis_z={scene.get('pelvis_z')} tilt={scene.get('tilt')} "
-            f"outcome={scene.get('outcome')} skill={scene.get('skill')} "
-            f"queue={scene.get('queue_i')}/{scene.get('queue_len')} ahead_m={scene.get('ahead_m')} "
-            f"requested_yaw={scene.get('requested_yaw')} achieved_yaw={scene.get('achieved_yaw')} "
-            f"done={scene.get('done')}\n"
-            "ahead_m is clear space in front of the head camera. "
-            "If queue is not yet on its last frame, keep the same queue and done=false.\n"
-            f"User command: {user_command}\n"
-            "JSON only. instruction is a short paraphrase of THIS command."
+    @staticmethod
+    def _lessons_block(lessons: Optional[List[str]]) -> str:
+        if not lessons:
+            return ""
+        items = "\n".join(f"  - {str(x).strip()}" for x in lessons[-4:] if str(x).strip())
+        if not items:
+            return ""
+        return (
+            "\nEpisodic lessons from prior FAILED attempts on this exact command "
+            "(avoid repeating these mistakes — adjust target point or motion):\n"
+            f"{items}\n"
         )
-        try:
-            text = await self._complete(prompt, image, 512)
-            parsed = self._parse(text, user_command)
-            if parsed is None:
-                self.last_err = "bad json from " + self.model
-                return self.hold(user_command, scene), False
-            self.last_err = ""
-            return parsed, True
-        except Exception as e:
-            self.last_err = f"{type(e).__name__}: {e}"[:160]
-            return self.hold(user_command, scene), False
 
-    async def plan_point(
-        self, user_command: str, image: bytes, prior: dict | None = None
-    ) -> tuple[Plan, bool]:
-        """Relook with memory of the approach pixel. No lean."""
-        prior_line = ""
-        if prior and prior.get("u") is not None and prior.get("v") is not None:
-            prior_line = (
-                f"Earlier, from farther away, the grasp pixel was "
-                f"u={float(prior['u']):.2f} v={float(prior['v']):.2f} "
-                f"(hand={prior.get('hand', 'right')}). "
-                "That was the intended handle/grip. "
-                "If you still see that same handle, refine u,v onto it. "
-                "If the handle is out of frame or occluded, reply {\"visible\": false} — "
-                "do NOT invent a point on the flat door, wall, or image border.\n"
+    def plan_command(self, rgb: np.ndarray, command: str, *, lessons: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Classify a natural-language command into body skill OR kitchen object manipulation + grounding."""
+        lesson_txt = self._lessons_block(lessons)
+        prompt = (
+            "You control a standing humanoid robot (Unitree G1) in a kitchen. The image is its head camera.\n"
+            f'Operator command: "{command}"\n'
+            f"{lesson_txt}"
+            "Decide whether the command is:\n"
+            '  1) "body_skill": locomotion, turning, squatting, raising/waving arms, or holding pose (no kitchen object interaction).\n'
+            '  2) "manipulate": interacting with a kitchen object/appliance (open/close oven, fridge, microwave, cabinet, drawer, dishwasher, press toaster/coffee button, etc.).\n'
+            "If manipulate:\n"
+            "  - Find the exact graspable part (handle, lever, button, door edge; NEVER walls or floor).\n"
+            "  - Return point=[x, y] in 0..1000 image coordinates (x right, y down), or visible=false if not clearly visible.\n"
+            f"  - Rank 1..4 candidate motions from {PRIMITIVES}: {PRIMITIVE_HELP}\n"
+            '  - If visible=false, suggest search_dir="left" or "right" where the target likely is.\n'
+            "If body_skill:\n"
+            '  - Fill skill ("locomote"|"turn"|"squat"|"reach"|"wave"|"stand") and params '
+            '({"direction":"forward|backward|left|right","steps":N,"angle":deg,"depth":"low","hand":"left|right|both","pose":"t|up|down"}).\n'
+            "Reply JSON ONLY:\n"
+            '{\n'
+            '  "mode": "manipulate" | "body_skill",\n'
+            '  "skill": "<if body_skill>",\n'
+            '  "params": {},\n'
+            '  "visible": true | false,\n'
+            '  "object": "<name>",\n'
+            '  "part": "<handle/lever/button>",\n'
+            '  "point": [x, y],\n'
+            '  "motions": ["pull_back"],\n'
+            '  "hand": "right" | "left",\n'
+            '  "search_dir": "left" | "right"\n'
+            '}'
+        )
+        res = self._ask_json(prompt, [rgb], max_tokens=320) or {}
+        mode = str(res.get("mode") or "manipulate").strip().lower()
+        h, w = rgb.shape[:2]
+
+        if mode == "body_skill":
+            return {
+                "mode": "body_skill",
+                "skill": str(res.get("skill") or "stand").strip().lower(),
+                "params": res.get("params") if isinstance(res.get("params"), dict) else {},
+                "ok": bool(res),
+            }
+
+        uv = _norm_point_to_uv(res.get("point"), w, h)
+        visible = bool(res.get("visible", False)) and (uv is not None)
+        mots = [m for m in (res.get("motions") or []) if m in PRIMITIVES]
+        for fallback in ("pull_back", "push_forward", "press_down", "lift_up"):
+            if fallback not in mots:
+                mots.append(fallback)
+        search_dir = str(res.get("search_dir") or "right").strip().lower()
+        if search_dir not in ("left", "right"):
+            search_dir = "right"
+        return {
+            "mode": "manipulate",
+            "visible": visible,
+            "uv": uv,
+            "object": str(res.get("object") or ""),
+            "part": str(res.get("part") or ""),
+            "motions": mots,
+            "hand": "left" if str(res.get("hand") or "right").strip().lower() == "left" else "right",
+            "search_dir": search_dir,
+            "ok": bool(res),
+        }
+
+    def ground(self, rgb: np.ndarray, command: str, *, lessons: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Dedicated visual re-grounding up close after the robot walks to the appliance."""
+        lesson_txt = self._lessons_block(lessons)
+        prompt = (
+            "This is the robot head camera, now standing close to the kitchen fixture.\n"
+            f'Operator command: "{command}"\n'
+            f"{lesson_txt}"
+            "Point precisely at the graspable part (handle bar, lever, button, door edge) needed for the command.\n"
+            "Do NOT point at flat doors without handle, floor, or walls.\n"
+            f"Also rank candidate motions from {PRIMITIVES}: {PRIMITIVE_HELP}\n"
+            "Reply JSON ONLY:\n"
+            '{"visible": true|false, "object": "<name>", "part": "<part>", "point": [x, y], "motions": ["..."]}\n'
+            "point uses 0..1000 image coordinates (x right, y down)."
+        )
+        res = self._ask_json(prompt, [rgb], max_tokens=200) or {}
+        h, w = rgb.shape[:2]
+        uv = _norm_point_to_uv(res.get("point"), w, h)
+        visible = bool(res.get("visible", False)) and (uv is not None)
+        mots = [m for m in (res.get("motions") or []) if m in PRIMITIVES]
+        for fallback in ("pull_back", "push_forward", "press_down", "lift_up"):
+            if fallback not in mots:
+                mots.append(fallback)
+        return {
+            "visible": visible,
+            "uv": uv,
+            "object": str(res.get("object") or ""),
+            "part": str(res.get("part") or ""),
+            "motions": mots,
+            "ok": bool(res),
+        }
+
+    def judge(self, before: np.ndarray, after: np.ndarray, command: str) -> Dict[str, Any]:
+        """Visual verification: compare before vs after head camera frames."""
+        prompt = (
+            "Two head-camera images of the same robot task: FIRST = before, SECOND = after.\n"
+            f'Operator command: "{command}"\n'
+            "Did the physical scene visibly change so the command is now accomplished "
+            "(e.g. door/drawer opened or closed, lever pressed down, button pushed)?\n"
+            'Reply JSON ONLY: {"changed": true|false, "done": true|false, "what": "<short description>"}'
+        )
+        res = self._ask_json(prompt, [before, after], max_tokens=140) or {}
+        return {
+            "done": bool(res.get("done", False)),
+            "changed": bool(res.get("changed", False)),
+            "what": str(res.get("what") or res.get("what_changed") or ""),
+            "ok": bool(res),
+        }
+
+    def reflect_failure(
+        self,
+        before: Optional[np.ndarray],
+        after: Optional[np.ndarray],
+        command: str,
+        info: Dict[str, Any],
+    ) -> str:
+        """Reflect on a failed episode to produce a concise, non-heuristic episodic lesson."""
+        tried = ", ".join(info.get("tried_motions") or []) or "none"
+        ik_cm = float(info.get("ik_err_cm") or 0.0)
+        fell = bool(info.get("fell", False))
+        pt = info.get("target_pt")
+        pt_str = f"[{pt[0]:.2f}, {pt[1]:.2f}, {pt[2]:.2f}]" if pt is not None else "unknown"
+        what = str(info.get("what") or info.get("reason") or "no visible change")
+
+        imgs = [im for im in (before, after) if im is not None]
+        if imgs:
+            prompt = (
+                f'The humanoid robot FAILED to complete command: "{command}".\n'
+                f"Execution telemetry: target_3d={pt_str}, IK_error={ik_cm:.1f}cm, "
+                f"tried_motions=[{tried}], fell={fell}, outcome='{what}'.\n"
+                "Inspect the camera image(s) (before/after if 2 images). Give ONE short concrete lesson "
+                "(max 25 words) for the next retry explaining what went wrong (e.g., missed handle height/position, "
+                "out-of-reach point causing fall, or wrong motion direction) and what to adjust.\n"
+                'Reply JSON ONLY: {"lesson": "<short lesson in Russian or English>"}'
             )
-        prompt = (
-            "The image is the robot head camera, upright, often close to the object.\n"
-            f"Command: {user_command}\n"
-            f"{prior_line}"
-            f"{_pointing_rules()}"
-            "Reply JSON with keys hand, u, v — or visible:false."
-        )
-        try:
-            text = (await self._complete(prompt, image, 120)).strip()
-            if "</think>" in text:
-                text = text.split("</think>", 1)[-1]
-            start, end = text.find("{"), text.rfind("}")
-            data = json.loads(text[start : end + 1] if start >= 0 else text)
-            if data.get("visible") is False or (data.get("u") is None and data.get("v") is None):
-                # Keep gait as hold — engine restores the approach world point.
-                plan = Plan(
-                    instruction=user_command,
-                    skill="hold",
-                    params={},
-                    done=False,
-                    queue=[{"vx": 0, "hold_s": 4}],
-                )
-                print("gaze point: not visible up close -> keep prior", flush=True)
-                self.last_err = ""
-                return plan, True
-            hand = str(data.get("hand") or (prior or {}).get("hand") or "right").strip().lower()
-            if hand not in {"left", "right", "both"}:
-                hand = "right"
-            u = float(np_clip(data.get("u")))
-            v = float(np_clip(data.get("v")))
-            goal = {"hand": hand, "u": u, "v": v}
-            plan = Plan(
-                instruction=user_command,
-                skill="hold",
-                params={"hand_goal": goal},
-                done=False,
-                queue=[{"hand_goal": goal, "vx": 0, "hold_s": 8}],
-            )
-            attach_reach(plan, user_command)
-            print(f"gaze point hand={hand} u={u:.2f} v={v:.2f}", flush=True)
-            self.last_err = ""
-            return plan, True
-        except Exception as e:
-            self.last_err = f"{type(e).__name__}: {e}"[:160]
-            print(f"gaze point failed: {self.last_err}", flush=True)
-            return self.hold(user_command, {}), False
+            res = self._ask_json(prompt, imgs, max_tokens=120) or {}
+            lesson = str(res.get("lesson") or "").strip()
+            if lesson:
+                return lesson[:220]
 
-    async def verify(self, user_command: str, image: bytes) -> dict:
-        """Did the language goal succeed in this head frame? Visual done, no joints."""
-        prompt = (
-            "The image is the robot head camera.\n"
-            f"Command: {user_command}\n"
-            "Has this command been successfully completed in the scene you see?\n"
-            "Examples: a door/fridge/oven that should be open is clearly open; "
-            "a toaster/appliance that should be on shows that state; "
-            "an object that should be grasped is clearly in hand.\n"
-            "If not done: is the graspable part (handle/button/object) still visible "
-            "so the robot should point again?\n"
-            'Reply JSON only: {"done": true|false, "retry": "hold"|"repoint"}.\n'
-            'Use retry="repoint" when the target is visible but the task is not done. '
-            'Use retry="hold" when waiting or the view is unclear.'
-        )
-        try:
-            text = (await self._complete(prompt, image, 80)).strip()
-            if "</think>" in text:
-                text = text.split("</think>", 1)[-1]
-            start, end = text.find("{"), text.rfind("}")
-            data = json.loads(text[start : end + 1] if start >= 0 else text)
-            done = bool(data.get("done"))
-            retry = str(data.get("retry") or ("hold" if done else "repoint")).strip().lower()
-            if retry not in {"hold", "repoint", "look", "point"}:
-                retry = "repoint" if not done else "hold"
-            self.last_err = ""
-            return {"done": done, "retry": retry}
-        except Exception as e:
-            self.last_err = f"{type(e).__name__}: {e}"[:160]
-            print(f"verify failed: {self.last_err}", flush=True)
-            return {"done": False, "retry": "hold"}
-
-
-def np_clip(value) -> float:
-    return max(0.0, min(1.0, float(value)))
+        parts = [f"прошлая попытка ({tried}) не удалась: {what}"]
+        if ik_cm > 12.0:
+            parts.append(f"точка цели была труднодосягаема (IK err={ik_cm:.0f}см) — выбери ручку на удобной высоте")
+        if fell:
+            parts.append("робот потерял равновесие — скорректируй точку и направление")
+        return "; ".join(parts)[:220]

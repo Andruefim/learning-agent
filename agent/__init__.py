@@ -1,42 +1,28 @@
-"""Standing Unitree G1: L1 planner, foundation L3, gated L2 command student."""
+"""Unitree G1 SLEEP Continual-Learning Assistant package."""
 
 from agent.config import (
-    ALPHA_MAX,
-    H1_SPEC,
-    SHADOW_MSE_MAX,
+    SLEEP_ACTION_DIM,
+    SLEEP_HORIZON,
+    SLEEP_IMG_SIZE,
+    SLEEP_PROPRIO_DIM,
+    TAU_THINK_DEFAULT,
 )
-from agent.engine import RobotEngine
-from agent.h2 import (
-    ACTION_DIM,
-    L_AZ,
-    L_SH,
-    N_ACT,
-    R_AK,
-    R_AZ,
-    R_HY,
-    R_HZ,
-    R_KN,
-    R_SH,
-    STAND_Q,
-)
-from agent.plan import Plan, evaluate_trial, parse_requested_yaw
+from agent.engine import CognitiveRobotEngine, RobotEngine
+from agent.planner import VisionLanguagePlanner
+from agent.sleep import CMSChain, FoundationVLAWithCMS, Learner, MoEBlock, SleepConfig
 
 __all__ = [
-    "ACTION_DIM",
-    "ALPHA_MAX",
-    "H1_SPEC",
-    "L_AZ",
-    "L_SH",
-    "N_ACT",
-    "Plan",
-    "R_AZ",
-    "R_HY",
-    "R_HZ",
-    "R_KN",
-    "R_SH",
+    "CMSChain",
+    "CognitiveRobotEngine",
+    "FoundationVLAWithCMS",
+    "Learner",
+    "MoEBlock",
     "RobotEngine",
-    "SHADOW_MSE_MAX",
-    "STAND_Q",
-    "evaluate_trial",
-    "parse_requested_yaw",
+    "SLEEP_ACTION_DIM",
+    "SLEEP_HORIZON",
+    "SLEEP_IMG_SIZE",
+    "SLEEP_PROPRIO_DIM",
+    "SleepConfig",
+    "TAU_THINK_DEFAULT",
+    "VisionLanguagePlanner",
 ]

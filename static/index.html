@@ -2,208 +2,417 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Standing humanoid</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Unitree G1 · SLEEP Continual Learning</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @keyframes pulse-fast {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(1.15); }
+    }
+    .animate-pulse-fast {
+      animation: pulse-fast 1.2s infinite ease-in-out;
+    }
+  </style>
 </head>
-<body class="bg-zinc-950 text-zinc-100 h-screen overflow-hidden font-sans">
+<body class="bg-zinc-950 text-zinc-100 h-screen overflow-hidden font-sans select-none">
   <div class="flex h-full">
+
+    <!-- LEFT: 3D VIEWPORT & TELEMETRY -->
     <section class="flex-1 flex flex-col p-4 border-r border-zinc-800 min-w-0">
       <header class="flex items-center justify-between mb-3 gap-3">
-        <h1 class="font-semibold text-emerald-400 tracking-tight">Standing humanoid · 3 levels</h1>
-        <div class="flex items-center gap-2 text-xs">
-          <span id="badge" class="bg-zinc-800 text-zinc-400 px-2 py-1 rounded">IDLE</span>
-          <span id="hold" class="bg-zinc-800 text-zinc-500 px-2 py-1 rounded">stand</span>
+        <div class="flex items-center gap-2">
+          <span class="inline-block w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse-fast"></span>
+          <h1 class="font-bold text-emerald-400 tracking-tight text-base sm:text-lg">
+            Unitree G1 · Wake/Sleep Continual Learning
+          </h1>
+        </div>
+        <div class="flex items-center gap-2 text-xs font-mono">
+          <span id="badgeVlm" class="bg-zinc-900 border border-zinc-700 text-zinc-300 px-2.5 py-1 rounded-md">
+            VLM: gemini
+          </span>
+          <span id="badgeState" class="bg-zinc-800 text-zinc-300 px-3 py-1 rounded-md font-semibold tracking-wide uppercase transition-colors">
+            IDLE
+          </span>
         </div>
       </header>
-      <div id="view" class="relative flex-1 bg-black rounded-xl overflow-hidden border border-zinc-800">
-        <img src="/video_feed" alt="MuJoCo" draggable="false"
+
+      <!-- Main Interactive 3D Viewport -->
+      <div id="view" class="relative flex-1 bg-black rounded-xl overflow-hidden border border-zinc-800 shadow-2xl">
+        <img src="/video_feed" alt="MuJoCo View" draggable="false"
              class="absolute inset-0 w-full h-full object-contain pointer-events-none select-none">
-        <div id="camDrag" class="absolute inset-0 cursor-grab" title="Тянуть — вращение"></div>
-        <div class="absolute bottom-3 left-3 z-10 pointer-events-none select-none">
-          <div class="rounded-lg overflow-hidden border border-zinc-600 bg-black/80 shadow-lg w-72">
-            <img src="/eye_feed" alt="Head cam" draggable="false"
+
+        <div id="camDrag" class="absolute inset-0 cursor-grab active:cursor-grabbing"
+             title="Зажмите ЛКМ и тяните для вращения камеры"></div>
+
+        <!-- PIP: Head Camera (Ego View) -->
+        <div class="absolute bottom-3 left-3 z-10 pointer-events-none">
+          <div class="rounded-lg overflow-hidden border border-zinc-700 bg-black/85 shadow-2xl w-60 sm:w-72">
+            <img src="/eye_feed" alt="Head Camera (Ego View)" draggable="false"
                  class="block w-full aspect-[4/3] object-cover">
-            <div class="px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-zinc-400 bg-zinc-900/90">head · L1 320×240</div>
+            <div class="px-2 py-1 text-[10px] font-mono uppercase tracking-wider text-zinc-400 bg-zinc-900/90 flex justify-between items-center">
+              <span>Камера головы (Ego) · 640×480</span>
+              <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+            </div>
           </div>
         </div>
+
+        <!-- Camera Orbit Controls -->
         <div class="absolute bottom-3 right-3 z-10 flex flex-col gap-1.5 pointer-events-auto select-none">
-          <div class="grid grid-cols-3 gap-1 w-[7.5rem]">
+          <div class="grid grid-cols-3 gap-1 w-28">
             <span></span>
-            <button type="button" data-cam="0,-36" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-sm" title="Выше">▲</button>
+            <button type="button" data-cam="0,-36" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-xs font-bold" title="Выше">▲</button>
             <span></span>
-            <button type="button" data-cam="-48,0" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-sm" title="Влево">◀</button>
-            <button type="button" data-cam="reset" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1 text-[10px] text-zinc-400" title="Сброс">⊙</button>
-            <button type="button" data-cam="48,0" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-sm" title="Вправо">▶</button>
+            <button type="button" data-cam="-48,0" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-xs font-bold" title="Влево">◀</button>
+            <button type="button" data-cam="reset" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1 text-[10px] text-zinc-400" title="Сброс камеры">⊙</button>
+            <button type="button" data-cam="48,0" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-xs font-bold" title="Вправо">▶</button>
             <span></span>
-            <button type="button" data-cam="0,36" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-sm" title="Ниже">▼</button>
+            <button type="button" data-cam="0,36" class="cam-btn bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-xs font-bold" title="Ниже">▼</button>
             <span></span>
           </div>
           <div class="flex gap-1">
-            <button type="button" data-cam-zoom="in" class="cam-btn flex-1 bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-sm font-semibold" title="Ближе">+</button>
-            <button type="button" data-cam-zoom="out" class="cam-btn flex-1 bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-sm font-semibold" title="Дальше">−</button>
+            <button type="button" data-cam-zoom="in" class="cam-btn flex-1 bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-xs font-bold" title="Приблизить">+</button>
+            <button type="button" data-cam-zoom="out" class="cam-btn flex-1 bg-zinc-800/90 hover:bg-zinc-700 border border-zinc-600 rounded py-1.5 text-xs font-bold" title="Отдалить">−</button>
           </div>
         </div>
       </div>
-      <dl id="stats" class="grid grid-cols-4 gap-2 mt-3 text-[11px] text-zinc-500 font-mono">
-        <div class="bg-zinc-900 rounded px-2 py-1">err <span id="s-err" class="text-zinc-200">—</span></div>
-        <div class="bg-zinc-900 rounded px-2 py-1">pelvis z <span id="s-z" class="text-zinc-200">—</span></div>
-        <div class="bg-zinc-900 rounded px-2 py-1">logs <span id="s-logs" class="text-zinc-200">—</span></div>
-        <div class="bg-zinc-900 rounded px-2 py-1">L2 <span id="s-dev" class="text-zinc-200">—</span></div>
+
+      <!-- Quick Telemetry Row -->
+      <dl class="grid grid-cols-2 sm:grid-cols-5 gap-2 mt-3 text-xs text-zinc-400 font-mono">
+        <div class="bg-zinc-900 border border-zinc-800 rounded-lg px-2.5 py-1.5">
+          <span class="text-zinc-500 block text-[10px] uppercase">Wake-буфер</span>
+          <span id="teleBuf" class="text-zinc-100 font-semibold text-sm">0 (ожидает: 0)</span>
+        </div>
+        <div class="bg-zinc-900 border border-zinc-800 rounded-lg px-2.5 py-1.5">
+          <span class="text-zinc-500 block text-[10px] uppercase">Неопределённость σ</span>
+          <span id="teleUnc" class="text-zinc-100 font-semibold text-sm">0.850</span>
+        </div>
+        <div class="bg-zinc-900 border border-zinc-800 rounded-lg px-2.5 py-1.5">
+          <span class="text-zinc-500 block text-[10px] uppercase">Задержка шага</span>
+          <span id="teleLatency" class="text-zinc-100 font-semibold text-sm">0.0 мс</span>
+        </div>
+        <div class="bg-zinc-900 border border-zinc-800 rounded-lg px-2.5 py-1.5">
+          <span class="text-zinc-500 block text-[10px] uppercase">Высота таза Z</span>
+          <span id="telePelvis" class="text-zinc-100 font-semibold text-sm">0.783 м</span>
+        </div>
+        <div class="bg-zinc-900 border border-zinc-800 rounded-lg px-2.5 py-1.5 col-span-2 sm:col-span-1">
+          <span class="text-zinc-500 block text-[10px] uppercase">Память CMS</span>
+          <span id="teleSlots" class="text-zinc-100 font-semibold text-sm">1 / 40</span>
+        </div>
       </dl>
     </section>
 
-    <aside class="w-[22rem] flex flex-col p-4 bg-zinc-900/80">
-      <p class="text-[10px] uppercase tracking-widest text-zinc-500 mb-2">Level 1 · command</p>
-      <div class="flex gap-2 mb-3">
-        <input id="cmd" type="text" placeholder="любая фраза: 5 шагов вперёд / опусти руки / присесть"
-               class="flex-1 bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
-        <button onclick="send()" class="bg-emerald-600 hover:bg-emerald-500 px-3 rounded-lg text-sm font-semibold">Go</button>
+    <!-- RIGHT: CONTROL & COGNITIVE DASHBOARD -->
+    <aside class="w-80 sm:w-96 flex flex-col p-4 bg-zinc-900/90 border-l border-zinc-800 space-y-3.5 overflow-y-auto">
+
+      <!-- Hardware Switches -->
+      <div class="bg-zinc-950 border border-zinc-800 rounded-xl p-3">
+        <div class="text-[10px] uppercase tracking-widest text-zinc-500 font-bold mb-2">Аппаратные тумблеры (HAL)</div>
+        <div class="grid grid-cols-2 gap-2">
+          <button id="btnPower" onclick="togglePower()"
+                  class="py-2 px-3 rounded-lg font-semibold text-xs transition-colors flex items-center justify-center gap-1.5 bg-emerald-600 hover:bg-emerald-500 text-white">
+            <span class="w-2 h-2 rounded-full bg-white"></span>
+            <span>POWER ON</span>
+          </button>
+          <button id="btnStandby" onclick="toggleStandby()"
+                  class="py-2 px-3 rounded-lg font-semibold text-xs transition-colors flex items-center justify-center gap-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300">
+            <span>STAND-BY (СОН)</span>
+          </button>
+        </div>
+        <div class="mt-2 text-[11px] text-zinc-500 leading-tight">
+          Stand-by удерживает безопасную стойку и запускает NREM консолидацию + REM сновидения (SLEEP).
+        </div>
       </div>
-      <div class="flex gap-2 mb-4 text-xs">
-        <button onclick="wsSend({type:'reset'})" class="flex-1 bg-zinc-800 hover:bg-zinc-700 py-1.5 rounded-lg">Reset</button>
-        <button onclick="wsSend({type:'auto_trial'})" class="flex-1 bg-sky-800 hover:bg-sky-700 py-1.5 rounded-lg">Авто-испытание (Auto-Trial)</button>
+
+      <!-- Natural Language Input -->
+      <div class="bg-zinc-950 border border-zinc-800 rounded-xl p-3">
+        <div class="text-[10px] uppercase tracking-widest text-zinc-500 font-bold mb-2">Команда оператора</div>
+        <div class="flex gap-2">
+          <input id="cmdInput" type="text"
+                 placeholder="например: открой духовку / присядь..."
+                 class="flex-1 bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 text-xs text-zinc-100 focus:outline-none focus:border-emerald-500 font-medium">
+          <button onclick="sendCommand()"
+                  class="bg-emerald-600 hover:bg-emerald-500 text-white px-3.5 rounded-lg text-xs font-semibold shadow-md active:scale-95 transition-all">
+            Пуск
+          </button>
+        </div>
+
+        <!-- Quick Command Chips -->
+        <div class="mt-3">
+          <div class="text-[10px] uppercase tracking-wider text-zinc-500 mb-1.5">Быстрые команды:</div>
+          <div class="grid grid-cols-2 gap-1.5 text-xs font-medium">
+            <button onclick="sendDirectCommand('открой духовку')" class="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700/80 rounded-md py-1.5 px-2 text-left text-zinc-300">
+              🔥 Открой духовку
+            </button>
+            <button onclick="sendDirectCommand('включи тостер')" class="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700/80 rounded-md py-1.5 px-2 text-left text-zinc-300">
+              🍞 Включи тостер
+            </button>
+            <button onclick="sendDirectCommand('открой холодильник')" class="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700/80 rounded-md py-1.5 px-2 text-left text-zinc-300">
+              ❄️ Холодильник
+            </button>
+            <button onclick="sendDirectCommand('открой микроволновку')" class="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700/80 rounded-md py-1.5 px-2 text-left text-zinc-300">
+              📻 Микроволновка
+            </button>
+            <button onclick="sendDirectCommand('присядь')" class="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700/80 rounded-md py-1.5 px-2 text-left text-zinc-300">
+              🦵 Присядь
+            </button>
+            <button onclick="sendDirectCommand('подними руки')" class="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700/80 rounded-md py-1.5 px-2 text-left text-zinc-300">
+              🙌 Подними руки
+            </button>
+          </div>
+        </div>
+
+        <button onclick="sendReset()" class="mt-2.5 w-full bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-400 py-1.5 rounded text-xs">
+          ↺ Сброс робота (Spawn)
+        </button>
       </div>
 
-      <p class="text-[10px] uppercase tracking-widest text-zinc-500 mb-1">In-Context Memory</p>
-      <div id="memory" class="mb-4 bg-zinc-950 border border-zinc-800 rounded-lg p-2 text-[11px] text-zinc-400 font-mono min-h-[4.5rem] space-y-1">
-        <div class="text-zinc-600">нет попыток</div>
+      <!-- Cognitive Confidence Gate -->
+      <div class="bg-zinc-950 border border-zinc-800 rounded-xl p-3">
+        <div class="flex justify-between items-center mb-2">
+          <span class="text-[10px] uppercase tracking-widest text-zinc-500 font-bold">Confidence Gate (σ vs τ)</span>
+          <span id="uncLabel" class="text-xs font-mono font-bold text-amber-400">System 2 (VLM)</span>
+        </div>
+
+        <div class="w-full bg-zinc-900 h-2.5 rounded-full overflow-hidden relative">
+          <div id="uncBar" class="bg-amber-500 h-full rounded-full transition-all duration-150" style="width: 60%;"></div>
+          <div id="tauMark" class="absolute top-0 bottom-0 w-0.5 bg-red-400" style="left: 50%;" title="Порог мышления tau_think"></div>
+        </div>
+
+        <div class="flex justify-between items-center text-[10px] text-zinc-500 font-mono mt-1.5">
+          <span>0.00 (System 1)</span>
+          <span class="text-red-400">τ=<span id="tauVal">0.35</span></span>
+          <span>0.70 (System 2)</span>
+        </div>
+
+        <input id="tauSlider" type="range" min="0.10" max="0.65" step="0.05" value="0.35"
+               oninput="onTauChange(this.value)"
+               class="w-full mt-1.5 accent-red-400 h-1 bg-zinc-800 rounded-lg cursor-pointer">
+
+        <div class="mt-2.5 grid grid-cols-2 gap-2 text-xs font-mono text-zinc-400">
+          <div class="bg-zinc-900/80 p-2 rounded border border-zinc-800">
+            <span class="text-[10px] text-zinc-500 block">System 1 (CMS)</span>
+            <span id="rateSys1" class="text-emerald-400 font-bold text-sm">0.0%</span>
+          </div>
+          <div class="bg-zinc-900/80 p-2 rounded border border-zinc-800">
+            <span class="text-[10px] text-zinc-500 block">System 2 (VLM/IK)</span>
+            <span id="rateSys2" class="text-amber-400 font-bold text-sm">0.0%</span>
+          </div>
+        </div>
       </div>
 
-      <p class="text-[11px] text-zinc-500 mb-4 leading-snug">
-        Сон сам: команда доиграла, робот не упал и ещё 5 с удержался. Падение в повтор не пишется.
-      </p>
+      <!-- Event Logs Terminal -->
+      <div class="flex-1 bg-zinc-950 border border-zinc-800 rounded-xl p-3 flex flex-col min-h-44">
+        <div class="flex justify-between items-center mb-1.5">
+          <span class="text-[10px] uppercase tracking-widest text-zinc-500 font-bold">Журнал событий</span>
+          <button onclick="clearLogs()" class="text-[10px] text-zinc-500 hover:text-zinc-300">очистить</button>
+        </div>
+        <div id="logs" class="flex-1 overflow-y-auto space-y-1 font-mono text-xs pr-1"></div>
+      </div>
 
-      <p class="text-[10px] uppercase tracking-widest text-zinc-500 mb-1">Levels</p>
-      <ul class="text-xs text-zinc-400 space-y-1 mb-4 font-mono">
-        <li><span class="text-emerald-500">L1</span> VLM · language → motor JSON</li>
-        <li><span class="text-sky-400">L2</span> command student · gated residual</li>
-        <li><span class="text-amber-400">L3</span> foundation MLP + Joint-PD</li>
-      </ul>
-
-      <p class="text-[10px] uppercase tracking-widest text-zinc-500 mb-1">Log</p>
-      <div id="logs" class="flex-1 bg-zinc-950 border border-zinc-800 rounded-lg p-2 text-xs text-zinc-400 overflow-y-auto space-y-1 font-mono"></div>
     </aside>
   </div>
 
   <script>
     let ws;
-    const logs = document.getElementById("logs");
+    let powerState = true;
+    let standbyState = false;
 
-    function line(t) {
+    const logsContainer = document.getElementById("logs");
+    const badgeState = document.getElementById("badgeState");
+    const badgeVlm = document.getElementById("badgeVlm");
+    const teleBuf = document.getElementById("teleBuf");
+    const teleUnc = document.getElementById("teleUnc");
+    const teleLatency = document.getElementById("teleLatency");
+    const telePelvis = document.getElementById("telePelvis");
+    const teleSlots = document.getElementById("teleSlots");
+    const uncBar = document.getElementById("uncBar");
+    const uncLabel = document.getElementById("uncLabel");
+    const tauMark = document.getElementById("tauMark");
+    const tauVal = document.getElementById("tauVal");
+    const rateSys1 = document.getElementById("rateSys1");
+    const rateSys2 = document.getElementById("rateSys2");
+    const btnPower = document.getElementById("btnPower");
+    const btnStandby = document.getElementById("btnStandby");
+    const cmdInput = document.getElementById("cmdInput");
+
+    function appendLog(time, level, text) {
       const d = document.createElement("div");
-      d.textContent = t;
-      logs.appendChild(d);
-      logs.scrollTop = logs.scrollHeight;
+      let color = "text-zinc-400";
+      if (level === "error") color = "text-red-400 font-semibold";
+      else if (level === "warn") color = "text-amber-400";
+      else if (level === "sleep") color = "text-sky-400";
+      else if (level === "sys1") color = "text-emerald-400";
+      else if (level === "sys2") color = "text-amber-300";
+
+      d.className = `leading-relaxed ${color}`;
+      d.textContent = `[${time || new Date().toLocaleTimeString()}] ${text}`;
+      logsContainer.appendChild(d);
+      while (logsContainer.children.length > 200) {
+        logsContainer.removeChild(logsContainer.firstChild);
+      }
+      logsContainer.scrollTop = logsContainer.scrollHeight;
     }
 
-    function connect() {
-      ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
-      ws.onopen = () => line("connected");
-      ws.onclose = () => { line("reconnect…"); setTimeout(connect, 800); };
-      ws.onmessage = (e) => {
-        const m = JSON.parse(e.data);
-        if (m.type === "log") line(m.text);
-        if (m.type === "telemetry") {
-          document.getElementById("badge").textContent = (m.instruction || m.subgoal || "stand").slice(0, 28);
-          const st = m.outcome === "fall" ? "fall" : (m.status || "stand");
-          document.getElementById("hold").textContent = st;
-          document.getElementById("hold").className = m.outcome === "fall"
-            ? "bg-amber-950 text-amber-400 px-2 py-1 rounded"
-            : "bg-zinc-800 text-zinc-500 px-2 py-1 rounded";
-          document.getElementById("s-err").textContent = m.error;
-          document.getElementById("s-z").textContent = m.pelvis_z;
-          document.getElementById("s-logs").textContent = m.logs;
-          document.getElementById("s-dev").textContent =
-            (m.ctrl || "track")
-            + (m.stage ? "·" + m.stage : "")
-            + (m.alpha ? "·α" + m.alpha : "")
-            + (m.h1 ? "·H1" : "")
-            + (m.outcome && m.outcome !== "ok" ? "·" + m.outcome : "");
-          const mem = document.getElementById("memory");
-          const trials = m.trials || [];
-          if (!trials.length) {
-            mem.innerHTML = '<div class="text-zinc-600">нет попыток</div>';
-          } else {
-            mem.innerHTML = trials.map((t) => {
-              const cls = t.fell ? "text-amber-400" : (t.success ? "text-emerald-400" : "text-zinc-300");
-              return `<div class="${cls}"></div>`;
-            }).join("");
-            [...mem.children].forEach((el, i) => { el.textContent = trials[i].line; });
+    function clearLogs() {
+      logsContainer.innerHTML = "";
+    }
+
+    function connectWs() {
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      ws = new WebSocket(`${protocol}//${location.host}/ws`);
+      ws.onopen = () => appendLog(null, "info", "WebSocket подключен.");
+      ws.onclose = () => {
+        appendLog(null, "warn", "WebSocket отключен. Переподключение через 2с...");
+        setTimeout(connectWs, 2000);
+      };
+      ws.onerror = () => ws.close();
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "log") {
+            appendLog(msg.time, msg.level, msg.text);
+          } else if (msg.type === "telemetry") {
+            updateTelemetry(msg);
           }
+        } catch (e) {
+          console.error("WS error:", e);
         }
       };
     }
 
-    function wsSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
-    function camOrbit(dx, dy) { wsSend({ type: "camera", dx, dy }); }
-    function camZoom(deltaY) { wsSend({ type: "camera", zoom: deltaY }); }
+    function updateTelemetry(t) {
+      teleBuf.textContent = `${t.wake_buffer_len} (новых: ${t.unconsolidated_steps})`;
+      teleUnc.textContent = t.uncertainty.toFixed(3);
+      teleLatency.textContent = t.latency_ms.toFixed(1) + " мс";
+      telePelvis.textContent = t.pelvis_z.toFixed(3) + " м";
+      teleSlots.textContent = `${t.cms_slots_used} / ${t.cms_slots_total}`;
+      badgeVlm.textContent = "VLM: " + t.vlm_backend;
 
-    document.querySelectorAll(".cam-btn[data-cam]").forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const raw = btn.getAttribute("data-cam");
-        if (raw === "reset") {
-          wsSend({ type: "camera_reset" });
-          return;
+      rateSys1.textContent = t.sys1_rate.toFixed(1) + "%";
+      rateSys2.textContent = t.sys2_rate.toFixed(1) + "%";
+
+      const uncPct = Math.min(100, Math.max(0, (t.uncertainty / 0.70) * 100));
+      const tauPct = Math.min(100, Math.max(0, (t.tau_think / 0.70) * 100));
+      uncBar.style.width = uncPct + "%";
+      tauMark.style.left = tauPct + "%";
+      tauVal.textContent = t.tau_think.toFixed(2);
+
+      if (t.uncertainty <= t.tau_think && t.cms_slots_used > 1) {
+        uncBar.className = "bg-emerald-500 h-full rounded-full transition-all duration-150";
+        uncLabel.className = "text-xs font-mono font-bold text-emerald-400";
+        uncLabel.textContent = "System 1 (Автоматизм)";
+      } else {
+        uncBar.className = "bg-amber-500 h-full rounded-full transition-all duration-150";
+        uncLabel.className = "text-xs font-mono font-bold text-amber-400";
+        uncLabel.textContent = "System 2 (VLM + IK)";
+      }
+
+      badgeState.textContent = t.state;
+      if (t.state === "SYS1") {
+        badgeState.className = "bg-emerald-600 text-white px-3 py-1 rounded-md font-bold tracking-wide uppercase";
+      } else if (t.state === "SYS2") {
+        badgeState.className = "bg-amber-500 text-black px-3 py-1 rounded-md font-bold tracking-wide uppercase";
+      } else if (t.state === "MICRO_SLEEP") {
+        badgeState.className = "bg-sky-600 text-white px-3 py-1 rounded-md font-bold tracking-wide uppercase animate-pulse";
+      } else if (t.state === "STANDBY") {
+        badgeState.className = "bg-indigo-600 text-white px-3 py-1 rounded-md font-bold tracking-wide uppercase animate-pulse";
+      } else if (t.state === "RECOVERING") {
+        badgeState.className = "bg-orange-500 text-white px-3 py-1 rounded-md font-bold tracking-wide uppercase animate-pulse";
+      } else if (t.state === "OFF") {
+        badgeState.className = "bg-red-700 text-white px-3 py-1 rounded-md font-bold tracking-wide uppercase";
+      } else {
+        badgeState.className = "bg-zinc-800 text-zinc-300 px-3 py-1 rounded-md font-semibold tracking-wide uppercase";
+      }
+
+      powerState = t.power_on;
+      standbyState = t.standby_mode;
+      if (powerState) {
+        btnPower.className = "py-2 px-3 rounded-lg font-semibold text-xs transition-colors flex items-center justify-center gap-1.5 bg-emerald-600 hover:bg-emerald-500 text-white";
+        btnPower.innerHTML = '<span class="w-2 h-2 rounded-full bg-white"></span><span>POWER ON</span>';
+      } else {
+        btnPower.className = "py-2 px-3 rounded-lg font-semibold text-xs transition-colors flex items-center justify-center gap-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-400";
+        btnPower.innerHTML = '<span class="w-2 h-2 rounded-full bg-red-500"></span><span>POWER OFF</span>';
+      }
+
+      if (standbyState) {
+        btnStandby.className = "py-2 px-3 rounded-lg font-semibold text-xs transition-colors flex items-center justify-center gap-1.5 bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg";
+        btnStandby.textContent = "STAND-BY (АКТИВЕН)";
+      } else {
+        btnStandby.className = "py-2 px-3 rounded-lg font-semibold text-xs transition-colors flex items-center justify-center gap-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300";
+        btnStandby.textContent = "STAND-BY (СОН)";
+      }
+    }
+
+    function sendCommand() {
+      const text = cmdInput.value.trim();
+      if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({ type: "command", text }));
+      cmdInput.value = "";
+    }
+
+    function sendDirectCommand(cmd) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({ type: "command", text: cmd }));
+    }
+
+    function togglePower() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({ type: "power", state: !powerState }));
+    }
+
+    function toggleStandby() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({ type: "standby", state: !standbyState }));
+    }
+
+    function onTauChange(val) {
+      tauVal.textContent = Number(val).toFixed(2);
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({ type: "set_tau", tau: Number(val) }));
+    }
+
+    function sendReset() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({ type: "reset" }));
+    }
+
+    cmdInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") sendCommand();
+    });
+
+    const dragArea = document.getElementById("camDrag");
+    let isDragging = false, lastX = 0, lastY = 0;
+    dragArea.addEventListener("mousedown", (e) => {
+      isDragging = true; lastX = e.clientX; lastY = e.clientY;
+    });
+    window.addEventListener("mouseup", () => { isDragging = false; });
+    window.addEventListener("mousemove", (e) => {
+      if (!isDragging || !ws || ws.readyState !== WebSocket.OPEN) return;
+      const dx = e.clientX - lastX, dy = e.clientY - lastY;
+      lastX = e.clientX; lastY = e.clientY;
+      ws.send(JSON.stringify({ type: "camera", dx, dy, zoom: 0 }));
+    });
+
+    document.querySelectorAll(".cam-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const cam = btn.getAttribute("data-cam");
+        const zoom = btn.getAttribute("data-cam-zoom");
+        if (cam === "reset") {
+          ws.send(JSON.stringify({ type: "camera_reset" }));
+        } else if (cam) {
+          const [dx, dy] = cam.split(",").map(Number);
+          ws.send(JSON.stringify({ type: "camera", dx, dy, zoom: 0 }));
+        } else if (zoom === "in") {
+          ws.send(JSON.stringify({ type: "camera", dx: 0, dy: 0, zoom: -1.0 }));
+        } else if (zoom === "out") {
+          ws.send(JSON.stringify({ type: "camera", dx: 0, dy: 0, zoom: 1.0 }));
         }
-        const [dx, dy] = raw.split(",").map((n) => parseFloat(n));
-        camOrbit(dx, dy);
-      });
-    });
-    document.querySelectorAll(".cam-btn[data-cam-zoom]").forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const dir = btn.getAttribute("data-cam-zoom");
-        camZoom(dir === "in" ? -120 : 120);
       });
     });
 
-    function send() {
-      const el = document.getElementById("cmd");
-      if (!el.value.trim()) return;
-      wsSend({ type: "command", text: el.value.trim() });
-      el.value = "";
-    }
-    document.getElementById("cmd").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
-
-    const camDrag = document.getElementById("camDrag");
-    let dragging = false;
-    let lastX = 0;
-    let lastY = 0;
-    camDrag.addEventListener("pointerdown", (e) => {
-      if (e.button !== 0) return;
-      if (e.target.closest(".cam-btn")) return;
-      dragging = true;
-      lastX = e.clientX;
-      lastY = e.clientY;
-      camDrag.classList.add("cursor-grabbing");
-      camDrag.setPointerCapture(e.pointerId);
-      e.preventDefault();
-    });
-    camDrag.addEventListener("pointermove", (e) => {
-      if (!dragging) return;
-      const dx = e.clientX - lastX;
-      const dy = e.clientY - lastY;
-      lastX = e.clientX;
-      lastY = e.clientY;
-      if (dx || dy) camOrbit(dx, dy);
-    });
-    function endDrag() {
-      dragging = false;
-      camDrag.classList.remove("cursor-grabbing");
-    }
-    camDrag.addEventListener("pointerup", endDrag);
-    camDrag.addEventListener("pointercancel", endDrag);
-    camDrag.addEventListener("pointerleave", (e) => {
-      if (dragging && !camDrag.hasPointerCapture(e.pointerId)) endDrag();
-    });
-    camDrag.addEventListener("wheel", (e) => {
-      e.preventDefault();
-      camZoom(e.deltaY);
-    }, { passive: false });
-
-    connect();
+    connectWs();
   </script>
 </body>
 </html>

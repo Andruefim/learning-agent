@@ -1,2 +1,0 @@
-Reset · spawn.
-«подними тостер» → поднять тостер · queue=1 skill=hold params={'hand_goal': {'hand': 'right', 'u': 0.92, 'v': 0.65}} goal={'hand': 'right', 'u': 0.92, 'v': 0.65}

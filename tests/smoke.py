@@ -1,416 +1,232 @@
-"""Physics + planner smoke for the Unitree G1 foundation controller.
-
-Run: `MUJOCO_GL=egl python app.py --smoke` or `python -m tests.smoke`.
-"""
+"""End-to-end verification of System 0 balance/walk, 6D IK, Gemini->Ollama fallback, SLEEP Wake/Sleep, System 1, and rendering."""
 
 from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
+import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 if not os.environ.get("MUJOCO_GL"):
-    os.environ["MUJOCO_GL"] = "glfw" if sys.platform == "darwin" else "egl"
+    os.environ["MUJOCO_GL"] = "glfw" if sys.platform in ("darwin", "win32") else "egl"
 
-from agent import (  # noqa: E402
-    ACTION_DIM,
-    ALPHA_MAX,
-    H1_SPEC,
-    L_SH,
-    N_ACT,
-    Plan,
-    R_SH,
-    RobotEngine,
-    SHADOW_MSE_MAX,
-    evaluate_trial,
-    parse_requested_yaw,
-)
-from agent.config import STAND_Z  # noqa: E402
-from agent.l3_cmd import L2_CMD_DIM, command_from_plan  # noqa: E402
-from agent.l3_foundation import (  # noqa: E402
-    ACT_DIM,
-    OBS_DIM,
-    HumanoidFoundationPolicy,
-    build_obs,
-)
-
-
-def _drive(bot: RobotEngine, plan: Plan, steps: int) -> None:
-    for i in range(steps):
-        if i % 50 == 0:
-            bot.apply_plan(plan, fresh=(i == 0), l1_ok=True)
-        bot.step()
-
-
-def _assert_idle_stand(bot: RobotEngine, ticks: int = 800) -> None:
-    for i in range(ticks):
-        bot.step()
-        z = float(bot._pelvis()[2])
-        assert bot.outcome != "fall", {"tick": i, **bot.telemetry()}
-        assert abs(z - STAND_Z) < 0.05, {"tick": i, "z": z, "stand_z": STAND_Z, **bot.telemetry()}
-
-
-def _assert_torso_push(bot: RobotEngine) -> None:
-    """Horizontal torso impulse after ~100 ticks of stand; z must return near STAND_Z."""
-    bot.reset_sim()
-    _assert_idle_stand(bot, 100)
-    for _ in range(8):
-        bot.data.xfrc_applied[bot.torso_id, 0] = 180.0
-        bot.step()
-    bot.data.xfrc_applied[bot.torso_id] = 0
-    saw_fall = bot.outcome == "fall"
-    recovered_at = None
-    for i in range(800):
-        bot.step()
-        z = float(bot._pelvis()[2])
-        if bot.outcome == "fall":
-            saw_fall = True
-        if recovered_at is None and saw_fall and bot.outcome != "fall" and abs(z - STAND_Z) < 0.05:
-            recovered_at = i
-        if i >= 400:
-            assert abs(z - STAND_Z) < 0.08, {
-                "post_tick": i,
-                "z": z,
-                "saw_fall": saw_fall,
-                **bot.telemetry(),
-            }
-    z = float(bot._pelvis()[2])
-    assert abs(z - STAND_Z) < 0.05, {"z": z, "saw_fall": saw_fall, **bot.telemetry()}
-    if saw_fall:
-        assert recovered_at is not None and recovered_at < 600, {
-            "recovered_at": recovered_at,
-            **bot.telemetry(),
-        }
-
-
-def _policy_tracks_vx(bot: RobotEngine) -> bool:
-    """Only assert walk displacement if this checkpoint actually tracks vx."""
-    bot.reset_sim()
-    x0 = float(bot._pelvis()[0])
-    _drive(
-        bot,
-        Plan("шаг", skill="locomote", params={"direction": "forward", "speed": "medium", "distance_hint": "3"}),
-        400,
-    )
-    dx = float(bot._pelvis()[0]) - x0
-    fell = bot.outcome == "fall"
-    bot.reset_sim()
-    return (not fell) and dx > 0.04
+from agent import RobotEngine, SleepConfig, SLEEP_ACTION_DIM, SLEEP_HORIZON, SLEEP_IMG_SIZE, SLEEP_PROPRIO_DIM
+from agent.system0 import MAT_HORIZ_HOOK, default_raw_action, extract_proprio, raw_to_norm_action, solve_whole_body_ik
 
 
 def smoke() -> None:
-    bot = RobotEngine()
-    assert bot.model.actuator(N_ACT - 1).name == "right_wrist_yaw"
-    assert int(bot.model.nu) >= N_ACT
-    assert bot.model.joint("left_hip_yaw_joint").id >= 0
-    assert isinstance(bot.l3, HumanoidFoundationPolicy)
-    import torch as _torch
+    print("[smoke] Initializing RobotEngine...")
+    with tempfile.TemporaryDirectory() as tmpdir, patch("agent.engine.CHECKPOINT_DIR", Path(tmpdir)):
+        os.environ["STORAGE_DIR"] = tmpdir
+        bot = RobotEngine(headless=False)
+        try:
+            # 1. Idle standing stability (free pelvis, no teleport)
+            for _ in range(40):
+                bot.step(10)
+            tel = bot.telemetry()
+            assert not tel["fell"], f"Robot fell at idle: {tel}"
+            assert tel["pelvis_z"] > 0.72, f"Bad stand pelvis_z: {tel}"
+            assert tel["tilt"] > 0.88, f"Bad stand tilt: {tel}"
+            print(f"[smoke] Stand OK: z={tel['pelvis_z']:.3f}, tilt={tel['tilt']:.3f}, cms={tel['cms_slots_used']}/{tel['cms_slots_total']}")
 
-    _torch.manual_seed(0)
-    l3_out = bot.l3(_torch.zeros(1, OBS_DIM))
-    assert tuple(l3_out.shape) == (1, ACT_DIM)
-    if not bot.l3_drive:
-        assert float(l3_out.abs().max()) < 1e-6, "untrained L3 last layer must be zero"
-    stand_obs = build_obs(
-        bot.data,
-        bot.torso_id,
-        bot._hinges(),
-        bot._qd(),
-        bot._last_a,
-        bot._cmd,
-    )
-    assert stand_obs.shape == (OBS_DIM,), stand_obs.shape
-    cmd = command_from_plan(Plan.stand())
-    assert cmd.shape == (L2_CMD_DIM,) == (ACTION_DIM,)
-    parsed = bot.planner._parse(
-        '{"instruction":"подними правую руку","skill":"reach","params":{"hand":"right"},"done":false}',
-        "подними правую руку",
-    )
-    assert parsed is not None and parsed.skill == "reach" and parsed.params.get("hand") == "right", parsed
-    dropped = bot.planner._parse(
-        '{"instruction":"подними руки","skill":"hold","params":{},"done":false}',
-        "подними руки",
-    )
-    assert dropped is not None and dropped.params.get("hand") == "both", dropped
-    assert dropped.teacher().r_arm > 0.5 and dropped.teacher().l_arm > 0.5, dropped.teacher()
-    walk = bot.planner._parse(
-        '{"instruction":"сделай 5 шагов вперед","skill":"locomote","params":{"direction":"forward","speed":"medium","distance_hint":"5"},"done":false}',
-        "сделай 5 шагов вперед",
-    )
-    assert walk is not None and walk.skill == "locomote" and walk.teacher().vx > 0.2 and walk.teacher().steps == 5, walk
-    queued = bot.planner._parse(
-        '{"instruction":"вперед потом руки","queue":[{"direction":"forward","speed":"medium","hold_s":3},{"pose":"t","vx":0,"hold_s":2}],"done":false}',
-        "вперед потом руки",
-    )
-    assert queued is not None and len(queued.queue) == 2, queued
-    from agent.l3_cmd import command_from_step
+            # 2. Real RL walking forward via G1LegPolicy
+            x0 = float(bot.data.xpos[bot.sys0.pelvis_id, 0])
+            walk_cmd = default_raw_action()
+            walk_cmd[0] = 0.40
+            for _ in range(30):
+                bot._step_cog_from_worker(walk_cmd, tuck_left=True, tuck_right=True)
+            stand_cmd = default_raw_action()
+            for _ in range(12):
+                bot._step_cog_from_worker(stand_cmd, tuck_left=True, tuck_right=True)
+            x1 = float(bot.data.xpos[bot.sys0.pelvis_id, 0])
+            assert x1 > x0 + 0.15, f"Robot did not walk forward cleanly: x0={x0:.3f}, x1={x1:.3f}"
+            assert not bot.sys0.fell(), "Robot fell while walking"
+            print(f"[smoke] Walk OK: dx={x1 - x0:.3f} m")
 
-    q0 = command_from_step(queued.queue[0])
-    q1 = command_from_step(queued.queue[1])
-    assert float(q0[0]) > 0.2 and abs(float(q1[0])) < 1e-6, (q0[0], q1[0])
-    assert abs(float(q1[5])) > 0.2, q1[4:8]
-    both = bot.planner._parse(
-        '{"instruction":"иди вперед и руки в стороны","skill":"locomote","params":{"direction":"forward","speed":"medium","pose":"t"},"done":false}',
-        "иди вперед и руки в стороны",
-    )
-    assert both is not None and both.teacher().vx > 0.2 and both.teacher().r_out == 1.0 and both.teacher().l_out == 1.0, both
-    squat_arms = bot.planner._parse(
-        '{"instruction":"присядь и подними руки","skill":"squat","params":{"depth":"low","hand":"both"},"done":false}',
-        "присядь и подними руки",
-    )
-    assert squat_arms is not None and squat_arms.teacher().height < 0.5 and squat_arms.teacher().r_arm > 0.5, squat_arms
-    down = bot.planner._parse(
-        '{"instruction":"опусти руки","skill":"hold","params":{"hands":"down"},"done":false}',
-        "опусти руки",
-    )
-    assert down is not None and down.skill == "hold" and down.teacher().r_arm == 0.0, down
-    waved = bot.planner._parse(
-        '{"instruction":"махни","skill":"wave","params":{"hand":"right"},"done":false}',
-        "махни",
-    )
-    assert waved is not None and waved.skill == "wave" and waved.teacher().wave == 1.0, waved
-    hold = bot.planner.hold("что угодно", {})
-    assert hold.skill == "stand" and hold.teacher().height == 1.0
-    leaked = bot.planner._parse(
-        '{"instruction":"x","skill":"reach","params":{"cube":1,"hand":"right"},"done":false}',
-        "x",
-    )
-    assert leaked is not None and "cube" not in leaked.params
-    src = (ROOT / "agent" / "plan.py").read_text(encoding="utf-8")
-    assert "cube_z" not in src
-    assert "GRASP_Z" not in src
+            # 3. 6D Whole-Body IK reachability test
+            bot.reset_sim()
+            handle_target = np.array([bot.data.xpos[bot.sys0.pelvis_id, 0] + 0.42, -0.05, 0.72], dtype=np.float64)
+            q_ik, ik_err = solve_whole_body_ik(
+                bot.model,
+                bot.data,
+                bot.sys2.scratch,
+                bot.qadr,
+                bot.vadr,
+                bot.sys0.wrist_r_id,
+                handle_target,
+                MAT_HORIZ_HOOK,
+                squat=0.15,
+            )
+            assert ik_err < 0.03, f"6D IK error too high: {ik_err:.4f}"
+            print(f"[smoke] Whole-Body 6D IK OK: err={ik_err * 100:.2f} cm")
 
-    err = {"h": 0.18, "vx": 0.0, "yaw": 0.0, "steps": 0.0, "wave": 0.0, "kick": 0.0, "r_arm": 0.0, "l_arm": 0.0}
-    _torch.manual_seed(0)
-    a = bot.trial_forward("squat", err)
-    _torch.manual_seed(0)
-    b = bot.trial_forward("locomote", err)
-    assert a.shape == b.shape == (ACTION_DIM,)
-    assert float(np.max(np.abs(a - b))) > 1e-6, "same error, different skill_id must change the net"
-    formula = np.full(ACTION_DIM, -0.18, dtype=np.float32)
-    assert float(np.max(np.abs(a - formula))) > 1e-4, "correction must not be params-error"
-    g_sq = bot.trial_token_grad("squat", err)
-    g_loc = bot.trial_token_grad("locomote", err)
-    assert g_sq > 0 and g_loc > 0, "trial tokens must sit in the autograd graph"
-    assert H1_SPEC["requires_student_on_actuators"] is False
-    assert H1_SPEC["shadow_streak"] >= 1 and H1_SPEC["shadow_mse_max"] > 0
-    assert ALPHA_MAX == 0.12
-    assert "stage_d" in H1_SPEC
-    assert "l3_cmd" in H1_SPEC["residual"] or "command" in H1_SPEC["residual"]
+            # 4. Gemini -> Ollama automatic fallback verification
+            bot.planner.api_key = "fake-test-key"
+            with patch.object(bot.planner, "_call_gemini", side_effect=RuntimeError("503 Service Unavailable")), \
+                 patch.object(bot.planner, "_call_ollama", return_value={"mode": "body_skill", "skill": "squat", "params": {"depth": "low"}}) as mock_ol:
+                plan = bot.planner.plan_command(np.zeros((64, 64, 3), dtype=np.uint8), "присядь")
+                assert mock_ol.called, "Ollama fallback was not triggered on Gemini 503"
+                assert plan["mode"] == "body_skill" and plan["skill"] == "squat"
+                assert "ollama" in bot.planner.active_backend
+            print("[smoke] Gemini 503 -> Ollama fallback OK")
 
-    bot.stage = "B"
-    bot.alpha = 0.08
-    bot.alpha_working = 0.03
-    bot._working_fall = 0.0
-    bot._shadow_falls.clear()
-    bot._shadow_falls.extend([1] * 64)
-    bot._maybe_update_authority(mse=0.5, fell=True)
-    assert bot.alpha <= 0.03, {"alpha": bot.alpha, "stage": bot.stage}
+            # 5. SLEEP Confidence Gate + Wake -> NREM Consolidate -> REM Dream -> Save/Load
+            head_rgb = bot._get_head_rgb_blocking()
+            assert head_rgb.shape == (480, 640, 3)
+            pr = extract_proprio(
+                bot.data, bot.sys0.pelvis_id, bot.sys0.torso_id, bot.sys0.wrist_r_id, bot.qadr, 0.0
+            )
+            assert pr.shape == (SLEEP_PROPRIO_DIM,)
 
-    bot.stage = "A"
-    bot.alpha = 0.0
-    bot.shadow_mse_ema = 0.04
-    bot._ema_ok_tick0 = 1
-    bot._ema_ok_fall0 = 0.0
-    bot.shadow_ok_streak = 160
-    bot._replay_n = 1000
-    bot._shadow_falls.clear()
-    bot._shadow_falls.extend([0] * 20)
-    bot._maybe_update_authority(mse=0.20, fell=False)
-    assert bot.shadow_mse_ema is not None and bot.shadow_mse_ema < SHADOW_MSE_MAX
-    assert bot.shadow_ok_streak > 160, bot.shadow_ok_streak
-    assert bot.stage == "A"
-    bot.shadow_ok_streak = 196
-    bot._maybe_update_authority(mse=0.04, fell=False)
-    assert bot.stage == "B" and abs(bot.alpha - 0.03) < 1e-6, {"stage": bot.stage, "alpha": bot.alpha}
+            _, sigma_before, _ = bot._infer_sys1(head_rgb, pr, "открой духовку")
+            assert sigma_before > bot.tau_think, f"Expected initial sigma > tau_think, got {sigma_before}"
 
-    bot.stage = "A"
-    bot.alpha = 0.0
-    bot.shadow_mse_ema = 0.04
-    bot._ema_ok_tick0 = 1
-    bot._ema_ok_fall0 = 0.0
-    bot.shadow_ok_streak = 500
-    bot._replay_n = 10
-    bot._shadow_falls.clear()
-    bot._shadow_falls.extend([0] * 20)
-    bot._maybe_update_authority(mse=0.04, fell=False)
-    assert bot.stage == "A", "replay gate must block A→B"
+            # Populate wake buffer with realistic smooth chunks toward squat/reach pose
+            rgb_128 = np.full((SLEEP_IMG_SIZE, SLEEP_IMG_SIZE, 3), 120, dtype=np.uint8)
+            target_raw = default_raw_action()
+            target_raw[2] = 0.25
+            target_raw[5:12] = q_ik[22:29]
+            norm_tgt = raw_to_norm_action(target_raw)
+            chunk = np.stack([norm_tgt] * SLEEP_HORIZON, axis=0)
+            for _ in range(36):
+                bot.wake_buffer.append((rgb_128, pr, "открой духовку", chunk, 1))
+            bot.unconsolidated_steps = len(bot.wake_buffer)
 
-    bot._replay_n = 1000
-    bot._ema_ok_tick0 = 1
-    bot._ema_ok_fall0 = 0.0
-    bot.shadow_ok_streak = 500
-    bot._shadow_falls.clear()
-    bot._shadow_falls.extend([1] * 32)
-    bot._maybe_update_authority(mse=0.04, fell=True)
-    assert bot.stage == "A", "fall-rate rise must block A→B"
-    bot.stage = "A"
-    bot.alpha = 0.0
-    blob = bot._load_replay()
-    bot._replay_n = 0 if blob is None else int(len(blob["action"]))
+            # Enough Wake experience + Deep Sleep consolidation so uncertainty drops below tau_think
+            bot._run_wake_update(steps=14, allow_consolidate=False)
+            bot.standby_mode = True
+            bot._sleep_done_for_batch = False
+            bot._pending_skills.add(bot._skill_key("открой духовку"))
+            bot.ckpt_path = Path(tmpdir) / "sleep_vla.pt"
+            bot._run_deep_sleep()
 
-    _assert_idle_stand(bot, 800)
-    tel = bot.telemetry()
-    assert bot._tilt_up() > 0.8, tel
-    assert abs(float(bot._hinges()[R_SH])) < 0.45, "idle arms should hang"
+            assert bot.vla.cms.used_slots() > 1, "Expected CMS slots to expand during sleep"
+            assert bot._skill_key("открой духовку") in bot.learner.consolidated_skills
+            assert bot._effective_sigma("включи тостер", 0.05) >= 0.85, "Unlearned skill must keep high epistemic uncertainty"
+            assert bot.ckpt_path.is_file(), "Checkpoint was not saved after deep sleep"
+            assert bot.learner.stats["sleeps"] >= 1, "Consolidation did not run"
+            print(
+                f"[smoke] SLEEP consolidation+dream OK: slots={bot.vla.cms.used_slots()}/{bot.vla.cms.total_slots()}, "
+                f"sleeps={bot.learner.stats['sleeps']}, sigma_before={sigma_before:.3f} -> sigma_after={bot.current_uncertainty:.3f}"
+            )
+            assert bot.current_uncertainty < sigma_before, "Uncertainty should decrease after Wake/Sleep training"
 
-    z0 = float(bot._pelvis()[2])
-    _drive(bot, Plan("присесть", skill="squat", params={"depth": "low"}), 800)
-    z_sq = float(bot._pelvis()[2])
-    assert bot.outcome != "fall", bot.telemetry()
-    assert z_sq < z0 - 0.02, {**bot.telemetry(), "stand_z": z0, "squat_z": z_sq}
+            # Verify System 1 closed-loop inference & execution stay upright
+            chunk_pred, sigma_live, ms_live = bot._infer_sys1(head_rgb, pr, "открой духовку")
+            bot.set_standby(False)
+            ok_sys1 = bot._run_sys1_closed_loop("открой духовку", chunk_pred)
+            assert ok_sys1 and not bot.sys0.fell(), "System 1 execution failed or fell"
+            print(f"[smoke] System 1 closed-loop OK: latency={ms_live:.2f} ms, sigma={sigma_live:.3f}, sys1_steps={bot.sys1_count}")
 
-    bot.reset_sim()
-    _assert_idle_stand(bot, 200)
-    _drive(bot, Plan("подними руки", skill="reach", params={"hand": "both"}), 700)
-    assert bot.outcome != "fall", bot.telemetry()
-    assert float(bot._hinges()[R_SH]) < -0.45, bot.telemetry()
+            # Verify checkpoint reload + second-episode Wake update with prev_teacher & anchors active
+            slots_before_reload = bot.vla.cms.used_slots()
+            bot.vla.cms.blocks[1].reset_slots()
+            assert bot.learner.load_checkpoint(bot.ckpt_path)
+            assert bot.vla.cms.used_slots() == slots_before_reload
+            loss_2nd_ep = bot._run_wake_update(steps=2, allow_consolidate=False)
+            assert np.isfinite(loss_2nd_ep), f"Second-episode wake update failed: {loss_2nd_ep}"
 
-    bot.reset_sim()
-    _assert_idle_stand(bot, 200)
-    _drive(bot, Plan("махни правой", skill="wave", params={"hand": "right"}), 700)
-    assert bot.outcome != "fall", bot.telemetry()
-    assert float(bot._hinges()[R_SH]) < -0.45, bot.telemetry()
+            # 6b. Autonomous Fall Recovery (supine floor -> SuperMimic RL -> upright stand)
+            assert bot.sys0.standup is not None, "Stand-up policy not loaded"
+            bot.set_power(False)
+            with bot._sim_lock:
+                bot.data.qpos[0:3] = [-0.6, 0.0, 0.22]
+                bot.data.qpos[3:7] = [0.7071, 0.0, -0.7071, 0.0]
+                bot.data.qvel[:] = 0.0
+                import mujoco
+                mujoco.mj_forward(bot.model, bot.data)
+            bot.step(80)
+            assert bot.sys0.fell(), "G1 did not settle into fallen state for recovery test"
+            bot.set_power(True)
+            recovered = bot._ensure_upright(timeout_s=10.0)
+            tel_rec = bot.telemetry()
+            assert recovered and not tel_rec["fell"] and tel_rec["pelvis_z"] > 0.70 and tel_rec["tilt"] > 0.90, (
+                f"Autonomous fall recovery failed: {tel_rec}"
+            )
+            print(f"[smoke] Autonomous fall recovery OK (z={tel_rec['pelvis_z']:.3f}, tilt={tel_rec['tilt']:.3f})")
+            bot.reset_sim()
 
-    _drive(bot, Plan("опусти руки", skill="hold", params={"hands": "down"}), 700)
-    assert abs(float(bot._hinges()[R_SH])) < 0.45, bot.telemetry()
-    assert abs(float(bot._hinges()[L_SH])) < 0.45, bot.telemetry()
+            # 6c. Failed-episode learning (Episodic Lesson + failure REM sleep, without fake Sys1 consolidation)
+            prev_sleeps = bot.total_sleep_cycles
+            bad_chunk = np.zeros((SLEEP_HORIZON, SLEEP_ACTION_DIM), dtype=np.float32)
+            bad_samples = [(np.zeros((128, 128, 3), dtype=np.uint8), np.zeros(SLEEP_PROPRIO_DIM, dtype=np.float32), "сломанный тест", bad_chunk) for _ in range(4)]
+            with (
+                patch.object(
+                    bot.sys2,
+                    "execute",
+                    return_value={
+                        "ok": False,
+                        "reason": "attempts_exhausted",
+                        "samples": bad_samples,
+                        "failure_info": {
+                            "before_rgb": np.zeros((480, 640, 3), dtype=np.uint8),
+                            "after_rgb": np.zeros((480, 640, 3), dtype=np.uint8),
+                            "target_pt": np.array([0.8, 0.0, 0.4]),
+                            "tried_motions": ["pull_back"],
+                            "ik_err_cm": 24.0,
+                            "fell": False,
+                            "what": "no visible change",
+                        },
+                    },
+                ),
+                patch.object(bot.planner, "reflect_failure", return_value="target was too low (IK err 24cm); aim higher at the handle"),
+            ):
+                bot._execute_command("сломанный тест")
+            skey = bot._skill_key("сломанный тест")
+            assert len(bot.learner.get_lessons(skey)) >= 1, "Episodic lesson not stored after failure"
+            assert len(bot.failure_buffer) >= 4, "Failed trajectory chunks not saved in failure_buffer"
+            assert bot.total_sleep_cycles > prev_sleeps, "Post-failure Sleep did not run"
+            assert skey not in bot.learner.consolidated_skills, "Failed skill must NOT enter consolidated System 1 skills"
+            assert bot._effective_sigma("сломанный тест", 0.10) >= 0.85
+            print("[smoke] Post-failure REM sleep & episodic lesson learning OK")
 
-    _drive(bot, Plan("stand", skill="stand"), 400)
-    bot.data.qpos[3:7] = [0.85, 0.5, 0.0, 0.0]
-    import mujoco
+            # 6. HAL switches + rendering MJPEG check
+            bot.set_power(False)
+            assert bot.telemetry()["state"] == "OFF"
+            bot.set_power(True)
+            assert bot.telemetry()["state"] == "IDLE"
+            bot.orbit_camera(15.0, -5.0, -0.5)
+            bot.step(10)
+            bot._render_sync()
+            assert bot._preview_rgb is not None and float(bot._preview_rgb.std()) > 20.0, "Overview camera occluded"
+            assert bot.get_overview_jpeg()[:2] == b"\xff\xd8"
+            assert bot.get_head_jpeg()[:2] == b"\xff\xd8"
+            print("[smoke] HAL switches & MJPEG render OK")
+        finally:
+            bot.close()
 
-    mujoco.mj_forward(bot.model, bot.data)
-    bot.step()
-    assert bot.outcome == "fall", bot.telemetry()
-    bot.apply_plan(Plan("спасайся", skill="locomote", params={"direction": "forward", "speed": "fast"}), fresh=True, l1_ok=True)
-    assert bot.status == "failed" and bot.user_cmd == ""
+    # 7. FastAPI WebSocket + HTTP routes check
+    from fastapi.testclient import TestClient
+    import app as server_app
 
-    bot.reset_sim()
-    _assert_idle_stand(bot, 800)
-    _assert_torso_push(bot)
-
-    bot.reset_sim()
-    pelvis = bot._pelvis()
-    assert float(pelvis[2]) > 0.75, {"z": float(pelvis[2]), **bot.telemetry()}
-    assert abs(float(pelvis[0])) < 0.08 and abs(float(pelvis[1])) < 0.08, {
-        "xy": (float(pelvis[0]), float(pelvis[1])),
-        **bot.telemetry(),
-    }
-    assert bot._tilt_up() > 0.90, {"tilt": bot._tilt_up(), **bot.telemetry()}
-    assert bot.outcome == "ok", bot.telemetry()
-
-    tracks = _policy_tracks_vx(bot)
-    if tracks:
-        bot.reset_sim()
-        x0 = float(bot._pelvis()[0])
-        _drive(
-            bot,
-            Plan(
-                "сделай 5 шагов вперед",
-                skill="locomote",
-                params={"direction": "forward", "speed": "medium", "distance_hint": "5"},
-            ),
-            1600,
-        )
-        x1 = float(bot._pelvis()[0])
-        assert x1 > x0 + 0.04, {**bot.telemetry(), "x0": x0, "x1": x1}
-        assert bot.outcome != "fall", bot.telemetry()
-        bot.begin_command("присядь")
-        bot.step()
-        assert bot.user_cmd == "присядь", "finished walk must not clear the next command"
-    else:
-        print("walk skip: foundation checkpoint does not track vx yet")
-
-    skipped = bot.auto_trial(Plan("налево", skill="turn", params={"direction": "left"}), max_trials=1, ticks=50)
-    assert skipped.get("skipped") is True, skipped
-    assert skipped["trials"] == []
-
-    req90 = parse_requested_yaw("turn", {"direction": "left", "angle": "90"})
-    assert req90 is not None and abs(float(req90) - 0.5 * np.pi) < 0.02, req90
-
-    bot.reset_sim()
-    ry0 = float(bot.data.xpos[bot.model.body("right_elbow_link").id][1])
-    ly0 = float(bot.data.xpos[bot.model.body("left_elbow_link").id][1])
-    _drive(bot, Plan("руки в стороны", skill="reach", params={"pose": "t"}), 800)
-    ry_t = float(bot.data.xpos[bot.model.body("right_elbow_link").id][1])
-    ly_t = float(bot.data.xpos[bot.model.body("left_elbow_link").id][1])
-    assert bot.outcome != "fall", bot.telemetry()
-    assert abs(ry_t) > abs(ry0) + 0.02, {"ry0": ry0, "ry_t": ry_t}
-    assert abs(ly_t) > abs(ly0) + 0.02, {"ly0": ly0, "ly_t": ly_t}
-
-    span_t = abs(ry_t - ly_t)
-    _drive(bot, Plan("хлопни", skill="wave", params={"pose": "clap"}), 800)
-    ry_c = float(bot.data.xpos[bot.model.body("right_elbow_link").id][1])
-    ly_c = float(bot.data.xpos[bot.model.body("left_elbow_link").id][1])
-    assert abs(ry_c - ly_c) < span_t - 0.05, {"span_t": span_t, "span_c": abs(ry_c - ly_c)}
-
-    ok_sq, err_sq = evaluate_trial(
-        "squat",
-        {"h": 0.45, "vx": 0.0, "yaw": 0.0, "steps": 0.0, "wave": 0.0, "kick": 0.0, "r_arm": 0.0, "l_arm": 0.0},
-        {"h": 0.60, "vx": 0.0, "yaw": 0.0, "steps": 0.0, "wave": 0.0, "kick": 0.0, "r_arm": 0.0, "l_arm": 0.0, "fell": False},
-    )
-    assert not ok_sq and err_sq["h"] > 0, err_sq
-    ok_loc, err_loc = evaluate_trial(
-        "locomote",
-        {"h": 1.0, "vx": 0.5, "yaw": 0.0, "steps": 5.0, "wave": 0.0, "kick": 0.0, "r_arm": 0.0, "l_arm": 0.0},
-        {"h": 1.0, "vx": 0.5, "yaw": 0.0, "steps": 2.0, "wave": 0.0, "kick": 0.0, "r_arm": 0.0, "l_arm": 0.0, "fell": False},
-    )
-    assert not ok_loc and err_loc["steps"] < 0, err_loc
-    assert "cube" not in err_sq and "cube" not in err_loc
-
-    bot.reset_sim()
-    bot.policy.eval()
-    sgd0 = bot._sgd_steps
-    squat_ictx = bot.auto_trial(
-        Plan("присесть", skill="squat", params={"depth": "low"}),
-        max_trials=2,
-        ticks=200,
-    )
-    assert bot._sgd_steps == sgd0, "in-context must not backprop"
-    assert not bot.policy.training
-    assert squat_ictx["skill"] == "squat"
-    assert squat_ictx["trials"], squat_ictx
-    assert "Δheight" in squat_ictx["lines"][0] or "skill=squat" in squat_ictx["lines"][0]
-
-    bot.reset_sim()
-    loc_ictx = bot.auto_trial(
-        Plan("шаг", skill="locomote", params={"direction": "forward", "speed": "medium", "distance_hint": "3"}),
-        max_trials=2,
-        ticks=200,
-    )
-    assert loc_ictx["skill"] == "locomote"
-    assert loc_ictx["trials"]
-
-    bot._render()
-    assert bot.jpeg()[:2] == b"\xff\xd8"
-    bot.reset_sim()
-    for n in range(1, 4):
-        bot.auto_trial(
-            Plan("присесть", skill="squat", params={"depth": "low"}),
-            max_trials=1,
-            ticks=400,
-        )
-        for _ in range(200):
-            bot.step()
-        msg = bot.consolidate()
-        print(msg.replace("[Consolidate]", f"[Consolidate #{n}]", 1))
-        assert "Replay:" in msg and "Shadow MSE EMA:" in msg, msg
-    assert bot.baked
-    assert not bot.student_drive, bot.h1_report
-    assert bot.h1_report.get("requires_student_on_actuators") is False
-    assert "shadow" in bot.h1_report
-    assert ALPHA_MAX == 0.12
-    print("H1", {k: bot.h1_report[k] for k in ("h1", "mse_true", "gap_zero", "gap_abl", "stage", "alpha") if k in bot.h1_report})
-    tel = bot.telemetry()
-    print("smoke ok", {k: tel[k] for k in ("outcome", "ctrl", "pelvis_z", "tilt", "status", "skill")})
-    bot.close()
+    with tempfile.TemporaryDirectory() as tmpdir2, patch("agent.engine.CHECKPOINT_DIR", Path(tmpdir2)):
+        with TestClient(server_app.app) as client:
+            r = client.get("/")
+            assert r.status_code == 200 and "STAND-BY" in r.text and "POWER ON" in r.text
+            h = client.get("/health")
+            assert h.status_code == 200 and h.json().get("ok") is True
+            with client.websocket_connect("/ws") as ws:
+                ws.send_json({"type": "power", "state": False})
+                ws.send_json({"type": "power", "state": True})
+                ws.send_json({"type": "set_tau", "tau": 0.40})
+                got_tel = False
+                for _ in range(15):
+                    msg = ws.receive_json()
+                    if msg.get("type") == "telemetry":
+                        got_tel = True
+                        if abs(msg.get("tau_think", 0.0) - 0.40) < 1e-6:
+                            break
+                assert got_tel, "Did not receive telemetry over /ws"
+    print("[smoke] FastAPI HTTP + WebSocket UI controls OK")
+    print("[smoke] ALL CHECKS PASSED.")
 
 
 if __name__ == "__main__":

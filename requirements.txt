@@ -5,6 +5,5 @@ numpy>=1.24.0
 python-dotenv>=1.0.0
 pillow>=10.0.0
 httpx>=0.27.0
-pyyaml>=6.0
-onnxruntime>=1.17.0
-lerobot[pi] @ git+https://github.com/huggingface/lerobot.git
+torch>=2.2.0
+torchvision>=0.17.0

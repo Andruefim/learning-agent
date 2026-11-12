@@ -10,16 +10,14 @@ from __future__ import annotations
 import numpy as np
 import mujoco
 
-from agent.config import PARAM_KEYS, ROOT
+from agent.config import ROOT
 from agent.joint_pd import kp_kd_vectors
 
 MODEL_XML = ROOT / "models" / "unitree_g1" / "scene_app.xml"
 TRAIN_XML = ROOT / "models" / "unitree_g1" / "scene_train.xml"
 N_ACT = 29
 QPOS_FREE = 7
-# L2 command: vx, vy, wz, h_m, 14 arm targets. Not 31 joint angles.
 ACTION_DIM = 18
-TRIAL_FEAT = N_ACT + ACTION_DIM + len(PARAM_KEYS)
 # Actuator order (see g1_29dof.xml <actuator>). Ankle pitch comes before ankle roll.
 L_HP, L_HR, L_HYA, L_KN, L_AP, L_AR = 0, 1, 2, 3, 4, 5
 R_HP, R_HR, R_HYA, R_KN, R_AP, R_AR = 6, 7, 8, 9, 10, 11

@@ -5,6 +5,7 @@ __pycache__/
 flywheel_data/
 *.pt
 !models/unitree_g1/motion.pt
+!models/unitree_g1/standup_supermimic.pt
 *.engine
 .DS_Store
 .env
