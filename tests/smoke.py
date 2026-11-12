@@ -134,24 +134,34 @@ def smoke() -> None:
             loss_2nd_ep = bot._run_wake_update(steps=2, allow_consolidate=False)
             assert np.isfinite(loss_2nd_ep), f"Second-episode wake update failed: {loss_2nd_ep}"
 
-            # 6b. Autonomous Fall Recovery (supine floor -> SuperMimic RL -> upright stand)
+            # 6b. Autonomous Fall Recovery (supine + yaw=180 prone floor -> SuperMimic RL -> stable upright stand)
             assert bot.sys0.standup is not None, "Stand-up policy not loaded"
-            bot.set_power(False)
-            with bot._sim_lock:
-                bot.data.qpos[0:3] = [-0.6, 0.0, 0.22]
-                bot.data.qpos[3:7] = [0.7071, 0.0, -0.7071, 0.0]
-                bot.data.qvel[:] = 0.0
-                import mujoco
-                mujoco.mj_forward(bot.model, bot.data)
-            bot.step(80)
-            assert bot.sys0.fell(), "G1 did not settle into fallen state for recovery test"
-            bot.set_power(True)
-            recovered = bot._ensure_upright(timeout_s=10.0)
-            tel_rec = bot.telemetry()
-            assert recovered and not tel_rec["fell"] and tel_rec["pelvis_z"] > 0.70 and tel_rec["tilt"] > 0.90, (
-                f"Autonomous fall recovery failed: {tel_rec}"
-            )
-            print(f"[smoke] Autonomous fall recovery OK (z={tel_rec['pelvis_z']:.3f}, tilt={tel_rec['tilt']:.3f})")
+            for rec_name, rpos, rquat in (
+                ("supine", [-0.6, 0.0, 0.22], [0.7071, 0.0, -0.7071, 0.0]),
+                ("yaw180_prone", [-0.9, 0.0, 0.65], [0.0, 0.7071, 0.0, 0.7071]),
+            ):
+                bot.reset_sim()
+                bot.set_power(False)
+                with bot._sim_lock:
+                    bot.data.qpos[0:3] = rpos
+                    bot.data.qpos[3:7] = rquat
+                    bot.data.qvel[:] = 0.0
+                    import mujoco
+                    mujoco.mj_forward(bot.model, bot.data)
+                bot.step(150)
+                assert bot.sys0.fell(), f"G1 did not settle into fallen state ({rec_name})"
+                bot.set_power(True)
+                recovered = bot._ensure_upright(timeout_s=10.0)
+                assert recovered, f"Autonomous fall recovery timed out ({rec_name})"
+                # Verify post-standup handover stays rock-solid upright for 4s (no wobble / delayed topple)
+                for _ in range(200):
+                    bot.step(10)
+                    assert not bot.sys0.fell() and not bot.sys0.recovering, f"G1 wobbled/fell after {rec_name} standup"
+                tel_rec = bot.telemetry()
+                assert not tel_rec["fell"] and tel_rec["pelvis_z"] > 0.74 and tel_rec["tilt"] > 0.97, (
+                    f"Post-standup stability failed ({rec_name}): {tel_rec}"
+                )
+            print(f"[smoke] Autonomous fall recovery + 4s post-standup stability OK (z={tel_rec['pelvis_z']:.3f}, tilt={tel_rec['tilt']:.3f})")
             bot.reset_sim()
 
             # 6c. Failed-episode learning (Episodic Lesson + failure REM sleep, without fake Sys1 consolidation)

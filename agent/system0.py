@@ -110,11 +110,13 @@ def torso_imu(data: mujoco.MjData, torso_id: int) -> tuple[np.ndarray, np.ndarra
 
 
 def com_err_xy(data: mujoco.MjData, pelvis_id: int, r_fg: int, l_fg: int) -> np.ndarray:
+    """Body-frame CoM offset from support midpoint relative to STAND_COM_X."""
     com = np.asarray(data.subtree_com[pelvis_id, :2], dtype=np.float32)
     right = np.asarray(data.geom_xpos[r_fg, :2], dtype=np.float32)
     left = np.asarray(data.geom_xpos[l_fg, :2], dtype=np.float32)
     support = 0.5 * (right + left)
-    return com - support - np.array([STAND_COM_X, 0.0], dtype=np.float32)
+    yaw = heading_z(data.qpos[3:7])
+    return body_xy(com - support, yaw) - np.array([STAND_COM_X, 0.0], dtype=np.float32)
 
 
 def balance_delta(err_b: np.ndarray, d_b: np.ndarray, squat: float = 0.0) -> np.ndarray:
@@ -356,7 +358,7 @@ class System0Controller:
         if self.walk is not None:
             self.walk.reset()
         self.q_cmd = np.clip(np.asarray(self.data.qpos[self.qadr[:N_ACT]], dtype=np.float32), self.lo, self.hi)
-        self._off_prev[:] = 0.0
+        self._off_prev = com_err_xy(self.data, self.pelvis_id, self.r_fg, self.l_fg)
 
     def fell(self) -> bool:
         z = float(self.data.xpos[self.pelvis_id, 2])
@@ -391,38 +393,46 @@ class System0Controller:
         self.data.ctrl[N_ACT:] = np.clip(f_tau, self.finger_lo, self.finger_hi)
 
     def _step_standup_tick(self) -> None:
-        """Advance one 2 ms physics tick under SuperMimic RL fall-recovery control."""
+        """Advance one 2 ms physics tick under SuperMimic RL until feet & CoM settle, then actively blend into STAND_Q."""
         assert self.standup is not None
-        blend_w = min(1.0, self._rec_blend_ticks / 350.0) if self._rec_blend_ticks > 0 else 0.0
+        blend_w = min(1.0, self._rec_blend_ticks / 150.0) if self._rec_blend_ticks > 0 else 0.0
         self.data.ctrl[:N_ACT] = self.standup.torques(self.data, self.qadr, self.vadr, KP, KD, blend_w=blend_w)
         self._step_fingers(0.0, tuck_left=True, tuck_right=True)
         mujoco.mj_step(self.model, self.data)
         self._tick += 1
         self._rec_ticks += 1
 
-        if self._rec_blend_ticks == 0 and (self._rec_ticks % DECIMATION == 0):
+        # Keep SuperMimic closed-loop active even while blending out so momentum never builds up
+        if self._rec_ticks % DECIMATION == 0:
             self.standup.update(self.data, self.qadr, self.vadr)
 
         pz = float(self.data.xpos[self.pelvis_id, 2])
         tilt = float(self.data.xmat[self.torso_id].reshape(3, 3)[2, 2])
         vel_norm = float(np.linalg.norm(self.data.qvel[:6]))
+        err_b = com_err_xy(self.data, self.pelvis_id, self.r_fg, self.l_fg)
+        yaw = heading_z(self.data.qpos[3:7])
+        fb_dx = abs(float(body_xy(self.data.geom_xpos[self.l_fg, :2] - self.data.geom_xpos[self.r_fg, :2], yaw)[0]))
+
         if self._rec_blend_ticks > 0:
             self._rec_blend_ticks += 1
-            if self._rec_blend_ticks > 350:
-                self.q_cmd = STAND_Q.copy()
-                self._off_prev[:] = 0.0
+            if self._rec_blend_ticks > 150:
+                self.q_cmd = np.clip(np.asarray(self.data.qpos[self.qadr[:N_ACT]], dtype=np.float32), self.lo, self.hi)
+                self._off_prev = err_b.copy()
                 if self.walk is not None:
                     self.walk.reset()
                 self.recovering = False
+                self._rec_blend_ticks = 0
                 self.recover_cooldown = 500
-        elif pz > 0.72 and tilt > 0.94 and vel_norm < 0.45:
+        elif pz > 0.75 and tilt > 0.99 and vel_norm < 0.12 and float(np.linalg.norm(err_b)) < 0.03 and fb_dx < 0.08:
             self._rec_stable_ticks += 1
-            if self._rec_stable_ticks >= 250:
+            if self._rec_stable_ticks >= 100:
                 self._rec_blend_ticks = 1
         else:
             self._rec_stable_ticks = 0
+            if self._rec_ticks >= 2200 and pz > 0.74 and tilt > 0.97 and vel_norm < 0.20:
+                self._rec_blend_ticks = 1
 
-        if self._rec_ticks >= 4000 and self.recovering:
+        if self._rec_ticks >= 4500 and self.recovering:
             self.stop_standup()
             self.recover_cooldown = 500
 
@@ -454,8 +464,8 @@ class System0Controller:
         self._tick += 1
         if pol.done and (self._flip_sub % DECIMATION == 0):
             self.flipping = False
-            self.q_cmd = STAND_Q.copy()
-            self._off_prev[:] = 0.0
+            self.q_cmd = np.clip(np.asarray(self.data.qpos[self.qadr[:N_ACT]], dtype=np.float32), self.lo, self.hi)
+            self._off_prev = com_err_xy(self.data, self.pelvis_id, self.r_fg, self.l_fg)
             self.recover_cooldown = 120
 
     def step_physics(self, raw_action: np.ndarray, *, power_on: bool = True, tuck_left: bool = True, tuck_right: bool = False) -> None:
@@ -483,11 +493,10 @@ class System0Controller:
         q_target = self._raw_to_qdes(raw_action)
 
         # CoM upright balance prior in body coordinates
-        off = com_err_xy(self.data, self.pelvis_id, self.r_fg, self.l_fg)
-        d_off = off - self._off_prev
-        self._off_prev = off.copy()
-        yaw = heading_z(self.data.qpos[3:7])
-        bal = balance_delta(body_xy(off, yaw), body_xy(d_off, yaw), squat=squat)
+        err_b = com_err_xy(self.data, self.pelvis_id, self.r_fg, self.l_fg)
+        d_b = err_b - self._off_prev
+        self._off_prev = err_b.copy()
+        bal = balance_delta(err_b, d_b, squat=squat)
 
         q_des = np.clip(q_target + bal, self.lo, self.hi)
         delta = np.clip(q_des - self.q_cmd, -SLEW_RAD, SLEW_RAD)
