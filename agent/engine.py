@@ -38,6 +38,7 @@ from agent.config import (
     SUBSTEPS_PER_COG_STEP,
     TAU_THINK_DEFAULT,
 )
+from agent.flip_policy import wants_flip
 from agent.h2 import MODEL_XML, N_ACT, actuator_addrs, disable_wrist_mesh_contacts, joint_limits
 from agent.planner import VisionLanguagePlanner
 from agent.sleep import FoundationVLAWithCMS, Learner, SleepConfig, tokenize
@@ -148,6 +149,9 @@ class CognitiveRobotEngine:
         # Command queue for worker thread
         self._cmd_cv = threading.Condition()
         self._pending_cmd: Optional[str] = None
+        self._active_goal: Optional[str] = None
+        self._goal_retries_left: int = 0
+        self._max_post_sleep_retries: int = 2
         self._worker_stop = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
 
@@ -221,11 +225,19 @@ class CognitiveRobotEngine:
         return self._task_vocab[key]
 
     # ------------------------------------------------------------------ HAL / UI controls
+    def _clear_goal_locked(self, *, clear_pending: bool = True) -> None:
+        self._active_goal = None
+        self._goal_retries_left = 0
+        if clear_pending:
+            self._pending_cmd = None
+
     def set_power(self, on: bool) -> None:
         self.power_on = bool(on)
         if not self.power_on:
             self._abort_flag = True
             self._executing = False
+            with self._cmd_cv:
+                self._clear_goal_locked()
             self.state = "OFF"
             self.log_event("warn", "Питание моторов отключено (E-Stop).")
         else:
@@ -233,8 +245,9 @@ class CognitiveRobotEngine:
             self.state = "STANDBY" if self.standby_mode else "IDLE"
             self.log_event("info", "Питание включено. System 0 удерживает стойку.")
 
-    def set_standby(self, on: bool) -> None:
+    def set_standby(self, on: bool, *, resume_goal: bool = True) -> None:
         self.standby_mode = bool(on)
+        resumed_goal: Optional[str] = None
         if self.standby_mode:
             self._abort_flag = True
             self._executing = False
@@ -248,8 +261,15 @@ class CognitiveRobotEngine:
             self._abort_flag = False
             self.state = "IDLE" if self.power_on else "OFF"
             self.log_event("info", "Выход из Stand-by: ассистент готов к командам.")
+            with self._cmd_cv:
+                if resume_goal and self.power_on and self._active_goal and self._pending_cmd is None:
+                    self._pending_cmd = self._active_goal
+                    self.current_command = self._active_goal
+                    resumed_goal = self._active_goal
         with self._cmd_cv:
             self._cmd_cv.notify_all()
+        if resumed_goal:
+            self.log_event("info", f"[Wake-up] После сна продолжаю незавершённую задачу «{resumed_goal}»...")
 
     def set_tau_think(self, tau: float) -> None:
         self.tau_think = float(np.clip(tau, 0.05, 1.0))
@@ -258,6 +278,8 @@ class CognitiveRobotEngine:
     def reset_sim(self) -> None:
         self._abort_flag = True
         self._executing = False
+        with self._cmd_cv:
+            self._clear_goal_locked()
         self.sys2.marker_pos = None
         with self._sim_lock:
             self._active_raw = default_raw_action()
@@ -281,6 +303,8 @@ class CognitiveRobotEngine:
         if any(w in low for w in ("стой", "стоп", "остановись", "stop", "halt")):
             self._abort_flag = True
             self._executing = False
+            with self._cmd_cv:
+                self._clear_goal_locked()
             self._active_raw = default_raw_action()
             self._tuck_left = True
             self._tuck_right = True
@@ -314,11 +338,16 @@ class CognitiveRobotEngine:
             return {"ok": False, "error": "Power is OFF"}
 
         if self.standby_mode:
-            self.set_standby(False)
+            self.set_standby(False, resume_goal=False)
 
         with self._cmd_cv:
             self._abort_flag = True
             self._pending_cmd = raw
+            if wants_flip(raw):
+                self._clear_goal_locked(clear_pending=False)
+            else:
+                self._active_goal = raw
+                self._goal_retries_left = self._max_post_sleep_retries
             self._cmd_cv.notify_all()
         self.current_command = raw
         self._last_activity = time.time()
@@ -483,6 +512,7 @@ class CognitiveRobotEngine:
             if (
                 self.power_on
                 and not self.standby_mode
+                and not self.sys0.flipping
                 and not was_rec
                 and self.sys0.recover_cooldown <= 0
                 and self.sys0.fell()
@@ -602,6 +632,50 @@ class CognitiveRobotEngine:
         self.log_event("sys1", f"[System 1] Навык «{command}» выполнен автономно (σ={self.current_uncertainty:.3f}).")
         return True
 
+    def _run_flip(self, command: str) -> None:
+        """Execute pretrained ONNX backflip policy under System 0 control."""
+        with self._sim_lock:
+            started = self.sys0.start_flip()
+        if not started:
+            self.log_event("warn", "[System 0] Политика сальто (models/g1_flip) не загружена.")
+            return
+        self.state = "SYS1"
+        t0 = time.perf_counter()
+        self.log_event("sys1", f"[System 0] Запуск политики сальто «{command}» (wbc-mjlab ONNX)...")
+        deadline = time.perf_counter() + 6.0
+        while time.perf_counter() < deadline:
+            if not self.power_on or self.standby_mode or self._abort_flag:
+                with self._sim_lock:
+                    self.sys0.flipping = False
+                return
+            with self._sim_lock:
+                still = self.sys0.flipping
+            if not still:
+                break
+            if self._worker_thread is None:
+                self.step(10)
+            else:
+                self._step_event.clear()
+                self._step_event.wait(timeout=0.05)
+
+        # Let landing settle briefly, then auto-recover if landing caused a fall
+        for _ in range(15):
+            if not self.power_on or self.standby_mode:
+                break
+            if self._worker_thread is None:
+                self.step(10)
+            else:
+                self._step_event.clear()
+                self._step_event.wait(timeout=0.05)
+        with self._sim_lock:
+            fell_after = self.sys0.fell()
+        if fell_after and self.power_on and not self.standby_mode:
+            self.log_event("warn", "[System 0] После приземления требуется вставание — запускаю SuperMimic RL...")
+            self._ensure_upright()
+        else:
+            self.log_event("sys1", "[System 0] Сальто выполнено!")
+        self.latency_ms = (time.perf_counter() - t0) * 1000.0
+
     def _execute_command(self, command: str) -> None:
         self._abort_flag = False
         self._executing = True
@@ -612,7 +686,17 @@ class CognitiveRobotEngine:
             if need_standup:
                 if not self._ensure_upright():
                     self.log_event("warn", "[System 0] Не удалось встать перед выполнением команды.")
+                    with self._cmd_cv:
+                        if self._active_goal == command:
+                            self._clear_goal_locked(clear_pending=False)
                     return
+
+            if wants_flip(command):
+                with self._cmd_cv:
+                    if self._active_goal == command:
+                        self._clear_goal_locked(clear_pending=False)
+                self._run_flip(command)
+                return
 
             head_rgb = self._get_head_rgb_blocking()
             with self._sim_lock:
@@ -633,6 +717,9 @@ class CognitiveRobotEngine:
                     f"[System 1] σ={sigma:.3f} <= τ={self.tau_think:.2f} · {ms:.1f} мс · Автопилот по памяти CMS!",
                 )
                 if self._run_sys1_closed_loop(command, chunk, verify=True):
+                    with self._cmd_cv:
+                        if self._active_goal == command:
+                            self._clear_goal_locked(clear_pending=False)
                     return
 
             # Fallback / Deliberative System 2 (VLM + Locomotion + Whole-Body IK)
@@ -656,6 +743,9 @@ class CognitiveRobotEngine:
             self.latency_ms = (time.perf_counter() - t0) * 1000.0
             samples = res.get("samples") or []
             if res.get("ok") and samples:
+                with self._cmd_cv:
+                    if self._active_goal == command:
+                        self._clear_goal_locked(clear_pending=False)
                 tid = self._task_id(command)
                 for rgb_128, pr, cmd, ch in samples:
                     self.wake_buffer.append((rgb_128, pr, cmd, ch, tid))
@@ -670,6 +760,7 @@ class CognitiveRobotEngine:
             else:
                 self.log_event("warn", f"[System 2] Команда «{command}» не завершена ({res.get('reason', 'unknown')}).")
                 self._handle_failed_episode(command, skill_key, head_rgb, proprio, chunk, samples, res.get("failure_info"))
+                self._maybe_schedule_retry(command, str(res.get("reason", "")))
         except Exception as exc:
             self.log_event("error", f"Ошибка выполнения «{command}»: {exc}")
         finally:
@@ -730,6 +821,34 @@ class CognitiveRobotEngine:
 
         if self.power_on and not self.standby_mode:
             self._run_failure_sleep()
+
+    def _maybe_schedule_retry(self, command: str, reason: str) -> None:
+        """Re-queue an unfinished goal after failure sleep while retries remain."""
+        non_retryable = reason in ("VLM недоступна", "Остановлено")
+        with self._cmd_cv:
+            if self._active_goal != command or self._pending_cmd is not None:
+                return
+            if non_retryable or not self.power_on or self.standby_mode or self._abort_flag:
+                if non_retryable or not self.power_on or self._abort_flag:
+                    self._clear_goal_locked(clear_pending=False)
+                return
+            if self._goal_retries_left <= 0:
+                self._clear_goal_locked(clear_pending=False)
+                self.log_event(
+                    "warn",
+                    f"[Авто-продолжение] Лимит попыток для «{command}» исчерпан — останавливаюсь.",
+                )
+                return
+            self._goal_retries_left -= 1
+            attempt_num = (self._max_post_sleep_retries - self._goal_retries_left) + 1
+            total_attempts = self._max_post_sleep_retries + 1
+            self._pending_cmd = command
+            self.current_command = command
+            self._cmd_cv.notify_all()
+        self.log_event(
+            "info",
+            f"[Авто-продолжение] После сна повторяю «{command}» с учётом урока (попытка {attempt_num}/{total_attempts})...",
+        )
 
     def _run_failure_sleep(self) -> None:
         """Automatic post-failure REM sleep: explore away from failed trajectories without polluting System 1."""

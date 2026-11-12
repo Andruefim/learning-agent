@@ -7,6 +7,7 @@ import mujoco
 
 from agent.config import DECIMATION, FALL_Z, PHYSICS_DT, SLEEP_ACTION_DIM, SLEEP_PROPRIO_DIM, SLEW_RAD, TILT_LIM
 from agent.dex3 import FINGER_KD, FINGER_KP, HOOK_LOCAL_L, HOOK_LOCAL_R, finger_pose
+from agent.flip_policy import FlipPolicy, flip_torque, load_g1_flip
 from agent.g1_walk import G1LegPolicy, load_g1_walk
 from agent.standup import G1StandUpPolicy, load_g1_standup
 from agent.h2 import (
@@ -275,6 +276,10 @@ class System0Controller:
 
         self.walk: G1LegPolicy | None = load_g1_walk()
         self.standup: G1StandUpPolicy | None = load_g1_standup()
+        self.flip: FlipPolicy | None = load_g1_flip()
+        self.flipping = False
+        self._flip_q = STAND_Q.copy()
+        self._flip_sub = 0
         self.recovering = False
         self._rec_ticks = 0
         self._rec_stable_ticks = 0
@@ -314,6 +319,8 @@ class System0Controller:
         self.q_cmd = STAND_Q.copy()
         self._off_prev[:] = 0.0
         self._tick = 0
+        self.flipping = False
+        self._flip_sub = 0
         self.recovering = False
         self._rec_ticks = 0
         self._rec_stable_ticks = 0
@@ -419,6 +426,38 @@ class System0Controller:
             self.stop_standup()
             self.recover_cooldown = 500
 
+    def start_flip(self) -> bool:
+        """Start pretrained 50 Hz ONNX backflip tracker at the current XY position."""
+        if self.flip is None:
+            return False
+        self.recovering = False
+        here = (float(self.data.qpos[0]), float(self.data.qpos[1]))
+        self.flip.reset(self.model, self.data, self.qadr, self.vadr, xy=here)
+        self._flip_q = self.flip.joint_pos[0].copy()
+        self._flip_sub = 0
+        if self.walk is not None:
+            self.walk.reset()
+        self.flipping = True
+        return True
+
+    def _step_flip_tick(self) -> None:
+        """Advance one 2 ms physics tick under pretrained backflip policy."""
+        assert self.flip is not None
+        pol = self.flip
+        if self._flip_sub % DECIMATION == 0 and not pol.done:
+            self._flip_q = pol.act(self.model, self.data, self.qadr, self.vadr)
+        self._flip_sub += 1
+        self.data.ctrl[:N_ACT] = flip_torque(self.model, self.data, self._flip_q, pol, self.qadr, self.vadr)
+        self._step_fingers(0.0, tuck_left=True, tuck_right=True)
+        mujoco.mj_step(self.model, self.data)
+        self.q_cmd = self._flip_q.copy()
+        self._tick += 1
+        if pol.done and (self._flip_sub % DECIMATION == 0):
+            self.flipping = False
+            self.q_cmd = STAND_Q.copy()
+            self._off_prev[:] = 0.0
+            self.recover_cooldown = 120
+
     def step_physics(self, raw_action: np.ndarray, *, power_on: bool = True, tuck_left: bool = True, tuck_right: bool = False) -> None:
         """Advance simulation by one 2 ms physics tick under System 0 stabilization."""
         if self.recover_cooldown > 0:
@@ -426,9 +465,14 @@ class System0Controller:
         if not power_on:
             if self.recovering:
                 self.recovering = False
+            if self.flipping:
+                self.flipping = False
             self.data.ctrl[:] = 0.0
             mujoco.mj_step(self.model, self.data)
             self._tick += 1
+            return
+        if self.flipping and self.flip is not None:
+            self._step_flip_tick()
             return
         if self.recovering and self.standup is not None:
             self._step_standup_tick()

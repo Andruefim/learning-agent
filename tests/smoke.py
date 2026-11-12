@@ -188,6 +188,63 @@ def smoke() -> None:
             assert bot._effective_sigma("сломанный тест", 0.10) >= 0.85
             print("[smoke] Post-failure REM sleep & episodic lesson learning OK")
 
+            # 6d. Pretrained ONNX Backflip skill (with automatic fall recovery if needed)
+            assert bot.sys0.flip is not None, "Flip policy not loaded"
+            bot.reset_sim()
+            bot._execute_command("сделай сальто")
+            tel_flip = bot.telemetry()
+            assert not bot.sys0.flipping and not tel_flip["fell"] and tel_flip["pelvis_z"] > 0.70, (
+                f"Backflip post-state failed: {tel_flip}"
+            )
+            print(f"[smoke] Backflip ONNX skill OK (z={tel_flip['pelvis_z']:.3f}, tilt={tel_flip['tilt']:.3f})")
+            bot.reset_sim()
+
+            # 6e. Post-sleep autonomous continuation (retry after failure sleep + standby wake resume + Stop/Reset cancel)
+            disp_retry = bot.dispatch_command("автоповтор тест")
+            assert disp_retry.get("ok") and bot._active_goal == "автоповтор тест" and bot._goal_retries_left == 2
+            with bot._cmd_cv:
+                queued_cmd = bot._pending_cmd
+                bot._pending_cmd = None
+            assert queued_cmd == "автоповтор тест"
+            with (
+                patch.object(
+                    bot.sys2,
+                    "execute",
+                    return_value={
+                        "ok": False,
+                        "reason": "attempts_exhausted",
+                        "samples": bad_samples,
+                        "failure_info": {
+                            "before_rgb": np.zeros((480, 640, 3), dtype=np.uint8),
+                            "after_rgb": np.zeros((480, 640, 3), dtype=np.uint8),
+                            "target_pt": np.array([0.8, 0.0, 0.4]),
+                            "tried_motions": ["pull_back"],
+                            "ik_err_cm": 18.0,
+                            "fell": False,
+                            "what": "no visible change",
+                        },
+                    },
+                ),
+                patch.object(bot.planner, "reflect_failure", return_value="move closer before pulling"),
+            ):
+                bot._execute_command("автоповтор тест")
+            assert bot._pending_cmd == "автоповтор тест", "Failed episode did not auto-requeue command after failure sleep"
+            assert bot._goal_retries_left == 1
+
+            with bot._cmd_cv:
+                bot._pending_cmd = None
+            bot.set_standby(True)
+            assert bot._active_goal == "автоповтор тест"
+            bot.set_standby(False)
+            assert bot._pending_cmd == "автоповтор тест", "Exiting standby did not resume active goal"
+
+            bot.dispatch_command("стоп")
+            assert bot._active_goal is None and bot._pending_cmd is None
+            bot.dispatch_command("второй тест")
+            bot.reset_sim()
+            assert bot._active_goal is None and bot._pending_cmd is None
+            print("[smoke] Post-sleep autonomous continuation & cancel OK")
+
             # 6. HAL switches + rendering MJPEG check
             bot.set_power(False)
             assert bot.telemetry()["state"] == "OFF"
