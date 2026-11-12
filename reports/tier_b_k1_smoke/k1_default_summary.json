@@ -1,0 +1,13 @@
+{
+  "mode": "k1_default",
+  "n": 10,
+  "successes": 5,
+  "success_rate": 0.5,
+  "wilson95": [
+    0.23658959361548731,
+    0.7634104063845126
+  ],
+  "mean_attempts": 1.0,
+  "total_wall_s": 218.0955048999749,
+  "path": "C:\\Users\\Andrey\\Desktop\\agi\\learning-agent\\reports\\tier_b_k1_smoke\\k1_default.jsonl"
+}

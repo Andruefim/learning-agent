@@ -17,12 +17,13 @@ friction/stiffness. The student must never see those privileged fields.
 
 | Gate | Result | Evidence |
 |---|---|---|
-| 3.1 zero policy | PASS | `reports/gate31_zero/summary.json` — 0/20 success, 0 falls |
-| 3.2A Tier A K=1 | PASS | `reports/tier_a_gate100/summary.json` — 100/100, Wilson95 ≥ 0.96 |
-| 3.2B Tier B | PASS | `reports/tier_b_gate100/tier_b_report.md` — k1=0%, k5_random=60% [0.50,0.69], k5_llm=82% [0.73,0.88]; Wilson intervals non-overlapping |
-| 3.3 dataset | code ready | `scripts/collect_flywheel_data.py`, `agent/oven_dataset.py`, `scripts/validate_dataset.py` |
-| 3.4 student BC | code ready | `scripts/train_student_oven.py` |
-| 3.5 DAgger | code ready | `scripts/run_dagger.py` |
+| 3.1 zero policy | PASS (clean) | `reports/gate31_zero/summary.json` — 0/20 success, 0 falls — **not contaminated** |
+| 3.2A Tier A K=1 | CONTAMINATED | privileged door `qfrc` assist — see `reports/*/CONTAMINATED.md` |
+| 3.2B Tier B | CONTAMINATED | θ search over assist teacher — invalid until honest rerun |
+| Day A ablation | running | `reports/day_a_ablation/` Rule 7 + stages 1/2/3 |
+| 3.3 dataset | PASS | `data/oven_flywheel` — D_success=498, D_histories=217 (150 recovery), schema ok |
+| 3.4 student BC | partial | val loss ↓ (1.28→0.79 BC; →0.76+trials) but open-loop MSE 0.69 > mean-baseline 0.20 — not yet Gate 3.4; ckpts `checkpoints/student_v0*` |
+| 3.5 DAgger / student-only | FAIL | mixed DAgger 3×40 @100%; student-only `reports/student_only_eval100/summary.json` — **0/100** (Wilson [0,0.037]), 0 falls. Root cause: Tier A success needs privileged door torque assist; student arms-only closed loop cannot open the hinge. |
 | 3.6 student-only | code ready | `STUDENT_ONLY_EVAL` in `agent/config.py` + `_mix` in `flywheel.py` |
 | 3.7 H1 closed-loop | code ready | `scripts/run_h1_closed_loop.py` → `reports/h1_closed_loop.md` |
 | 3.8 flywheel turns | code ready | `scripts/run_flywheel_loop.py` → `reports/flywheel.csv` |

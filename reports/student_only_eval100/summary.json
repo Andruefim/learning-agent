@@ -1,0 +1,13 @@
+{
+  "n": 100,
+  "successes": 0,
+  "success_rate": 0.0,
+  "falls": 0,
+  "wilson95": [
+    0.0,
+    0.03699480747600191
+  ],
+  "loaded": true,
+  "ckpt": "checkpoints\\student_dagger\\round_3\\flow_policy.pt",
+  "wall_s": 1260.3298258781433
+}

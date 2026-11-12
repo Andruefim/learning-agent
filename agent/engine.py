@@ -30,6 +30,7 @@ from agent.config import (
     VISION_STRIDE,
     VISION_W,
 )
+from agent.flip_policy import wants_flip
 from agent.flywheel import FlywheelMixin
 from agent.g1_walk import load_g1_walk
 from agent.h2 import (
@@ -206,6 +207,7 @@ class RobotEngine(FlywheelMixin):
         self._ep_slept = False
         self._ep_failed = False
         self._awaiting_plan = False
+        self._flip = None
         self._quiet_tick: int | None = None
         self._reach_sol: np.ndarray | None = None
         self._reach_tick = -10**9
@@ -1306,6 +1308,44 @@ class RobotEngine(FlywheelMixin):
             self._turn_heading0 = None
             self._requested_yaw = None
             self.status = self.user_cmd or "stand"
+            if wants_flip(text):
+                self._start_flip()
+
+    def _start_flip(self) -> None:
+        from agent.flip_policy import FlipPolicy
+
+        pol = FlipPolicy(clip="flip_04.npz")
+        here = (float(self.data.qpos[0]), float(self.data.qpos[1]))
+        pol.reset(self.model, self.data, self.qadr, xy=here)
+        self._flip = pol
+        self._flip_q = pol.joint_pos[0].copy()
+        self._flip_sub = 0
+        self._awaiting_plan = False
+        self.outcome = "ok"
+        self.status = "сальто"
+        if self.walk is not None:
+            self.walk.reset()
+
+    def _step_flip(self) -> None:
+        from agent.flip_policy import flip_torque
+
+        pol = self._flip
+        nsub = max(1, int(round(0.02 / float(self.model.opt.timestep))))
+        if self._flip_sub % nsub == 0 and not pol.done:
+            self._flip_q = pol.act(self.model, self.data, self.qadr, self.vadr)
+        self._flip_sub += 1
+        self.data.ctrl[:N_ACT] = flip_torque(self.model, self.data, self._flip_q, pol, self.qadr, self.vadr)
+        if self.finger_qadr.size:
+            self.data.ctrl[N_ACT:] = 0
+        mujoco.mj_step(self.model, self.data)
+        self.q_cmd = self._flip_q
+        self.ctrl_source = "flip"
+        self._tick += 1
+        if pol.done and self._flip_sub % nsub == 0:
+            self._flip = None
+            self.user_cmd = ""
+            self.intent = ""
+            self.status = "сальто готово"
 
     def apply_plan(self, plan: Plan, *, fresh: bool, l1_ok: bool = True):
         with self.lock:
@@ -1515,6 +1555,11 @@ class RobotEngine(FlywheelMixin):
                 # hold: allow one more check much later, not immediately
                 self._need_verify = False
                 self._note("L1: ещё не сделано — продолжаю.")
+
+    def defer_l1(self, seconds: float) -> None:
+        """Skip the next planner calls. Used when pointing already failed."""
+        with self.lock:
+            self.last_l1 = time.monotonic() + max(0.0, float(seconds)) - L1_PERIOD
 
     def l1_due(self) -> bool:
         with self.lock:
@@ -1816,6 +1861,9 @@ class RobotEngine(FlywheelMixin):
             TORCH_GATE.release()
 
     def _step_torch(self):
+        if getattr(self, "_flip", None) is not None:
+            self._step_flip()
+            return
         err = self._balance_err()
         self.errors.append(err.copy())
         proprio = self._hinges()

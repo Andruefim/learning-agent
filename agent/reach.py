@@ -209,7 +209,8 @@ def cast_grasp_uv(model, data, pelvis_id: int, u: float, v: float) -> tuple[bool
     if "wall" in name or "floor" in name or name in {"world", "ground"}:
         return False, root
     u_f, v_f = float(u), float(v)
-    if u_f < 0.12 or u_f > 0.88 or v_f < 0.12 or v_f > 0.88:
+    # Only drop the extreme frame edge. A handle at the side of the head view is still a hit.
+    if u_f < 0.02 or u_f > 0.98 or v_f < 0.02 or v_f > 0.98:
         return False, root
     return True, root
 

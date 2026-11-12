@@ -1,0 +1,9 @@
+Whole-body tracking policy and the flip_02 clip.
+
+Source: https://github.com/wbc-mjlab/wbc-g1-deploy
+Commit: 6dabf86f
+Files: config/policy/wbc/params/policy.onnx, config/policy/wbc/params/config.yaml, config/clips/flip_02.npz
+
+The policy was trained in wbc-mjlab on LAFAN1 plus a small set of BONES-SEED flips.
+flip_02 is the flip clip that repository enables by default.
+Action is a residual on the clip joint pose. Control rate is 50 Hz.

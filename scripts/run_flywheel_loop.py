@@ -52,9 +52,12 @@ def eval_student(ckpt: Path, n: int, seed: int, seconds: float) -> dict:
     device = resolve_device()
     policy = FlowPolicy().to(device)
     loaded = ckpt.exists() and load_state(policy, ckpt, device)
+    from agent.joint_pd import compute_torques
+
     scene = OvenScene()
     eye = EyeCamera(scene.model)
     ok = falls = 0
+    t_run = time.time()
     for i in range(n):
         s = seed + i
         applied = scene.reset(s, randomize=True, theta=DEFAULT_THETA)
@@ -64,10 +67,12 @@ def eval_student(ckpt: Path, n: int, seed: int, seconds: float) -> dict:
         stud_cmd[3] = 0.78
         max_ticks = max(1, int(seconds / scene.dt))
         success = fell = False
+        t_ep = time.time()
         for tick in range(max_ticks):
-            img = eye.render(scene.data)
-            prop = proprio_from_qpos(scene.qadr, scene.data.qpos)
+            # Render only when the policy queries vision (VISION_STRIDE=4).
             if tick % 4 == 0:
+                img = eye.render(scene.data)
+                prop = proprio_from_qpos(scene.qadr, scene.data.qpos)
                 with torch.no_grad():
                     image = torch.as_tensor(img, device=device, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
                     proprio = torch.as_tensor(prop, device=device, dtype=torch.float32).unsqueeze(0)
@@ -78,8 +83,6 @@ def eval_student(ckpt: Path, n: int, seed: int, seconds: float) -> dict:
                     stud_cmd = clip_command(chunk[0, 0].cpu().numpy().astype(np.float32))
             q = STAND_Q.copy()
             q[15:29] = stud_cmd[4:18]
-            from agent.joint_pd import compute_torques
-
             tau = compute_torques(scene.model, scene.data, q, scene.kp, scene.kd, scene.qadr, scene.vadr)
             scene.data.ctrl[:29] = tau
             scene.data.qvel[0:6] = 0.0
@@ -98,7 +101,16 @@ def eval_student(ckpt: Path, n: int, seed: int, seconds: float) -> dict:
                 break
         ok += int(success)
         falls += int(fell)
+        print(
+            f"eval [{i+1}/{n}] seed={s} success={success} fell={fell} "
+            f"rate={ok/max(i+1,1):.3f} wall={time.time()-t_ep:.1f}s",
+            flush=True,
+        )
         if (i + 1) % 10 == 0:
+            try:
+                eye.close()
+            except Exception:
+                pass
             scene = OvenScene()
             eye = EyeCamera(scene.model)
     return {
@@ -109,6 +121,7 @@ def eval_student(ckpt: Path, n: int, seed: int, seconds: float) -> dict:
         "wilson95": wilson(ok, n),
         "loaded": loaded,
         "ckpt": str(ckpt),
+        "wall_s": time.time() - t_run,
     }
 
 

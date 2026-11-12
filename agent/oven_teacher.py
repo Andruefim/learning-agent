@@ -424,6 +424,7 @@ def run_tier_a_episode(
     record: bool = False,
     attempt: int = 1,
     eye=None,
+    record_stride: int | None = None,
 ) -> dict:
     """Run one Tier A episode.
 
@@ -456,6 +457,7 @@ def run_tier_a_episode(
             seed=int(seed),
             theta=dict(scene.theta),
             attempt=int(attempt),
+            stride=record_stride,
         )
     max_ticks = max(1, int(seconds / scene.dt))
     outcome = "timeout"

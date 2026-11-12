@@ -114,13 +114,22 @@ class EyeCamera:
 
 
 class EpisodeRecorder:
-    """Buffers student-visible ticks (+ optional privileged) at VISION_STRIDE."""
+    """Buffers student-visible ticks (+ optional privileged) at a vision stride."""
 
-    def __init__(self, *, prompt: str, seed: int, theta: dict, attempt: int = 1):
+    def __init__(
+        self,
+        *,
+        prompt: str,
+        seed: int,
+        theta: dict,
+        attempt: int = 1,
+        stride: int | None = None,
+    ):
         self.prompt = str(prompt)
         self.seed = int(seed)
         self.theta = {k: float(v) for k, v in dict(theta).items()}
         self.attempt = int(attempt)
+        self.stride = max(1, int(stride if stride is not None else VISION_STRIDE))
         self.images: list[np.ndarray] = []
         self.proprio: list[np.ndarray] = []
         self.cmd: list[np.ndarray] = []
@@ -140,7 +149,7 @@ class EpisodeRecorder:
         handle_pos: np.ndarray | None = None,
         hinge_pos: np.ndarray | None = None,
     ) -> None:
-        if self.tick % max(1, int(VISION_STRIDE)) != 0:
+        if self.tick % self.stride != 0:
             self.tick += 1
             return
         self.images.append(np.asarray(image, dtype=np.uint8).copy())
@@ -230,7 +239,7 @@ def save_episode(
         "theta": recorder.theta,
         "success": bool(success),
         "n_frames": int(recorder.n_frames()),
-        "vision": {"h": VISION_H, "w": VISION_W, "stride": VISION_STRIDE},
+        "vision": {"h": VISION_H, "w": VISION_W, "stride": int(getattr(recorder, "stride", VISION_STRIDE))},
         "action_dim": ACTION_DIM,
         "chunk": CHUNK,
         **meta,

@@ -25,6 +25,11 @@ TRACK_OK = 0.05
 BRACE_TILT = 0.72
 FALL_Z = 0.50
 STAND_Z = 0.78
+# Honest oven success (Day A Rule 7 + contact). Thresholds are logged per episode.
+OVEN_SUCCESS_ANGLE = 0.8
+OVEN_SUCCESS_HOLD_S = 1.0
+OVEN_CONTACT_OPEN_MS = 200.0
+OVEN_CONTACT_MIN_ANGLE = 0.4
 BRACE_ERR_WIN = 80
 BRACE_TILT_WIN = 40
 TURN_IN_CONTEXT_OK = False

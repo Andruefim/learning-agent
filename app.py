@@ -23,6 +23,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from starlette.websockets import WebSocketState
 
 from agent import Plan, RobotEngine
+from agent.flip_policy import wants_flip
 from agent.reach import GRASP_TRIES, attach_reach, merge_grasp_point, plan_wants_grasp_point, strip_planner_pixels
 
 engine: RobotEngine | None = None
@@ -97,7 +98,9 @@ def eye_feed():
 async def _resolve_grasp(bot: RobotEngine, cmd: str, plan: Plan, jpeg: bytes) -> None:
     """Vision-only u,v merged into a motion-only plan, then raycast-validated."""
     prior = bot.reach_prior()
-    attempts = min(3, int(GRASP_TRIES))
+    # One vision call per cycle. The free tier 503s when this loops, and the robot
+    # stands still until a pixel is accepted.
+    attempts = 1
     for _ in range(attempts):
         point_plan, pt_ok = await bot.planner.plan_point(cmd, jpeg, prior=prior)
         if not pt_ok or not merge_grasp_point(plan, point_plan):
@@ -117,6 +120,8 @@ async def _resolve_grasp(bot: RobotEngine, cmd: str, plan: Plan, jpeg: bytes) ->
         attach_reach(plan, cmd)
         prior = {"u": float(u), "v": float(v), "hand": str(hg.get("hand") or "right")}
     print("grasp: no valid pixel after pointing", flush=True)
+    bot._note("Ручка не найдена в кадре. Стоит, повтор через 15 с.")
+    bot.defer_l1(15.0)
 
 
 async def _run_l1(bot: RobotEngine, text: str, *, fresh: bool) -> Plan:
@@ -168,6 +173,9 @@ async def ws(sock: WebSocket):
                 if kind == "command":
                     text = str(raw.get("text", "")).strip()
                     bot.begin_command(text)
+                    if wants_flip(text):
+                        await sock.send_json({"type": "log", "text": f"«{text}» → сальто"})
+                        continue
                     plan = await _run_l1(bot, text, fresh=True)
                     tel = bot.telemetry()
                     if tel["l1_ok"]:

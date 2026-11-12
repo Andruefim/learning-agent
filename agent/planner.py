@@ -68,10 +68,85 @@ def resolve_ollama_url(spec: str | None = None) -> str:
 
 class Level1Planner:
     def __init__(self):
-        self.model = os.getenv("L1_MODEL", "qwen3.5:9b-q8_0").strip()
+        self.api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = (
+            os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+            if self.api_key
+            else os.getenv("L1_MODEL", "qwen3.5:9b-q8_0").strip()
+        )
         self.base_url = resolve_ollama_url()
         self.last_err = ""
-        print(f"L1 planner model={self.model} url={self.base_url}", flush=True)
+        if self.api_key:
+            print(f"L1 planner model={self.model} via Gemini API", flush=True)
+        else:
+            print(f"L1 planner model={self.model} url={self.base_url}", flush=True)
+
+    async def _complete(self, prompt: str, image: bytes, max_tokens: int) -> str:
+        if self.api_key:
+            return await self._gemini(prompt, image, max_tokens)
+        return await self._ollama(prompt, image, max_tokens)
+
+    async def _gemini(self, prompt: str, image: bytes, max_tokens: int) -> str:
+        import httpx
+
+        parts: list[dict] = [{"text": prompt}]
+        if image:
+            parts.append(
+                {
+                    "inline_data": {
+                        "mime_type": "image/png" if image[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg",
+                        "data": base64.b64encode(image).decode("ascii"),
+                    }
+                }
+            )
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.model}:generateContent"
+        )
+        body = {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": max_tokens,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(url, headers={"x-goog-api-key": self.api_key}, json=body)
+            if r.status_code == 400 and "thinkingConfig" in body["generationConfig"]:
+                body["generationConfig"].pop("thinkingConfig", None)
+                r = await client.post(url, headers={"x-goog-api-key": self.api_key}, json=body)
+            r.raise_for_status()
+            data = r.json()
+        texts = []
+        for part in data["candidates"][0]["content"].get("parts") or []:
+            if part.get("thought"):
+                continue
+            if part.get("text"):
+                texts.append(part["text"])
+        if not texts:
+            raise RuntimeError("empty Gemini response")
+        return "".join(texts)
+
+    async def _ollama(self, prompt: str, image: bytes, max_tokens: int) -> str:
+        import httpx
+
+        message: dict = {"role": "user", "content": prompt}
+        if image:
+            message["images"] = [base64.b64encode(image).decode("ascii")]
+        payload = {
+            "model": self.model,
+            "messages": [message],
+            "stream": False,
+            "format": "json",
+            "think": False,
+            "options": {"temperature": 0, "num_ctx": 8192, "num_predict": max_tokens, "think": False},
+        }
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(f"{self.base_url}/api/chat", json=payload)
+            r.raise_for_status()
+            return r.json()["message"]["content"]
 
     def hold(self, user_command: str, scene: dict) -> Plan:
         return Plan.stand(user_command.strip() or "stand")
@@ -175,24 +250,8 @@ class Level1Planner:
             f"User command: {user_command}\n"
             "JSON only. instruction is a short paraphrase of THIS command."
         )
-        message: dict = {"role": "user", "content": prompt}
-        if image:
-            message["images"] = [base64.b64encode(image).decode("ascii")]
-        payload = {
-            "model": self.model,
-            "messages": [message],
-            "stream": False,
-            "format": "json",
-            "think": False,
-            "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 512, "think": False},
-        }
         try:
-            import httpx
-
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                r = await client.post(f"{self.base_url}/api/chat", json=payload)
-                r.raise_for_status()
-                text = r.json()["message"]["content"]
+            text = await self._complete(prompt, image, 512)
             parsed = self._parse(text, user_command)
             if parsed is None:
                 self.last_err = "bad json from " + self.model
@@ -225,23 +284,8 @@ class Level1Planner:
             f"{_pointing_rules()}"
             "Reply JSON with keys hand, u, v — or visible:false."
         )
-        message: dict = {"role": "user", "content": prompt, "images": [base64.b64encode(image).decode("ascii")]}
-        payload = {
-            "model": self.model,
-            "messages": [message],
-            "stream": False,
-            "format": "json",
-            "think": False,
-            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 120, "think": False},
-        }
         try:
-            import httpx
-
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                r = await client.post(f"{self.base_url}/api/chat", json=payload)
-                r.raise_for_status()
-                text = r.json()["message"]["content"]
-            text = text.strip()
+            text = (await self._complete(prompt, image, 120)).strip()
             if "</think>" in text:
                 text = text.split("</think>", 1)[-1]
             start, end = text.find("{"), text.rfind("}")
@@ -263,17 +307,6 @@ class Level1Planner:
                 hand = "right"
             u = float(np_clip(data.get("u")))
             v = float(np_clip(data.get("v")))
-            if u < 0.10 or u > 0.90:
-                plan = Plan(
-                    instruction=user_command,
-                    skill="hold",
-                    params={},
-                    done=False,
-                    queue=[{"vx": 0, "hold_s": 4}],
-                )
-                print(f"gaze point: border u={u:.2f} -> keep prior", flush=True)
-                self.last_err = ""
-                return plan, True
             goal = {"hand": hand, "u": u, "v": v}
             plan = Plan(
                 instruction=user_command,
@@ -306,23 +339,8 @@ class Level1Planner:
             'Use retry="repoint" when the target is visible but the task is not done. '
             'Use retry="hold" when waiting or the view is unclear.'
         )
-        message: dict = {"role": "user", "content": prompt, "images": [base64.b64encode(image).decode("ascii")]}
-        payload = {
-            "model": self.model,
-            "messages": [message],
-            "stream": False,
-            "format": "json",
-            "think": False,
-            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 80, "think": False},
-        }
         try:
-            import httpx
-
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                r = await client.post(f"{self.base_url}/api/chat", json=payload)
-                r.raise_for_status()
-                text = r.json()["message"]["content"]
-            text = text.strip()
+            text = (await self._complete(prompt, image, 80)).strip()
             if "</think>" in text:
                 text = text.split("</think>", 1)[-1]
             start, end = text.find("{"), text.rfind("}")
