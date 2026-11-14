@@ -40,6 +40,7 @@ from agent.config import (
 )
 from agent.flip_policy import wants_flip
 from agent.h2 import MODEL_XML, N_ACT, actuator_addrs, disable_wrist_mesh_contacts, joint_limits
+from agent.pi0_e2e import Pi0E2EModel, pi0_enabled
 from agent.planner import VisionLanguagePlanner
 from agent.sleep import FoundationVLAWithCMS, Learner, SleepConfig, tokenize
 from agent.system0 import (
@@ -61,10 +62,11 @@ def resolve_device() -> torch.device:
 class CognitiveRobotEngine:
     """Unified runtime integrating MuJoCo G1 physics, Gemini/Ollama VLM, and SLEEP Wake/Sleep learning."""
 
-    def __init__(self, *, headless: bool = False, defer_render: bool = False) -> None:
+    def __init__(self, *, headless: bool = False, defer_render: bool = False, enable_pi0: Optional[bool] = None) -> None:
         self.device = resolve_device()
         self.ckpt_path = CHECKPOINT_DIR / "sleep_vla.pt"
         self.headless = headless
+        self._enable_pi0 = pi0_enabled() if enable_pi0 is None else bool(enable_pi0)
 
         # Physics setup
         self.model = mujoco.MjModel.from_xml_path(str(MODEL_XML))
@@ -103,8 +105,15 @@ class CognitiveRobotEngine:
         )
         loaded = self.learner.load_checkpoint(self.ckpt_path)
 
-        # System 2 Planner (Gemini primary -> Ollama fallback) & Executor
+        # System 2 Cognitive Planner + E2E π₀ Backbone & Coordinator
         self.planner = VisionLanguagePlanner(log=lambda msg: self.log_event("warn" if "fallback" in msg.lower() else "info", msg))
+        self.pi0 = Pi0E2EModel(
+            self.device,
+            self._net_lock,
+            log=lambda msg: self.log_event("info" if "Готова" in msg else "warn", msg),
+        )
+        if self._enable_pi0:
+            self.pi0.start_async()
         self.sys2 = System2Executor(
             self.model,
             self.data,
@@ -115,6 +124,11 @@ class CognitiveRobotEngine:
             is_aborted_fn=lambda: (not self.power_on) or self.standby_mode or self._abort_flag,
             log_fn=self.log_event,
             sim_lock=self._sim_lock,
+            sys1_propose_fn=self._propose_sys1,
+            pi0_propose_fn=self.pi0.propose_chunk,
+            cms_slots_fn=self.vla.cms.used_slots,
+            on_sys1_step_fn=self._tick_sys1_counter,
+            tau_fn=lambda: self.tau_think,
         )
 
         # Hardware / Cognitive FSM state
@@ -172,6 +186,8 @@ class CognitiveRobotEngine:
         self._head_jpeg_seq = -1
         self._last_render_ts = 0.0
         self._step_event = threading.Event()
+        self._step_cv = threading.Condition()
+        self._step_seq = 0
 
         with self._sim_lock:
             self.sys0.reset_pose(settle_ticks=120)
@@ -280,7 +296,7 @@ class CognitiveRobotEngine:
         self._executing = False
         with self._cmd_cv:
             self._clear_goal_locked()
-        self.sys2.marker_pos = None
+        self.sys2.reset_memory()
         with self._sim_lock:
             self._active_raw = default_raw_action()
             self._tuck_left = True
@@ -458,21 +474,30 @@ class CognitiveRobotEngine:
             return self._head_rgb.copy()
 
     def _step_cog_from_worker(self, raw: np.ndarray, tuck_left: bool = True, tuck_right: bool = False) -> None:
+        with self._step_cv:
+            target_seq = self._step_seq + 5
         with self._sim_lock:
             self._active_raw = np.asarray(raw, dtype=np.float32).copy()
             self._tuck_left = bool(tuck_left)
             self._tuck_right = bool(tuck_right)
-        # Wait 5 sim ticks (~100 ms) synced to physics thread, or run synchronously if no loop thread
+        # Wait exact 5 sim steps (50 * 2 ms = 100 ms) synced to physics thread, or run synchronously if headless
         if self._worker_thread is None:
             self.step(SUBSTEPS_PER_COG_STEP)
             return
-        for _ in range(5):
-            if self._abort_flag or not self.power_on:
-                break
-            self._step_event.clear()
-            self._step_event.wait(timeout=0.05)
+        deadline = time.perf_counter() + 1.5
+        with self._step_cv:
+            while (
+                self._step_seq < target_seq
+                and not self._abort_flag
+                and self.power_on
+                and not self._worker_stop.is_set()
+            ):
+                rem = deadline - time.perf_counter()
+                if rem <= 0.0:
+                    break
+                self._step_cv.wait(timeout=rem)
 
-    def _ensure_upright(self, timeout_s: float = 8.5) -> bool:
+    def _ensure_upright(self, timeout_s: float = 18.0) -> bool:
         """Wait for (or run synchronously) autonomous stand-up RL policy if G1 is fallen."""
         with self._sim_lock:
             fell = self.sys0.fell()
@@ -492,6 +517,9 @@ class CognitiveRobotEngine:
             with self._sim_lock:
                 still_rec = self.sys0.recovering
                 still_fell = self.sys0.fell()
+                # Re-arm standup automatically if cooldown expired after an incomplete recovery cycle
+                if (not still_rec) and still_fell and self.sys0.recover_cooldown <= 0:
+                    still_rec = self.sys0.start_standup()
             if not still_rec and not still_fell:
                 return True
             if self._worker_thread is None:
@@ -546,12 +574,23 @@ class CognitiveRobotEngine:
                 self._last_render_ts = now
             self._step_event.set()
 
+        with self._step_cv:
+            self._step_seq += 1
+            self._step_cv.notify_all()
+
         if started_msg:
             self.log_event("warn", started_msg)
         if finished_msg:
             self.log_event("info" if "встал" in finished_msg else "warn", finished_msg)
 
     # ------------------------------------------------------------------ Cognitive / SLEEP workers
+    def _tick_sys1_counter(self) -> None:
+        self.sys1_count += 1
+
+    def _propose_sys1(self, head_rgb: np.ndarray, proprio: np.ndarray, command: str) -> Tuple[np.ndarray, float]:
+        chunk, sigma, _ = self._infer_sys1(head_rgb, proprio, command)
+        return chunk, sigma
+
     def _infer_sys1(self, head_rgb: np.ndarray, proprio: np.ndarray, command: str) -> Tuple[np.ndarray, float, float]:
         img_small = np.array(
             Image.fromarray(head_rgb).resize((SLEEP_IMG_SIZE, SLEEP_IMG_SIZE), Image.BILINEAR),
@@ -614,9 +653,16 @@ class CognitiveRobotEngine:
                     self.log_event("warn", f"[Confidence Gate] σ выросла до {sigma:.3f} -> эскалация в System 2")
                     return False
 
-        # Settle gently after Sys1 execution
+        # Settle gently after Sys1 execution until leg gait fully hands back to stand PD
         stand = default_raw_action()
-        self._step_cog_from_worker(stand, tuck_left=True, tuck_right=True)
+        for k in range(12):
+            if self._abort_flag or not self.power_on:
+                break
+            self._step_cog_from_worker(stand, tuck_left=True, tuck_right=True)
+            with self._sim_lock:
+                holding = self.sys0.walk is None or self.sys0.walk.holding
+            if k >= 9 and holding:
+                break
 
         if verify:
             with self._sim_lock:
@@ -742,21 +788,24 @@ class CognitiveRobotEngine:
             res = self.sys2.execute(command, lessons=lessons)
             self.latency_ms = (time.perf_counter() - t0) * 1000.0
             samples = res.get("samples") or []
-            if res.get("ok") and samples:
+            if res.get("ok"):
                 with self._cmd_cv:
                     if self._active_goal == command:
                         self._clear_goal_locked(clear_pending=False)
-                tid = self._task_id(command)
-                for rgb_128, pr, cmd, ch in samples:
-                    self.wake_buffer.append((rgb_128, pr, cmd, ch, tid))
-                self._pending_skills.add(skill_key)
-                self.unconsolidated_steps += len(samples)
-                self._sleep_done_for_batch = False
-                self._run_wake_update(steps=2, allow_consolidate=False)
-                self.log_event(
-                    "info",
-                    f"[Wake] Сохранено {len(samples)} траекторных чанков «{command}» в буфер памяти.",
-                )
+                if samples:
+                    tid = self._task_id(command)
+                    for rgb_128, pr, cmd, ch in samples:
+                        self.wake_buffer.append((rgb_128, pr, cmd, ch, tid))
+                    self._pending_skills.add(skill_key)
+                    self.unconsolidated_steps += len(samples)
+                    self._sleep_done_for_batch = False
+                    self._run_wake_update(steps=2, allow_consolidate=False)
+                    self.log_event(
+                        "info",
+                        f"[Wake] Сохранено {len(samples)} траекторных чанков «{command}» в буфер памяти.",
+                    )
+                elif res.get("already_done"):
+                    self.log_event("info", f"[System 2] Цель «{command}» уже выполнена — завершаю задачу.")
             else:
                 self.log_event("warn", f"[System 2] Команда «{command}» не завершена ({res.get('reason', 'unknown')}).")
                 self._handle_failed_episode(command, skill_key, head_rgb, proprio, chunk, samples, res.get("failure_info"))
@@ -1050,6 +1099,7 @@ class CognitiveRobotEngine:
             "recovering": self.sys0.recovering,
             "command": self.current_command,
             "vlm_backend": self.planner.active_backend,
+            "pi0_phase": self.pi0.phase(),
             "uncertainty": float(self.current_uncertainty),
             "tau_think": float(self.tau_think),
             "latency_ms": float(self.latency_ms),
@@ -1086,6 +1136,8 @@ class CognitiveRobotEngine:
         self._worker_stop.set()
         with self._cmd_cv:
             self._cmd_cv.notify_all()
+        with self._step_cv:
+            self._step_cv.notify_all()
         if self._worker_thread is None:
             self._close_renderers()
 

@@ -120,20 +120,17 @@ def com_err_xy(data: mujoco.MjData, pelvis_id: int, r_fg: int, l_fg: int) -> np.
 
 
 def balance_delta(err_b: np.ndarray, d_b: np.ndarray, squat: float = 0.0) -> np.ndarray:
-    """Ankle/hip inverted-pendulum stabilizer around desired squat/stand pose."""
+    """Velocity-damped ankle inverted-pendulum stabilizer around desired squat/stand pose."""
     err_x, err_y = float(err_b[0]), float(err_b[1])
-    d_x, d_y = float(d_b[0]), float(d_b[1])
-    scale = float(np.clip(1.0 - 0.5 * squat, 0.5, 1.0))
-    ak_lim = float(np.clip(0.14 + 0.8 * abs(err_x), 0.14, 0.28))
-    hy_lim = float(np.clip(0.20 + 1.5 * abs(err_x), 0.20, 0.50))
-    sag_ak = float(np.clip(2.4 * err_x - 5.0 * d_x, -ak_lim, ak_lim)) * scale
-    sag_hy = float(np.clip(4.0 * err_x - 8.0 * d_x, -hy_lim, hy_lim)) * scale
-    pd_hx = float(np.clip(1.2 * err_y - 6.0 * d_y, -0.25, 0.25))
+    vx = float(d_b[0]) / PHYSICS_DT
+    vy = float(d_b[1]) / PHYSICS_DT
+    scale = float(np.clip(1.0 - 0.35 * squat, 0.65, 1.0))
+    sag_ak = float(np.clip(2.5 * err_x + 0.45 * vx, -0.12 * scale, 0.24 * scale))
+    pd_hx = float(np.clip(0.5 * err_y + 0.10 * vy, -0.15, 0.15))
     dlt = np.zeros(N_ACT, dtype=np.float32)
     dlt[R_AP] = dlt[L_AP] = sag_ak
-    dlt[R_HP] = dlt[L_HP] = sag_hy
     dlt[R_HR] = dlt[L_HR] = pd_hx
-    return dlt * 0.28
+    return dlt
 
 
 def rot_axis_angle(axis: np.ndarray, angle: float) -> np.ndarray:

@@ -26,7 +26,7 @@ def smoke() -> None:
     print("[smoke] Initializing RobotEngine...")
     with tempfile.TemporaryDirectory() as tmpdir, patch("agent.engine.CHECKPOINT_DIR", Path(tmpdir)):
         os.environ["STORAGE_DIR"] = tmpdir
-        bot = RobotEngine(headless=False)
+        bot = RobotEngine(headless=False, enable_pi0=False)
         try:
             # 1. Idle standing stability (free pelvis, no teleport)
             for _ in range(40):
@@ -255,6 +255,119 @@ def smoke() -> None:
             assert bot._active_goal is None and bot._pending_cmd is None
             print("[smoke] Post-sleep autonomous continuation & cancel OK")
 
+            # 6f. Already-accomplished visual short-circuit stops redundant retries cleanly
+            bot.dispatch_command("открой шкаф")
+            with bot._cmd_cv:
+                bot._pending_cmd = None
+            prev_fail_len = len(bot.failure_buffer)
+            prev_wake_len = len(bot.wake_buffer)
+            with patch.object(
+                bot.planner,
+                "plan_command",
+                return_value={
+                    "mode": "manipulate",
+                    "visible": True,
+                    "already_done": True,
+                    "status": "дверца шкафа уже открыта",
+                    "uv": None,
+                    "object": "cabinet",
+                    "part": "door",
+                    "motions": ["pull_back"],
+                    "hand": "right",
+                    "search_dir": "right",
+                    "ok": True,
+                },
+            ) as mock_plan:
+                bot._execute_command("открой шкаф")
+            assert mock_plan.called, "6f did not reach System 2 plan_command"
+            assert bot._active_goal is None and bot._pending_cmd is None, "Already-done goal was not cleared"
+            assert len(bot.failure_buffer) == prev_fail_len, "Already-done treated as failure"
+            assert len(bot.wake_buffer) == prev_wake_len, "Already-done wrote empty wake chunk"
+            print("[smoke] Already-done visual check & retry stop OK")
+
+            # 6g. Safe System 2 (bumper walk, scratch rehearsal, IK teacher -> wake_buffer), pi0 helpers & 429 cooldown
+            import time as _time
+            import httpx as _httpx
+            from agent.pi0_e2e import build_pi0_state, pi0_chunk_to_g1_norm, pi0_enabled, resolve_pi0_source
+
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("E2E_ENABLE", None)
+                os.environ.pop("PI0_ENABLE", None)
+                assert not pi0_enabled(), "Untrained frozen pi0 should default to off until G1 adapter is enabled"
+            src_path, is_local = resolve_pi0_source("lerobot/pi0_base")
+            assert is_local and Path(src_path).is_dir(), f"Expected cached local pi0_base snapshot, got {src_path}"
+            st32 = build_pi0_state(pr, default_raw_action(), 4.0)
+            assert st32.shape == (32,)
+            mock_pi0_raw = np.zeros((1, 50, 32), dtype=np.float32)
+            mock_pi0_raw[0, :, 0] = -0.25
+            mock_pi0_raw[0, :, 15] = 0.60
+            g1_chunk = pi0_chunk_to_g1_norm(mock_pi0_raw, default_raw_action())
+            assert g1_chunk.shape == (SLEEP_HORIZON, SLEEP_ACTION_DIM)
+            assert np.all(g1_chunk >= -1.0) and np.all(g1_chunk <= 1.0)
+
+            bot.reset_sim()
+            # Test scratch mental rehearsal rejects unreachable extreme point
+            safe_bad, _, _ = bot.sys2._rehearse_primitive(
+                np.array([4.5, 0.0, 2.2]),
+                np.array([1.0, 0.0, 0.0]),
+                np.eye(3),
+                0.05,
+                "push_forward",
+            )
+            assert not safe_bad, "Scratch rehearsal should reject extreme unreachable target"
+
+            prev_wake = len(bot.wake_buffer)
+            mock_plan_ik = {
+                "mode": "manipulate",
+                "visible": True,
+                "already_done": False,
+                "status": "",
+                "uv": (440.0, 250.0),
+                "object": "toaster",
+                "part": "lever",
+                "motions": ["press_down"],
+                "hand": "right",
+                "search_dir": "right",
+                "ok": True,
+            }
+            mock_ground_ik = {
+                "visible": True,
+                "already_done": False,
+                "status": "",
+                "uv": (440.0, 250.0),
+                "object": "toaster",
+                "part": "lever",
+                "motions": ["press_down"],
+                "ok": True,
+            }
+            with (
+                patch.object(bot.planner, "plan_command", return_value=mock_plan_ik),
+                patch.object(bot.planner, "ground", return_value=mock_ground_ik),
+                patch.object(bot.planner, "judge", return_value={"done": True, "changed": True, "progress": 1.0, "what": "lever pressed", "ok": True}),
+            ):
+                bot._execute_command("тест тостер")
+
+            assert not bot.sys0.fell(), "Robot fell during bumper-safe walk + IK manipulation"
+            assert bot.sys0.walk is None or bot.sys0.walk.holding, "Gait policy failed to hand back to stand hold"
+            assert len(bot.wake_buffer) > prev_wake, "Successful System 2 teacher episode was not saved into wake_buffer"
+            bot.reset_sim()
+
+            # Verify HTTP 429 triggers alternate Gemini model retry + cooldown -> Ollama fallback
+            bot.planner.api_key = "fake-test-key"
+            bot.planner._gemini_cooldown_until = 0.0
+            req429 = _httpx.Request("POST", "https://generativelanguage.googleapis.com/v1beta/models/x:generateContent")
+            resp429 = _httpx.Response(429, request=req429, headers={"Retry-After": "0.3"})
+            err429 = _httpx.HTTPStatusError("429 Too Many Requests", request=req429, response=resp429)
+            with patch("agent.planner.time.sleep", return_value=None), \
+                 patch.object(bot.planner, "_call_gemini", side_effect=[err429, err429]) as mock_g429, \
+                 patch.object(bot.planner, "_call_ollama", return_value={"mode": "body_skill", "skill": "stand", "params": {}}) as mock_o429:
+                out429 = bot.planner.plan_command(np.zeros((64, 64, 3), dtype=np.uint8), "встань")
+                assert mock_g429.call_count == 2, f"Expected alt-model retry on 429, got {mock_g429.call_count} calls"
+                assert mock_o429.called and out429["skill"] == "stand"
+                assert bot.planner._gemini_cooldown_until > _time.monotonic(), "429 cooldown was not armed"
+            bot.planner._gemini_cooldown_until = 0.0
+            print("[smoke] Safe System 2 (bumper walk, scratch rehearsal, IK -> Wake), pi0 helpers & 429 cooldown OK")
+
             # 6. HAL switches + rendering MJPEG check
             bot.set_power(False)
             assert bot.telemetry()["state"] == "OFF"
@@ -274,7 +387,9 @@ def smoke() -> None:
     from fastapi.testclient import TestClient
     import app as server_app
 
-    with tempfile.TemporaryDirectory() as tmpdir2, patch("agent.engine.CHECKPOINT_DIR", Path(tmpdir2)):
+    with tempfile.TemporaryDirectory() as tmpdir2, \
+         patch("agent.engine.CHECKPOINT_DIR", Path(tmpdir2)), \
+         patch("agent.engine.pi0_enabled", return_value=False):
         with TestClient(server_app.app) as client:
             r = client.get("/")
             assert r.status_code == 200 and "STAND-BY" in r.text and "POWER ON" in r.text

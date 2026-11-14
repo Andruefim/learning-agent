@@ -24,7 +24,7 @@ Free-standing Unitree G1 humanoid in MuJoCo (`models/unitree_g1/scene_app.xml`) 
 
 ```bash
 cp .env.example .env
-# Fill in GEMINI_API_KEY (and ensure Ollama has qwen3.5:9b pulled for offline/503 fallback)
+# Fill in GEMINI_API_KEY (and ensure Ollama has qwen3.5:9b-q8_0 pulled for offline/503 fallback)
 python app.py
 ```
 
@@ -43,7 +43,7 @@ python app.py --smoke
 | Variable | Default / Meaning |
 |---|---|
 | `GEMINI_MODEL` / `GEMINI_API_KEY` | Primary Cloud Gemini VLM (`gemini-3.5-flash-lite`) |
-| `L1_MODEL` / `L1_BASE_URL` | Fallback local Ollama VLM (`qwen3.5:9b` at `http://127.0.0.1:11434`) |
+| `L1_MODEL` / `L1_BASE_URL` | Fallback local Ollama VLM (`qwen3.5:9b-q8_0` at `http://127.0.0.1:11434`) |
 | `SLEEP_DEVICE` | Compute device for SLEEP VLA (`cuda` / `cpu`) |
 | `MUJOCO_GL` | Offscreen OpenGL backend (`glfw` on Windows/macOS, `egl` on Linux headless) |
 | `STORAGE_DIR` | Checkpoint directory (`./checkpoints`) |

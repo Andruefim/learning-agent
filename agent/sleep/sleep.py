@@ -417,11 +417,12 @@ class Learner:
         m.cms.set_random_expert(False)
 
         best_cand = None
-        best_sep = -1.0
+        best_sep = -1e9
         for y_c in cands:
-            sep = float(((y_c - y_bad) ** 2).mean().clamp(max=0.35).item())
-            smooth = float(((y_c[:, 1:] - y_c[:, :-1]) ** 2).mean().item()) if y_c.shape[1] > 1 else 0.0
-            score = sep - 0.35 * smooth
+            sep_arm = float(((y_c[:, :, 2:] - y_bad[:, :, 2:]) ** 2).mean().clamp(max=0.40).item())
+            smooth_arm = float(((y_c[:, 1:, 2:] - y_c[:, :-1, 2:]) ** 2).mean().item()) if y_c.shape[1] > 1 else 0.0
+            loc_pen = float(((y_c[:, :, :2] - y_bad[:, :, :2]) ** 2).mean().item())
+            score = sep_arm - 0.35 * smooth_arm - 0.25 * loc_pen
             if score > best_sep:
                 best_sep = score
                 best_cand = y_c

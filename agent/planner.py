@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -106,15 +107,21 @@ class VisionLanguagePlanner:
     def __init__(self, log: Callable[[str], None] = print) -> None:
         self.api_key = os.getenv("GEMINI_API_KEY", "").strip()
         self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-        self.ollama_model = os.getenv("L1_MODEL", "qwen3.5:9b").strip()
+        alt_default = "gemini-2.5-flash-lite" if self.gemini_model == "gemini-2.5-flash" else "gemini-2.5-flash"
+        self.gemini_alt_model = os.getenv("GEMINI_FALLBACK_MODEL", alt_default).strip()
+        self.ollama_model = os.getenv("L1_MODEL", "qwen3.5:9b-q8_0").strip()
         self.ollama_url = resolve_ollama_url()
         self.log = log
         self.active_backend = "gemini" if self.api_key else "ollama"
         self.last_error = ""
+        self._gemini_cooldown_until = 0.0
 
-    def _call_gemini(self, prompt: str, images: List[np.ndarray], max_tokens: int) -> Dict[str, Any]:
+    def _call_gemini(
+        self, prompt: str, images: List[np.ndarray], max_tokens: int, model: Optional[str] = None
+    ) -> Dict[str, Any]:
         if not self.api_key:
             raise RuntimeError("GEMINI_API_KEY not set")
+        mdl = model or self.gemini_model
         parts: list[dict] = [{"text": prompt}]
         for img in images:
             parts.append(
@@ -125,7 +132,7 @@ class VisionLanguagePlanner:
                     }
                 }
             )
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{mdl}:generateContent"
         body = {
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
@@ -163,6 +170,7 @@ class VisionLanguagePlanner:
             "messages": [msg],
             "stream": False,
             "format": "json",
+            "keep_alive": "25s",
             "think": False,
             "options": {"temperature": 0.0, "num_ctx": 8192, "num_predict": max_tokens, "think": False},
         }
@@ -176,12 +184,41 @@ class VisionLanguagePlanner:
         return parsed
 
     def _ask_json(self, prompt: str, images: List[np.ndarray], max_tokens: int = 384) -> Optional[Dict[str, Any]]:
-        if self.api_key:
+        if self.api_key and time.monotonic() >= self._gemini_cooldown_until:
             try:
                 res = self._call_gemini(prompt, images, max_tokens)
                 self.active_backend = f"gemini ({self.gemini_model})"
                 self.last_error = ""
                 return res
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code if exc.response is not None else 0
+                if status == 429:
+                    retry_after = 0.8
+                    if exc.response is not None:
+                        ra = exc.response.headers.get("Retry-After", "")
+                        try:
+                            retry_after = float(np.clip(float(ra), 0.3, 2.0))
+                        except ValueError:
+                            pass
+                    time.sleep(retry_after)
+                    if self.gemini_alt_model and self.gemini_alt_model != self.gemini_model:
+                        try:
+                            res = self._call_gemini(prompt, images, max_tokens, model=self.gemini_alt_model)
+                            self.active_backend = f"gemini ({self.gemini_alt_model})"
+                            self.last_error = ""
+                            return res
+                        except httpx.HTTPStatusError as exc2:
+                            exc = exc2
+                        except Exception as exc2:
+                            exc = exc2
+                    self._gemini_cooldown_until = time.monotonic() + 12.0
+                    err_msg = f"HTTP 429 -> cooldown 12s ({exc})"[:160]
+                    self.last_error = err_msg
+                    self.log(f"[VLM] Gemini 429 (лимит RPM) -> пауза 12с и fallback на Ollama ({self.ollama_model})")
+                else:
+                    err_msg = f"{type(exc).__name__}: {exc}"[:160]
+                    self.last_error = err_msg
+                    self.log(f"[VLM] Gemini не ответил ({err_msg}) -> fallback на Ollama ({self.ollama_model})")
             except Exception as exc:
                 err_msg = f"{type(exc).__name__}: {exc}"[:160]
                 self.last_error = err_msg
@@ -212,20 +249,25 @@ class VisionLanguagePlanner:
         )
 
     def plan_command(self, rgb: np.ndarray, command: str, *, lessons: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Classify a natural-language command into body skill OR kitchen object manipulation + grounding."""
+        """Classify a natural-language command into body skill OR kitchen manipulation + safe grounding."""
         lesson_txt = self._lessons_block(lessons)
         prompt = (
             "You control a standing humanoid robot (Unitree G1) in a kitchen. The image is its head camera.\n"
             f'Operator command: "{command}"\n'
             f"{lesson_txt}"
             "Decide whether the command is:\n"
-            '  1) "body_skill": locomotion, turning, squatting, raising/waving arms, or holding pose (no kitchen object interaction).\n'
-            '  2) "manipulate": interacting with a kitchen object/appliance (open/close oven, fridge, microwave, cabinet, drawer, dishwasher, press toaster/coffee button, etc.).\n'
+            '  1) "body_skill": ONLY pure body commands with NO kitchen object/appliance target (locomotion, turning, squatting, raising/waving arms, standing).\n'
+            '  2) "manipulate": ANY command naming a kitchen appliance or object (oven/духовка, toaster/тостер, fridge/холодильник, microwave/микроволновка, cabinet/шкаф, drawer/ящик, dishwasher) — ALWAYS use mode="manipulate" even if lessons mention stepping/adjusting.\n'
             "If manipulate:\n"
-            "  - Find the exact graspable part (handle, lever, button, door edge; NEVER walls or floor).\n"
-            "  - Return point=[x, y] in 0..1000 image coordinates (x right, y down), or visible=false if not clearly visible.\n"
+            "  - First check carefully: is the target visible AND is the requested goal ALREADY accomplished right now "
+            "(e.g., oven/fridge/cabinet door ALREADY visibly open, toaster lever ALREADY down)?\n"
+            '  - Set "already_done": true ONLY when visible=true and clearly already accomplished.\n'
+            "  - If not already_done, point precisely at the solid GRASPABLE PART: front horizontal oven handle bar (BELOW stovetop knobs, ABOVE the dark glass window), "
+            "toaster side/front lever (toaster sits ON TOP of the white marble countertop — NEVER point at the lower cabinet doors below it), knob, or door edge.\n"
+            "  - CRITICAL: NEVER point inside oven/microwave glass windows, empty air, flat blank doors away from the handle, floor, or brick walls.\n"
+            '  - Return "point": [x, y] in 0..1000 image coordinates (x right, y down), or visible=false if not clearly visible.\n'
             f"  - Rank 1..4 candidate motions from {PRIMITIVES}: {PRIMITIVE_HELP}\n"
-            '  - If visible=false, suggest search_dir="left" or "right" where the target likely is.\n'
+            '  - If visible=false, suggest search_dir="left" or "right" toward the kitchen appliances.\n'
             "If body_skill:\n"
             '  - Fill skill ("locomote"|"turn"|"squat"|"reach"|"wave"|"stand") and params '
             '({"direction":"forward|backward|left|right","steps":N,"angle":deg,"depth":"low","hand":"left|right|both","pose":"t|up|down"}).\n'
@@ -235,6 +277,8 @@ class VisionLanguagePlanner:
             '  "skill": "<if body_skill>",\n'
             '  "params": {},\n'
             '  "visible": true | false,\n'
+            '  "already_done": false,\n'
+            '  "status": "<optional short reason if already_done>",\n'
             '  "object": "<name>",\n'
             '  "part": "<handle/lever/button>",\n'
             '  "point": [x, y],\n'
@@ -243,7 +287,7 @@ class VisionLanguagePlanner:
             '  "search_dir": "left" | "right"\n'
             '}'
         )
-        res = self._ask_json(prompt, [rgb], max_tokens=320) or {}
+        res = self._ask_json(prompt, [rgb], max_tokens=340) or {}
         mode = str(res.get("mode") or "manipulate").strip().lower()
         h, w = rgb.shape[:2]
 
@@ -256,9 +300,11 @@ class VisionLanguagePlanner:
             }
 
         uv = _norm_point_to_uv(res.get("point"), w, h)
-        visible = bool(res.get("visible", False)) and (uv is not None)
+        vis_flag = bool(res.get("visible", False))
+        already_done = bool(res.get("already_done", False)) and vis_flag
+        visible = vis_flag and (uv is not None or already_done)
         mots = [m for m in (res.get("motions") or []) if m in PRIMITIVES]
-        for fallback in ("pull_back", "push_forward", "press_down", "lift_up"):
+        for fallback in ("pull_back", "press_down", "push_forward", "lift_up"):
             if fallback not in mots:
                 mots.append(fallback)
         search_dir = str(res.get("search_dir") or "right").strip().lower()
@@ -267,6 +313,8 @@ class VisionLanguagePlanner:
         return {
             "mode": "manipulate",
             "visible": visible,
+            "already_done": already_done,
+            "status": str(res.get("status") or ""),
             "uv": uv,
             "object": str(res.get("object") or ""),
             "part": str(res.get("part") or ""),
@@ -277,29 +325,36 @@ class VisionLanguagePlanner:
         }
 
     def ground(self, rgb: np.ndarray, command: str, *, lessons: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Dedicated visual re-grounding up close after the robot walks to the appliance."""
+        """Dedicated visual re-grounding up close (or during search) with already_done awareness."""
         lesson_txt = self._lessons_block(lessons)
         prompt = (
-            "This is the robot head camera, now standing close to the kitchen fixture.\n"
+            "This is the robot head camera standing in the kitchen.\n"
             f'Operator command: "{command}"\n'
             f"{lesson_txt}"
-            "Point precisely at the graspable part (handle bar, lever, button, door edge) needed for the command.\n"
-            "Do NOT point at flat doors without handle, floor, or walls.\n"
-            f"Also rank candidate motions from {PRIMITIVES}: {PRIMITIVE_HELP}\n"
+            "Check visually:\n"
+            "  1) already_done: if target is clearly visible and ALREADY in the requested end state (e.g. door already open), set true.\n"
+            "  2) Otherwise, point precisely at the solid GRASPABLE PART: handle bar (ABOVE glass on oven/microwave), toaster lever/button (toaster sits ON TOP of the white countertop, NOT the lower cabinet), or door edge.\n"
+            "  3) NEVER point inside glass windows, hollow interiors, floor, or brick walls.\n"
+            f"  4) Rank candidate motions from {PRIMITIVES}: {PRIMITIVE_HELP}\n"
             "Reply JSON ONLY:\n"
-            '{"visible": true|false, "object": "<name>", "part": "<part>", "point": [x, y], "motions": ["..."]}\n'
+            '{"visible": true|false, "already_done": false, "status": "<if already_done>", '
+            '"object": "<name>", "part": "<part>", "point": [x, y], "motions": ["..."]}\n'
             "point uses 0..1000 image coordinates (x right, y down)."
         )
-        res = self._ask_json(prompt, [rgb], max_tokens=200) or {}
+        res = self._ask_json(prompt, [rgb], max_tokens=220) or {}
         h, w = rgb.shape[:2]
         uv = _norm_point_to_uv(res.get("point"), w, h)
-        visible = bool(res.get("visible", False)) and (uv is not None)
+        vis_flag = bool(res.get("visible", False))
+        already_done = bool(res.get("already_done", False)) and vis_flag
+        visible = vis_flag and (uv is not None or already_done)
         mots = [m for m in (res.get("motions") or []) if m in PRIMITIVES]
-        for fallback in ("pull_back", "push_forward", "press_down", "lift_up"):
+        for fallback in ("pull_back", "press_down", "push_forward", "lift_up"):
             if fallback not in mots:
                 mots.append(fallback)
         return {
             "visible": visible,
+            "already_done": already_done,
+            "status": str(res.get("status") or ""),
             "uv": uv,
             "object": str(res.get("object") or ""),
             "part": str(res.get("part") or ""),
@@ -308,18 +363,25 @@ class VisionLanguagePlanner:
         }
 
     def judge(self, before: np.ndarray, after: np.ndarray, command: str) -> Dict[str, Any]:
-        """Visual verification: compare before vs after head camera frames."""
+        """Visual verification: compare before vs after head camera frames and estimate progress."""
         prompt = (
             "Two head-camera images of the same robot task: FIRST = before, SECOND = after.\n"
             f'Operator command: "{command}"\n'
-            "Did the physical scene visibly change so the command is now accomplished "
-            "(e.g. door/drawer opened or closed, lever pressed down, button pushed)?\n"
-            'Reply JSON ONLY: {"changed": true|false, "done": true|false, "what": "<short description>"}'
+            "Did the physical scene visibly change so the command is now accomplished, "
+            "OR is the requested goal clearly visible as accomplished in the SECOND image "
+            "(e.g. door/drawer open, lever pressed down, button pushed)?\n"
+            'Also rate visual progress toward the goal from 0.0 (no progress) to 1.0 (accomplished).\n'
+            'Reply JSON ONLY: {"changed": true|false, "done": true|false, "progress": 0.0, "what": "<short description>"}'
         )
-        res = self._ask_json(prompt, [before, after], max_tokens=140) or {}
+        res = self._ask_json(prompt, [before, after], max_tokens=150) or {}
+        try:
+            prog = float(np.clip(float(res.get("progress", 1.0 if res.get("done") else 0.0)), 0.0, 1.0))
+        except Exception:
+            prog = 1.0 if res.get("done") else 0.0
         return {
             "done": bool(res.get("done", False)),
             "changed": bool(res.get("changed", False)),
+            "progress": prog,
             "what": str(res.get("what") or res.get("what_changed") or ""),
             "ok": bool(res),
         }
@@ -347,7 +409,7 @@ class VisionLanguagePlanner:
                 f"tried_motions=[{tried}], fell={fell}, outcome='{what}'.\n"
                 "Inspect the camera image(s) (before/after if 2 images). Give ONE short concrete lesson "
                 "(max 25 words) for the next retry explaining what went wrong (e.g., missed handle height/position, "
-                "out-of-reach point causing fall, or wrong motion direction) and what to adjust.\n"
+                "targeted oven glass instead of top bar handle, out-of-reach point causing fall, or wrong motion direction) and what to adjust.\n"
                 'Reply JSON ONLY: {"lesson": "<short lesson in Russian or English>"}'
             )
             res = self._ask_json(prompt, imgs, max_tokens=120) or {}
@@ -359,5 +421,5 @@ class VisionLanguagePlanner:
         if ik_cm > 12.0:
             parts.append(f"точка цели была труднодосягаема (IK err={ik_cm:.0f}см) — выбери ручку на удобной высоте")
         if fell:
-            parts.append("робот потерял равновесие — скорректируй точку и направление")
+            parts.append("робот потерял равновесие — держи безопасную дистанцию и высоту ручки")
         return "; ".join(parts)[:220]

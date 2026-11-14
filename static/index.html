@@ -293,7 +293,8 @@
       teleLatency.textContent = t.latency_ms.toFixed(1) + " мс";
       telePelvis.textContent = t.pelvis_z.toFixed(3) + " м";
       teleSlots.textContent = `${t.cms_slots_used} / ${t.cms_slots_total}`;
-      badgeVlm.textContent = "VLM: " + t.vlm_backend;
+      const pi0Txt = t.pi0_phase && t.pi0_phase !== "off" ? ` · π₀: ${t.pi0_phase}` : "";
+      badgeVlm.textContent = "VLM: " + t.vlm_backend + pi0Txt;
 
       rateSys1.textContent = t.sys1_rate.toFixed(1) + "%";
       rateSys2.textContent = t.sys2_rate.toFixed(1) + "%";
@@ -311,7 +312,9 @@
       } else {
         uncBar.className = "bg-amber-500 h-full rounded-full transition-all duration-150";
         uncLabel.className = "text-xs font-mono font-bold text-amber-400";
-        uncLabel.textContent = "System 2 (VLM + IK)";
+        uncLabel.textContent = (t.pi0_phase && t.pi0_phase !== "off")
+          ? "System 2 (VLM + E2E π₀)"
+          : "System 2 (VLM + IK)";
       }
 
       badgeState.textContent = t.state;

@@ -1567,7 +1567,7 @@
         <site pos="0.0 0.0 0.0" size="0.002046946746117132 0.002046946746117132 0.002046946746117132" rgba="1 0 0 0" type="sphere" group="0" name="coffee_machine_main_group_default_site" />
       </body>
     </body>
-    <body name="knife_block_main_group_main" pos="0.4000 0.4300 0.1600" quat="0.707106781 0 0 -0.707106781">
+    <body name="knife_block_main_group_main" pos="1.2400 0.6000 1.0850" quat="0.707106781 0 0 -0.707106781">
       <freejoint name="knife_block_free" />
       <geom mesh="knife_block_main_group_KnifeBlock008_vis" type="mesh" solimp="0.998 0.998 0.001" solref="0.001 1" friction="0.95 0.3 0.1" material="knife_block_main_group_KnifeBlock008_material" conaffinity="0" contype="0" group="1" name="knife_block_main_group_g0" />
       <body name="knife_block_main_group_KnifeBlock008_Prop">
